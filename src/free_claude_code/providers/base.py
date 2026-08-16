@@ -36,6 +36,10 @@ class ProviderConfig:
     proxy: str = ""
     log_raw_sse_events: bool = False
     log_api_error_tracebacks: bool = False
+    # Additional keys for the same provider, rotated on quota exhaustion or
+    # unavailability. ``api_key`` stays as the primary credential so callers
+    # that only read the singular field keep working unchanged.
+    api_keys: tuple[str, ...] = ()
 
 
 class BaseProvider(ABC):

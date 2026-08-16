@@ -932,6 +932,87 @@ class TestPerModelMapping:
         with pytest.raises(ValidationError, match="Invalid provider"):
             Settings()
 
+    def test_model_fallbacks_loads_from_env(self, monkeypatch):
+        """MODEL_FALLBACKS comma-separated refs are parsed and normalized."""
+        from free_claude_code.config.settings import Settings
+
+        monkeypatch.setenv(
+            "MODEL_FALLBACKS",
+            "open_router/anthropic/claude-sonnet-4, gemini/models/gemini-3.1-flash",
+        )
+        s = Settings()
+        assert s.model_fallbacks == (
+            "open_router/anthropic/claude-sonnet-4,gemini/models/gemini-3.1-flash"
+        )
+
+    def test_model_fallbacks_empty_is_default(self, monkeypatch):
+        """Unset MODEL_FALLBACKS yields empty string."""
+        from free_claude_code.config.settings import Settings
+
+        monkeypatch.delenv("MODEL_FALLBACKS", raising=False)
+        s = Settings()
+        assert s.model_fallbacks == ""
+
+    def test_model_fallbacks_invalid_provider_raises(self, monkeypatch):
+        """MODEL_FALLBACKS with an unknown provider prefix raises."""
+        from free_claude_code.config.settings import Settings
+
+        monkeypatch.setenv("MODEL_FALLBACKS", "bogus_provider/some-model")
+        with pytest.raises(
+            ValidationError, match="Invalid provider in MODEL_FALLBACKS"
+        ):
+            Settings()
+
+    def test_model_fallbacks_no_slash_raises(self, monkeypatch):
+        """MODEL_FALLBACKS entry without provider prefix raises."""
+        from free_claude_code.config.settings import Settings
+
+        monkeypatch.setenv("MODEL_FALLBACKS", "noprefix")
+        with pytest.raises(ValidationError, match="prefixed with provider type"):
+            Settings()
+
+    def test_provider_api_keys_parses_json_from_env(self, monkeypatch):
+        """PROVIDER_API_KEYS accepts a JSON object string from the env."""
+        from free_claude_code.config.settings import Settings
+
+        monkeypatch.setenv(
+            "PROVIDER_API_KEYS",
+            '{"nvidia_nim": "k1,k2,k3", "open_router": "ka,kb"}',
+        )
+        s = Settings()
+        assert s.provider_api_keys == {
+            "nvidia_nim": "k1,k2,k3",
+            "open_router": "ka,kb",
+        }
+
+    def test_provider_api_keys_defaults_to_empty(self, monkeypatch):
+        """Unset PROVIDER_API_KEYS yields an empty dict."""
+        from free_claude_code.config.settings import Settings
+
+        monkeypatch.delenv("PROVIDER_API_KEYS", raising=False)
+        s = Settings()
+        assert s.provider_api_keys == {}
+
+    def test_provider_api_keys_non_json_raises(self, monkeypatch):
+        """PROVIDER_API_KEYS that is not a JSON object raises."""
+        from pydantic_settings import SettingsError
+
+        from free_claude_code.config.settings import Settings
+
+        monkeypatch.setenv("PROVIDER_API_KEYS", "nvidia_nim=k1,k2")
+        with pytest.raises(SettingsError, match=r"(?i)provider_api_keys"):
+            Settings()
+
+    def test_provider_api_keys_non_object_json_raises(self, monkeypatch):
+        """PROVIDER_API_KEYS JSON that is not an object raises."""
+        from pydantic_settings import SettingsError
+
+        from free_claude_code.config.settings import Settings
+
+        monkeypatch.setenv("PROVIDER_API_KEYS", '["k1", "k2"]')
+        with pytest.raises((SettingsError, ValidationError)):
+            Settings()
+
     def test_resolve_model_fable_override(self):
         """ModelRouter returns model_fable for Fable model names."""
         from free_claude_code.application.routing import ModelRouter

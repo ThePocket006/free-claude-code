@@ -144,10 +144,12 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
     "opencode": OpenAIChatProfile(
         _policy("OPENCODE", ReasoningReplayMode.THINK_TAGS),
         NO_REASONING,
+        user_agent="opencode",
     ),
     "opencode_go": OpenAIChatProfile(
         _policy("OPENCODE_GO", ReasoningReplayMode.THINK_TAGS),
         NO_REASONING,
+        user_agent="opencode",
     ),
     "vercel": OpenAIChatProfile(
         _policy(

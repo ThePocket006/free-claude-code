@@ -38,6 +38,7 @@ from free_claude_code.providers.admission import (
     ProviderRetrySession,
 )
 from free_claude_code.providers.base import BaseProvider, ProviderConfig
+from free_claude_code.providers.credential_pool import CredentialPool
 from free_claude_code.providers.failure_policy import (
     RetryableToolProtocolError,
     classify_provider_failure,
@@ -101,6 +102,13 @@ class OpenAIChatProvider(BaseProvider):
         self._provider_name = profile.provider_name
         self._api_key = config.api_key
         self._base_url = profile.base_url(config.base_url).rstrip("/")
+        # Multiple keys for this provider are served through a rotating pool
+        # that hands the SDK a fresh key after quota/availability failures.
+        self._credential_pool = (
+            CredentialPool(config.api_keys) if config.api_keys else None
+        )
+        if self._credential_pool is not None:
+            api_key_provider = self._credential_pool
         # Learned per-model output-token caps from upstream 400 rejections, so
         # later requests clamp proactively instead of paying the 400 each time.
         self._model_output_caps: dict[str, int] = {}
@@ -223,6 +231,11 @@ class OpenAIChatProvider(BaseProvider):
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                rotated = (
+                    await self._credential_pool.rotate_on_failure(error)
+                    if self._credential_pool is not None
+                    else False
+                )
                 retry_body = self._next_create_retry_body(error, body, used_retry_kinds)
                 if retry_body is not None and retry_session.can_attempt:
                     await attempt.retry_immediately()
@@ -233,6 +246,10 @@ class OpenAIChatProvider(BaseProvider):
                     provider_failure_override=self._provider_failure_override,
                 )
                 if not should_retry:
+                    if rotated and retry_session.can_attempt:
+                        # The failed key was rejected or cooled; retry with a
+                        # different key even though the error was not retryable.
+                        continue
                     raise
             finally:
                 if not retain_attempt:

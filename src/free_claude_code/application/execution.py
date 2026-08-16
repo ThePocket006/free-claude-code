@@ -2,10 +2,12 @@
 
 import sys
 from collections.abc import AsyncIterator, Callable
+from dataclasses import replace
 from typing import Literal
 
 from loguru import logger
 
+from free_claude_code.config.model_refs import parse_model_name, parse_provider_type
 from free_claude_code.core.anthropic import (
     Message,
     SystemContent,
@@ -13,6 +15,7 @@ from free_claude_code.core.anthropic import (
     anthropic_request_snapshot,
     get_token_count,
 )
+from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from free_claude_code.core.trace import (
     close_stream_input,
     trace_event,
@@ -27,6 +30,23 @@ TokenCounter = Callable[
     int,
 ]
 WireApi = Literal["messages", "responses"]
+
+_FAILOVER_ELIGIBLE_KINDS = frozenset(
+    {
+        FailureKind.AUTHENTICATION,
+        FailureKind.PERMISSION,
+        FailureKind.RATE_LIMIT,
+        FailureKind.OVERLOADED,
+        FailureKind.TIMEOUT,
+        FailureKind.UPSTREAM,
+        FailureKind.UNAVAILABLE,
+    }
+)
+
+
+def is_failover_eligible(failure: ExecutionFailure) -> bool:
+    """Return whether an execution failure warrants trying a fallback model."""
+    return failure.kind in _FAILOVER_ELIGIBLE_KINDS
 
 
 class ProviderExecutor:
@@ -110,17 +130,76 @@ class ProviderExecutor:
         )
 
         async def provider_body() -> AsyncIterator[str]:
+            fallback_refs = list(routed.resolved.fallbacks)
+            current_request = routed.request
+            current_resolved = routed.resolved
             provider_stream: AsyncIterator[str] | None = None
+            first_attempt = True
             try:
-                provider_stream = provider.stream_response(
-                    routed.request,
-                    input_tokens=input_tokens,
-                    request_id=request_id,
-                    response_model=gateway_model,
-                    reasoning=routed.reasoning,
-                )
-                async for chunk in provider_stream:
-                    yield chunk
+                while True:
+                    active_provider = self._provider_resolver(
+                        current_resolved.provider_id
+                    )
+                    if not first_attempt:
+                        active_provider.preflight_stream(
+                            current_request,
+                            reasoning=routed.reasoning,
+                        )
+                    first_attempt = False
+                    provider_stream = active_provider.stream_response(
+                        current_request,
+                        input_tokens=input_tokens,
+                        request_id=request_id,
+                        response_model=gateway_model,
+                        reasoning=routed.reasoning,
+                    )
+                    emitted = False
+                    try:
+                        async for chunk in provider_stream:
+                            emitted = True
+                            yield chunk
+                        return
+                    except ExecutionFailure as error:
+                        if emitted or not is_failover_eligible(error):
+                            raise
+                        if not fallback_refs:
+                            raise
+                        await close_stream_input(
+                            provider_stream,
+                            owner="provider_executor",
+                            source="api",
+                            preserved_error=error,
+                        )
+                        provider_stream = None
+                        next_ref = fallback_refs.pop(0)
+                        next_provider_id = parse_provider_type(next_ref)
+                        next_model = parse_model_name(next_ref)
+                        logger.warning(
+                            "FAILOVER: provider='{}' failed ({}), retrying via '{}'",
+                            current_resolved.provider_id,
+                            error.kind.value,
+                            next_ref,
+                        )
+                        trace_event(
+                            stage="routing",
+                            event="free_claude_code.api.route.failover",
+                            source="api",
+                            request_id=request_id,
+                            from_provider=current_resolved.provider_id,
+                            to_provider=next_provider_id,
+                            to_model=next_model,
+                            reason=error.kind.value,
+                        )
+                        current_resolved = replace(
+                            current_resolved,
+                            provider_id=next_provider_id,
+                            provider_model=next_model,
+                            provider_model_ref=next_ref,
+                        )
+                        current_request = current_request.model_copy(
+                            update={"model": next_model}, deep=True
+                        )
+                        continue
             finally:
                 if provider_stream is not None:
                     await close_stream_input(

@@ -133,6 +133,20 @@ SECTIONS: tuple[ConfigSectionSpec, ...] = (
 
 _NON_PROVIDER_FIELDS: tuple[ConfigFieldSpec, ...] = (
     ConfigFieldSpec(
+        "PROVIDER_API_KEYS",
+        "Provider API Key Pool",
+        "providers",
+        "textarea",
+        settings_attr="provider_api_keys",
+        secret=True,
+        description=(
+            "Extra API keys per provider for automatic rotation on quota "
+            "exhaustion or unavailability. JSON object mapping provider id to a "
+            "comma-separated list, e.g. "
+            '{"nvidia_nim": "key1,key2", "open_router": "keyA,keyB"}.'
+        ),
+    ),
+    ConfigFieldSpec(
         "MODEL",
         "Default Model",
         "models",
@@ -172,6 +186,18 @@ _NON_PROVIDER_FIELDS: tuple[ConfigFieldSpec, ...] = (
         "optional_model",
         settings_attr="model_haiku",
         description="Select None to use the Default Model for Haiku requests.",
+    ),
+    ConfigFieldSpec(
+        "MODEL_FALLBACKS",
+        "Fallback Models",
+        "models",
+        "textarea",
+        settings_attr="model_fallbacks",
+        description=(
+            "Comma-separated provider/model slugs tried in order when the "
+            "resolved provider fails with a quota or availability error, e.g. "
+            "open_router/anthropic/claude-sonnet-4, gemini/gemini-2.5-flash."
+        ),
     ),
     ConfigFieldSpec(
         "REASONING_POLICY",

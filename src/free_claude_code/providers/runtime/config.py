@@ -23,6 +23,17 @@ def provider_credential(descriptor: ProviderDescriptor, settings: Settings) -> s
     return ""
 
 
+def provider_credential_pool(
+    descriptor: ProviderDescriptor, settings: Settings
+) -> tuple[str, ...]:
+    """Return the extra rotation keys configured for a provider descriptor."""
+    raw = settings.provider_api_keys.get(descriptor.provider_id, "")
+    if not raw:
+        return ()
+    keys = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return keys
+
+
 def has_provider_configuration(
     descriptor: ProviderDescriptor, settings: Settings
 ) -> bool:
@@ -52,7 +63,9 @@ def build_provider_config(
 ) -> ProviderConfig:
     """Build shared provider configuration for one provider descriptor."""
     credential = provider_credential(descriptor, settings)
-    require_provider_credential(descriptor, credential)
+    pool_keys = provider_credential_pool(descriptor, settings)
+    primary_key = pool_keys[0] if pool_keys else credential
+    require_provider_credential(descriptor, primary_key)
     base_url = string_setting(
         settings, descriptor.base_url_attr, descriptor.default_base_url or ""
     )
@@ -63,7 +76,8 @@ def build_provider_config(
         )
     proxy = string_setting(settings, descriptor.proxy_attr)
     return ProviderConfig(
-        api_key=credential,
+        api_key=primary_key,
+        api_keys=pool_keys,
         base_url=resolved_base_url,
         rate_limit=settings.provider_rate_limit,
         rate_window=settings.provider_rate_window,

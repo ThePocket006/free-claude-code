@@ -39,6 +39,29 @@ def test_model_router_resolves_default_model(settings):
     assert resolved.provider_model == "fallback-model"
     assert resolved.provider_model_ref == "nvidia_nim/fallback-model"
     assert resolved.reasoning_preference is ReasoningPreference.CLIENT
+    assert resolved.fallbacks == ()
+
+
+def test_model_router_carries_configured_fallbacks(settings):
+    settings.model_fallbacks = (
+        "open_router/anthropic/claude-sonnet-4,gemini/models/gemini-3.1-flash"
+    )
+
+    resolved = ModelRouter(settings).resolve("claude-3-opus")
+
+    assert resolved.fallbacks == (
+        "open_router/anthropic/claude-sonnet-4",
+        "gemini/models/gemini-3.1-flash",
+    )
+
+
+def test_model_router_carries_fallbacks_on_direct_route(settings):
+    settings.model_fallbacks = "open_router/anthropic/claude-haiku-4"
+
+    resolved = ModelRouter(settings).resolve("deepseek/deepseek-chat")
+
+    assert resolved.provider_id == "deepseek"
+    assert resolved.fallbacks == ("open_router/anthropic/claude-haiku-4",)
 
 
 def test_model_router_applies_opus_override(settings):

@@ -102,6 +102,7 @@ def _make_settings(**overrides):
     mock.cerebras_api_key = ""
     mock.cerebras_proxy = ""
     mock.ollama_cloud_proxy = ""
+    mock.provider_api_keys = {}
     mock.provider_rate_limit = 40
     mock.provider_rate_window = 60
     mock.provider_max_concurrency = 5
@@ -137,6 +138,13 @@ def test_provider_catalog_covers_advertised_provider_ids():
     assert set(OPENAI_CHAT_PROFILES) < set(PROVIDER_CATALOG)
     for descriptor in PROVIDER_CATALOG.values():
         assert descriptor.provider_id
+
+
+def test_opencode_profiles_carry_zen_compatible_user_agent():
+    """The zen gateway rejects non-'opencode' User-Agents with HTTP 429."""
+    for profile_id in ("opencode", "opencode_go"):
+        profile = OPENAI_CHAT_PROFILES[profile_id]
+        assert profile.user_agent == "opencode"
 
 
 def test_ollama_descriptor_uses_local_openai_endpoint_semantics():
@@ -297,6 +305,42 @@ def test_build_provider_config_opencode_go_uses_opencode_api_key() -> None:
     config = build_provider_config(descriptor, settings)
 
     assert config.api_key == "shared-opencode-token"
+
+
+def test_build_provider_config_uses_credential_pool_when_configured() -> None:
+    descriptor = PROVIDER_CATALOG["nvidia_nim"]
+    settings = _make_settings(
+        nvidia_nim_api_key="primary-key",
+        provider_api_keys={"nvidia_nim": "k1, k2,k3"},
+    )
+
+    config = build_provider_config(descriptor, settings)
+
+    assert config.api_key == "k1"
+    assert config.api_keys == ("k1", "k2", "k3")
+
+
+def test_build_provider_config_pool_falls_back_to_single_key() -> None:
+    descriptor = PROVIDER_CATALOG["nvidia_nim"]
+    settings = _make_settings(nvidia_nim_api_key="solo-key")
+
+    config = build_provider_config(descriptor, settings)
+
+    assert config.api_key == "solo-key"
+    assert config.api_keys == ()
+
+
+def test_build_provider_config_opencode_go_uses_opencode_pool() -> None:
+    descriptor = PROVIDER_CATALOG["opencode_go"]
+    settings = _make_settings(
+        opencode_api_key="shared-opencode-token",
+        provider_api_keys={"opencode_go": "shared-key-1, shared-key-2"},
+    )
+
+    config = build_provider_config(descriptor, settings)
+
+    assert config.api_key == "shared-key-1"
+    assert config.api_keys == ("shared-key-1", "shared-key-2")
 
 
 def test_vercel_descriptor_uses_openai_chat_gateway() -> None:

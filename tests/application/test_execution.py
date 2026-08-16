@@ -10,6 +10,7 @@ from free_claude_code.application.routing import ResolvedModel, RoutedMessagesRe
 from free_claude_code.config.reasoning import ReasoningPreference
 from free_claude_code.core.anthropic.models import Message, MessagesRequest
 from free_claude_code.core.async_iterators import AsyncCloseable
+from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from free_claude_code.core.reasoning import ReasoningPolicy
 
 
@@ -72,6 +73,29 @@ class FailingStreamConstructionProvider(FakeProvider):
         reasoning: ReasoningPolicy,
     ) -> AsyncIterator[str]:
         raise RuntimeError("stream construction failed")
+
+
+class FailingWithFailureProvider(FakeProvider):
+    """Yields nothing but raises the given ExecutionFailure once per stream."""
+
+    def __init__(self, failure: ExecutionFailure) -> None:
+        super().__init__()
+        self.failure = failure
+
+    async def stream_response(
+        self,
+        request: MessagesRequest,
+        input_tokens: int = 0,
+        *,
+        request_id: str | None = None,
+        response_model: str | None = None,
+        reasoning: ReasoningPolicy,
+    ) -> AsyncIterator[str]:
+        try:
+            raise self.failure
+        finally:
+            self.stream_close_calls += 1
+        yield  # pragma: no cover - never reached
 
 
 def _routed_request() -> RoutedMessagesRequest:
@@ -186,3 +210,156 @@ def test_executor_preflight_failure_stays_before_token_count_and_stream() -> Non
 
     token_counter.assert_not_called()
     assert provider.stream_calls == []
+
+
+def _routed_with_fallbacks(*fallbacks: str) -> RoutedMessagesRequest:
+    routed = _routed_request()
+    return RoutedMessagesRequest(
+        request=routed.request,
+        resolved=ResolvedModel(
+            original_model=routed.resolved.original_model,
+            provider_id=routed.resolved.provider_id,
+            provider_model=routed.resolved.provider_model,
+            provider_model_ref=routed.resolved.provider_model_ref,
+            reasoning_preference=routed.resolved.reasoning_preference,
+            fallbacks=fallbacks,
+        ),
+        reasoning=routed.reasoning,
+    )
+
+
+@pytest.mark.asyncio
+async def test_executor_fails_over_to_fallback_provider_on_retryable_failure() -> None:
+    primary = FailingWithFailureProvider(
+        ExecutionFailure(
+            kind=FailureKind.RATE_LIMIT,
+            status_code=429,
+            message="rate limited",
+            retryable=True,
+        )
+    )
+    fallback = FakeProvider()
+    providers = {"provider": primary, "open_router": fallback}
+    executor = ProviderExecutor(
+        lambda provider_id: providers[provider_id],
+        token_counter=lambda _m, _s, _t: 17,
+    )
+
+    stream = executor.stream(
+        _routed_with_fallbacks("open_router/anthropic/claude-sonnet-4"),
+        wire_api="messages",
+        raw_log_label="FULL_PAYLOAD",
+        raw_log_payload={},
+        request_id="req_failover",
+    )
+
+    chunks = [chunk async for chunk in stream]
+
+    assert chunks == ["event: message_stop\ndata: {}\n\n"]
+    assert primary.stream_calls == []
+    assert len(fallback.stream_calls) == 1
+    fallback_request = fallback.stream_calls[0]["request"]
+    assert isinstance(fallback_request, MessagesRequest)
+    assert fallback_request.model == "anthropic/claude-sonnet-4"
+
+
+@pytest.mark.asyncio
+async def test_executor_raises_when_no_fallback_configured() -> None:
+    primary = FailingWithFailureProvider(
+        ExecutionFailure(
+            kind=FailureKind.RATE_LIMIT,
+            status_code=429,
+            message="rate limited",
+            retryable=True,
+        )
+    )
+    executor = ProviderExecutor(
+        lambda _provider_id: primary,
+        token_counter=lambda _m, _s, _t: 17,
+    )
+
+    stream = executor.stream(
+        _routed_request(),
+        wire_api="messages",
+        raw_log_label="FULL_PAYLOAD",
+        raw_log_payload={},
+        request_id="req_no_fallback",
+    )
+
+    with pytest.raises(ExecutionFailure, match="rate limited"):
+        await anext(stream)
+
+
+@pytest.mark.asyncio
+async def test_executor_does_not_fail_over_for_non_retryable_kind() -> None:
+    primary = FailingWithFailureProvider(
+        ExecutionFailure(
+            kind=FailureKind.INVALID_REQUEST,
+            status_code=400,
+            message="bad request",
+            retryable=False,
+        )
+    )
+    executor = ProviderExecutor(
+        lambda _provider_id: primary,
+        token_counter=lambda _m, _s, _t: 17,
+    )
+
+    stream = executor.stream(
+        _routed_with_fallbacks("open_router/anthropic/claude-sonnet-4"),
+        wire_api="messages",
+        raw_log_label="FULL_PAYLOAD",
+        raw_log_payload={},
+        request_id="req_invalid",
+    )
+
+    with pytest.raises(ExecutionFailure, match="bad request"):
+        await anext(stream)
+
+
+@pytest.mark.asyncio
+async def test_executor_does_not_fail_over_after_first_chunk_emitted() -> None:
+    class FailsAfterFirstChunkProvider(FakeProvider):
+        async def stream_response(
+            self,
+            request: MessagesRequest,
+            input_tokens: int = 0,
+            *,
+            request_id: str | None = None,
+            response_model: str | None = None,
+            reasoning: ReasoningPolicy,
+        ) -> AsyncIterator[str]:
+            try:
+                yield "event: message_start\ndata: {}\n\n"
+                raise ExecutionFailure(
+                    kind=FailureKind.RATE_LIMIT,
+                    status_code=429,
+                    message="rate limited mid-stream",
+                    retryable=True,
+                )
+            finally:
+                self.stream_close_calls += 1
+
+    primary = FailsAfterFirstChunkProvider()
+    fallback = FakeProvider()
+    providers = {"provider": primary, "open_router": fallback}
+    executor = ProviderExecutor(
+        lambda provider_id: providers[provider_id],
+        token_counter=lambda _m, _s, _t: 17,
+    )
+
+    stream = executor.stream(
+        _routed_with_fallbacks("open_router/anthropic/claude-sonnet-4"),
+        wire_api="messages",
+        raw_log_label="FULL_PAYLOAD",
+        raw_log_payload={},
+        request_id="req_mid_stream",
+    )
+
+    # The first chunk was already emitted: failover is no longer allowed and
+    # the failure must propagate to the caller.
+    assert await anext(stream) == "event: message_start\ndata: {}\n\n"
+    with pytest.raises(ExecutionFailure, match="rate limited mid-stream"):
+        await anext(stream)
+
+    assert fallback.stream_calls == []

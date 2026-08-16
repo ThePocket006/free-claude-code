@@ -1,10 +1,10 @@
 """Flat application settings schema loaded by Pydantic Settings."""
 
 from functools import lru_cache
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .constants import HTTP_CONNECT_TIMEOUT_DEFAULT
 from .env_files import (
@@ -148,6 +148,17 @@ class Settings(BaseSettings):
     model_opus: str | None = Field(default=None, validation_alias="MODEL_OPUS")
     model_sonnet: str | None = Field(default=None, validation_alias="MODEL_SONNET")
     model_haiku: str | None = Field(default=None, validation_alias="MODEL_HAIKU")
+
+    # Comma-separated fallback model refs (provider/model/name) tried in order
+    # when the resolved provider fails with a quota/availability error.
+    model_fallbacks: str = Field(default="", validation_alias="MODEL_FALLBACKS")
+
+    # Extra API keys per provider, used for automatic rotation on quota
+    # exhaustion or unavailability. JSON map: provider_id -> comma-separated keys.
+    # Example: {"nvidia_nim": "key1,key2", "open_router": "keyA,keyB"}
+    provider_api_keys: Annotated[dict[str, str], NoDecode] = Field(
+        default_factory=dict, validation_alias="PROVIDER_API_KEYS"
+    )
 
     # ==================== Per-Provider Proxy ====================
     nvidia_nim_proxy: str = Field(default="", validation_alias="NVIDIA_NIM_PROXY")
@@ -421,6 +432,50 @@ class Settings(BaseSettings):
         if provider not in SUPPORTED_PROVIDER_IDS:
             supported = ", ".join(f"'{p}'" for p in SUPPORTED_PROVIDER_IDS)
             raise ValueError(f"Invalid provider: '{provider}'. Supported: {supported}")
+        return v
+
+    @field_validator("model_fallbacks")
+    @classmethod
+    def validate_model_fallbacks(cls, v: str) -> str:
+        """Validate every comma-separated fallback ref with model-format rules."""
+        refs = [part.strip() for part in v.split(",") if part.strip()]
+        for ref in refs:
+            if "/" not in ref:
+                raise ValueError(
+                    f"MODEL_FALLBACKS entry must be prefixed with provider type. "
+                    f"Format: provider_type/model/name. Got: {ref!r}"
+                )
+            provider = ref.split("/", 1)[0]
+            if provider not in SUPPORTED_PROVIDER_IDS:
+                supported = ", ".join(f"'{p}'" for p in SUPPORTED_PROVIDER_IDS)
+                raise ValueError(
+                    f"Invalid provider in MODEL_FALLBACKS: '{provider}'. "
+                    f"Supported: {supported}"
+                )
+        return ",".join(refs)
+
+    @field_validator("provider_api_keys", mode="before")
+    @classmethod
+    def parse_provider_api_keys(cls, v: Any) -> Any:
+        """Tolerate a raw JSON object string for PROVIDER_API_KEYS."""
+        if isinstance(v, str):
+            if not v.strip():
+                return {}
+            import json
+
+            try:
+                parsed = json.loads(v)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "PROVIDER_API_KEYS must be a JSON object mapping "
+                    "provider_id -> comma-separated keys"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    "PROVIDER_API_KEYS must be a JSON object mapping "
+                    "provider_id -> comma-separated keys"
+                )
+            return parsed
         return v
 
     @model_validator(mode="after")

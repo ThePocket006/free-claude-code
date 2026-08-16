@@ -33,6 +33,9 @@ class ResolvedModel:
     provider_model: str
     provider_model_ref: str
     reasoning_preference: ReasoningPreference
+    # Fallback model refs (provider/model/name) tried in order when the
+    # primary provider fails with a quota/availability error.
+    fallbacks: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +58,7 @@ class ModelRouter:
         self._settings = settings
 
     def resolve(self, claude_model_name: str) -> ResolvedModel:
+        fallbacks = self._fallbacks()
         (
             direct_provider_id,
             direct_provider_model,
@@ -79,6 +83,7 @@ class ModelRouter:
                 provider_model=direct_provider_model,
                 provider_model_ref=claude_model_name,
                 reasoning_preference=reasoning_preference,
+                fallbacks=fallbacks,
             )
 
         provider_model_ref = self._resolve_model_ref(claude_model_name)
@@ -96,7 +101,17 @@ class ModelRouter:
             provider_model=provider_model,
             provider_model_ref=provider_model_ref,
             reasoning_preference=reasoning_preference,
+            fallbacks=fallbacks,
         )
+
+    def _fallbacks(self) -> tuple[str, ...]:
+        """Return the configured fallback model refs, excluding the primary."""
+        refs = tuple(
+            part.strip()
+            for part in self._settings.model_fallbacks.split(",")
+            if part.strip()
+        )
+        return refs
 
     @staticmethod
     def _validate_provider_id(provider_id: str) -> None:
