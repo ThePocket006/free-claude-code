@@ -58,7 +58,8 @@ class ModelRouter:
         self._settings = settings
 
     def resolve(self, claude_model_name: str) -> ResolvedModel:
-        fallbacks = self._fallbacks()
+        tier = self._detect_tier(claude_model_name)
+        fallbacks = self._fallbacks(tier)
         (
             direct_provider_id,
             direct_provider_model,
@@ -104,14 +105,33 @@ class ModelRouter:
             fallbacks=fallbacks,
         )
 
-    def _fallbacks(self) -> tuple[str, ...]:
-        """Return the configured fallback model refs, excluding the primary."""
+    def _fallbacks(self, tier: str | None = None) -> tuple[str, ...]:
+        """Return fallback model refs, preferring per-tier over global."""
+        # Check per-tier fallback first.
+        if tier is not None:
+            tier_attr = f"model_fallbacks_{tier}"
+            tier_value = getattr(self._settings, tier_attr, "")
+            if tier_value:
+                refs = tuple(
+                    part.strip() for part in tier_value.split(",") if part.strip()
+                )
+                return refs
+        # Fall back to global fallbacks.
         refs = tuple(
             part.strip()
             for part in self._settings.model_fallbacks.split(",")
             if part.strip()
         )
         return refs
+
+    @staticmethod
+    def _detect_tier(model_name: str) -> str | None:
+        """Detect the Claude tier from the model name."""
+        normalized = model_name.lower()
+        for tier in ("fable", "opus", "sonnet", "haiku"):
+            if tier in normalized:
+                return tier
+        return None
 
     @staticmethod
     def _validate_provider_id(provider_id: str) -> None:

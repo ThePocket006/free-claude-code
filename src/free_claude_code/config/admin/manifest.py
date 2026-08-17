@@ -147,6 +147,42 @@ _NON_PROVIDER_FIELDS: tuple[ConfigFieldSpec, ...] = (
         ),
     ),
     ConfigFieldSpec(
+        "PROVIDER_KEY_COOLDOWN_SECONDS",
+        "Key Cooldown (s)",
+        "providers",
+        "number",
+        settings_attr="provider_key_cooldown_seconds",
+        default="60.0",
+        description=(
+            "Seconds before a temporarily-failed API key (429 / 5xx) is retried. "
+            "Increase for providers with strict rate limits."
+        ),
+    ),
+    ConfigFieldSpec(
+        "CIRCUIT_BREAKER_THRESHOLD",
+        "Circuit Breaker Threshold",
+        "providers",
+        "number",
+        settings_attr="circuit_breaker_threshold",
+        default="3",
+        description=(
+            "Number of recent failures (within cooldown window) that trip a "
+            "provider to OPEN state, skipping it until cooldown expires."
+        ),
+    ),
+    ConfigFieldSpec(
+        "CIRCUIT_BREAKER_COOLDOWN",
+        "Circuit Breaker Cooldown (s)",
+        "providers",
+        "number",
+        settings_attr="circuit_breaker_cooldown",
+        default="120.0",
+        description=(
+            "Seconds a provider stays in OPEN state (skipped) before allowing "
+            "a single probe request."
+        ),
+    ),
+    ConfigFieldSpec(
         "MODEL",
         "Default Model",
         "models",
@@ -197,6 +233,50 @@ _NON_PROVIDER_FIELDS: tuple[ConfigFieldSpec, ...] = (
             "Comma-separated provider/model slugs tried in order when the "
             "resolved provider fails with a quota or availability error, e.g. "
             "open_router/anthropic/claude-sonnet-4, gemini/gemini-2.5-flash."
+        ),
+    ),
+    ConfigFieldSpec(
+        "MODEL_FALLBACKS_FABLE",
+        "Fable Fallbacks",
+        "models",
+        "textarea",
+        settings_attr="model_fallbacks_fable",
+        description=(
+            "Per-tier fallback overrides for Fable. Takes precedence over "
+            "Fallback Models when set. Empty = use global fallbacks."
+        ),
+    ),
+    ConfigFieldSpec(
+        "MODEL_FALLBACKS_OPUS",
+        "Opus Fallbacks",
+        "models",
+        "textarea",
+        settings_attr="model_fallbacks_opus",
+        description=(
+            "Per-tier fallback overrides for Opus. Takes precedence over "
+            "Fallback Models when set. Empty = use global fallbacks."
+        ),
+    ),
+    ConfigFieldSpec(
+        "MODEL_FALLBACKS_SONNET",
+        "Sonnet Fallbacks",
+        "models",
+        "textarea",
+        settings_attr="model_fallbacks_sonnet",
+        description=(
+            "Per-tier fallback overrides for Sonnet. Takes precedence over "
+            "Fallback Models when set. Empty = use global fallbacks."
+        ),
+    ),
+    ConfigFieldSpec(
+        "MODEL_FALLBACKS_HAIKU",
+        "Haiku Fallbacks",
+        "models",
+        "textarea",
+        settings_attr="model_fallbacks_haiku",
+        description=(
+            "Per-tier fallback overrides for Haiku. Takes precedence over "
+            "Fallback Models when set. Empty = use global fallbacks."
         ),
     ),
     ConfigFieldSpec(

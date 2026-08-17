@@ -21,6 +21,7 @@ from free_claude_code.core.trace import (
     trace_event,
     traced_async_stream,
 )
+from free_claude_code.core.circuit_breaker import CircuitBreakerRegistry
 
 from .ports import ProviderResolver
 from .routing import RoutedMessagesRequest
@@ -59,11 +60,13 @@ class ProviderExecutor:
         token_counter: TokenCounter = get_token_count,
         generation_id: int | None = None,
         log_raw_payloads: bool = False,
+        circuit_breakers: CircuitBreakerRegistry | None = None,
     ) -> None:
         self._provider_resolver = provider_resolver
         self._token_counter = token_counter
         self._generation_id = generation_id
         self._log_raw_payloads = log_raw_payloads
+        self._circuit_breakers = circuit_breakers
 
     def stream(
         self,
@@ -137,6 +140,53 @@ class ProviderExecutor:
             first_attempt = True
             try:
                 while True:
+                    # Circuit breaker: skip known-unhealthy providers.
+                    if self._circuit_breakers is not None and not first_attempt:
+                        breaker = self._circuit_breakers.get(
+                            current_resolved.provider_id
+                        )
+                        if not breaker.is_healthy:
+                            if not fallback_refs:
+                                raise ExecutionFailure(
+                                    kind=FailureKind.UNAVAILABLE,
+                                    status_code=503,
+                                    message=(
+                                        f"Provider '{current_resolved.provider_id}' "
+                                        "is circuit-broken (open). No fallbacks."
+                                    ),
+                                    retryable=False,
+                                )
+                            next_ref = fallback_refs.pop(0)
+                            next_provider_id = parse_provider_type(next_ref)
+                            next_model = parse_model_name(next_ref)
+                            logger.warning(
+                                "CIRCUIT_BREAKER: provider='{}' is OPEN, "
+                                "skipping to '{}'",
+                                current_resolved.provider_id,
+                                next_ref,
+                            )
+                            trace_event(
+                                stage="routing",
+                                event=(
+                                    "free_claude_code.api.route.circuit_breaker_skip"
+                                ),
+                                source="api",
+                                request_id=request_id,
+                                skipped_provider=current_resolved.provider_id,
+                                to_provider=next_provider_id,
+                                to_model=next_model,
+                            )
+                            current_resolved = replace(
+                                current_resolved,
+                                provider_id=next_provider_id,
+                                provider_model=next_model,
+                                provider_model_ref=next_ref,
+                            )
+                            current_request = current_request.model_copy(
+                                update={"model": next_model}, deep=True
+                            )
+                            continue
+
                     active_provider = self._provider_resolver(
                         current_resolved.provider_id
                     )
@@ -158,8 +208,18 @@ class ProviderExecutor:
                         async for chunk in provider_stream:
                             emitted = True
                             yield chunk
+                        # Stream succeeded — record success in circuit breaker.
+                        if self._circuit_breakers is not None:
+                            self._circuit_breakers.get(
+                                current_resolved.provider_id
+                            ).record_success()
                         return
                     except ExecutionFailure as error:
+                        # Record failure in the circuit breaker for this provider.
+                        if self._circuit_breakers is not None:
+                            self._circuit_breakers.get(
+                                current_resolved.provider_id
+                            ).record_failure(error)
                         if emitted or not is_failover_eligible(error):
                             raise
                         if not fallback_refs:

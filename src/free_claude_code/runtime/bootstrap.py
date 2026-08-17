@@ -10,6 +10,7 @@ from free_claude_code.config.paths import server_log_path
 from free_claude_code.config.settings import Settings
 from free_claude_code.messaging.transcription import TranscriptionService
 from free_claude_code.messaging.voice import Transcriber
+from free_claude_code.core.circuit_breaker import CircuitBreakerRegistry
 from free_claude_code.providers.nvidia_nim.voice import NvidiaNimTranscriber
 
 from .application import ApplicationRuntime, RestartCallback
@@ -38,6 +39,10 @@ def build_asgi_app(
         requests=provider_manager,
         admin=runtime,
         tasks=runtime,
+        circuit_breakers=CircuitBreakerRegistry(
+            threshold=settings.circuit_breaker_threshold,
+            cooldown_seconds=settings.circuit_breaker_cooldown,
+        ),
     )
     return RuntimeASGIApp(create_app(services), runtime)
 

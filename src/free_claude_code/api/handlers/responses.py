@@ -27,6 +27,7 @@ from free_claude_code.core.openai_responses import (
     openai_error_type_for_failure,
     openai_failure_payload,
 )
+from free_claude_code.core.circuit_breaker import CircuitBreakerRegistry
 
 
 class ResponsesHandler:
@@ -41,6 +42,7 @@ class ResponsesHandler:
         responses_adapter: OpenAIResponsesAdapter | None = None,
         provider_executor: ProviderExecutor | None = None,
         generation_id: int | None = None,
+        circuit_breakers: CircuitBreakerRegistry | None = None,
     ) -> None:
         self._settings = settings
         self._model_router = model_router or ModelRouter(settings)
@@ -49,6 +51,7 @@ class ResponsesHandler:
             provider_resolver,
             generation_id=generation_id,
             log_raw_payloads=settings.log_raw_api_payloads,
+            circuit_breakers=circuit_breakers,
         )
 
     async def create(

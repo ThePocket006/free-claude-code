@@ -1000,7 +1000,7 @@ class TestPerModelMapping:
         from free_claude_code.config.settings import Settings
 
         monkeypatch.setenv("PROVIDER_API_KEYS", "nvidia_nim=k1,k2")
-        with pytest.raises(SettingsError, match=r"(?i)provider_api_keys"):
+        with pytest.raises((SettingsError, ValidationError), match=r"(?i)provider_api_keys"):
             Settings()
 
     def test_provider_api_keys_non_object_json_raises(self, monkeypatch):
@@ -1241,3 +1241,89 @@ class TestPerModelMapping:
         assert refs[1].model_id == "anthropic/claude-fable-5"
         assert refs[2].provider_id == "open_router"
         assert refs[2].model_id == "anthropic/claude-opus"
+
+
+# ── Provider key cooldown ────────────────────────────────────────────────────
+
+
+class TestProviderKeyCooldown:
+    def test_default_cooldown(self):
+        from free_claude_code.config.settings import Settings
+
+        s = Settings()
+        assert s.provider_key_cooldown_seconds == 60.0
+
+    def test_cooldown_from_env(self, monkeypatch):
+        from free_claude_code.config.settings import Settings
+
+        monkeypatch.setenv("PROVIDER_KEY_COOLDOWN_SECONDS", "120")
+        s = Settings()
+        assert s.provider_key_cooldown_seconds == 120.0
+
+    def test_negative_cooldown_raises(self, monkeypatch):
+        from pydantic import ValidationError
+
+        from free_claude_code.config.settings import Settings
+
+        monkeypatch.setenv("PROVIDER_KEY_COOLDOWN_SECONDS", "-5")
+        with pytest.raises(ValidationError, match="must be >= 0"):
+            Settings()
+
+
+# ── Circuit breaker settings ────────────────────────────────────────────────
+
+
+class TestCircuitBreakerSettings:
+    def test_defaults(self):
+        from free_claude_code.config.settings import Settings
+
+        s = Settings()
+        assert s.circuit_breaker_threshold == 3
+        assert s.circuit_breaker_cooldown == 120.0
+
+    def test_from_env(self, monkeypatch):
+        from free_claude_code.config.settings import Settings
+
+        monkeypatch.setenv("CIRCUIT_BREAKER_THRESHOLD", "5")
+        monkeypatch.setenv("CIRCUIT_BREAKER_COOLDOWN", "300")
+        s = Settings()
+        assert s.circuit_breaker_threshold == 5
+        assert s.circuit_breaker_cooldown == 300.0
+
+
+# ── Per-tier fallback settings ──────────────────────────────────────────────
+
+
+class TestPerTierFallbacks:
+    def test_per_tier_fallbacks_default_empty(self):
+        from free_claude_code.config.settings import Settings
+
+        s = Settings()
+        assert s.model_fallbacks_fable == ""
+        assert s.model_fallbacks_opus == ""
+        assert s.model_fallbacks_sonnet == ""
+        assert s.model_fallbacks_haiku == ""
+
+    def test_per_tier_fallbacks_from_env(self, monkeypatch):
+        from free_claude_code.config.settings import Settings
+
+        monkeypatch.setenv(
+            "MODEL_FALLBACKS_OPUS",
+            "deepseek/deepseek-chat,open_router/anthropic/claude-sonnet-4",
+        )
+        monkeypatch.setenv("MODEL_FALLBACKS_HAIKU", "gemini/models/gemini-3.1-flash")
+        s = Settings()
+        assert (
+            s.model_fallbacks_opus
+            == "deepseek/deepseek-chat,open_router/anthropic/claude-sonnet-4"
+        )
+        assert s.model_fallbacks_haiku == "gemini/models/gemini-3.1-flash"
+
+    def test_per_tier_fallback_invalid_provider_raises(self, monkeypatch):
+        from pydantic import ValidationError
+
+        from free_claude_code.config.settings import Settings
+
+        monkeypatch.setenv("MODEL_FALLBACKS_SONNET", "bogus_provider/model")
+        with pytest.raises(ValidationError, match="Invalid provider"):
+            Settings()

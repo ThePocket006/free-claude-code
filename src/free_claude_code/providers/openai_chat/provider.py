@@ -105,7 +105,12 @@ class OpenAIChatProvider(BaseProvider):
         # Multiple keys for this provider are served through a rotating pool
         # that hands the SDK a fresh key after quota/availability failures.
         self._credential_pool = (
-            CredentialPool(config.api_keys) if config.api_keys else None
+            CredentialPool(
+                config.api_keys,
+                cooldown_seconds=config.key_cooldown_seconds,
+            )
+            if config.api_keys
+            else None
         )
         if self._credential_pool is not None:
             api_key_provider = self._credential_pool

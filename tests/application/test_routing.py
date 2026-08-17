@@ -293,3 +293,62 @@ def test_model_router_preserves_typed_error_for_unknown_mapped_provider(settings
     assert str(exc_info.value) == (
         f"Unknown provider_type: 'unknown'. Supported: '{supported}'"
     )
+
+
+# ── Per-tier fallback tests ──────────────────────────────────────────────────
+
+
+def test_per_tier_fallback_overrides_global(settings):
+    settings.model_fallbacks = "open_router/anthropic/claude-sonnet-4"
+    settings.model_fallbacks_opus = "deepseek/deepseek-chat"
+
+    resolved = ModelRouter(settings).resolve("claude-opus-4-20250514")
+
+    assert resolved.fallbacks == ("deepseek/deepseek-chat",)
+
+
+def test_per_tier_fallback_empty_uses_global(settings):
+    settings.model_fallbacks = "open_router/anthropic/claude-sonnet-4"
+    settings.model_fallbacks_opus = ""
+
+    resolved = ModelRouter(settings).resolve("claude-opus-4-20250514")
+
+    assert resolved.fallbacks == ("open_router/anthropic/claude-sonnet-4",)
+
+
+def test_per_tier_fallback_sonnet(settings):
+    settings.model_fallbacks = "gemini/models/gemini-3.1-flash"
+    settings.model_fallbacks_sonnet = "deepseek/deepseek-chat"
+
+    resolved = ModelRouter(settings).resolve("claude-sonnet-4-20250514")
+
+    assert resolved.fallbacks == ("deepseek/deepseek-chat",)
+
+
+def test_per_tier_fallback_haiku(settings):
+    settings.model_fallbacks_haiku = (
+        "open_router/anthropic/claude-sonnet-4,gemini/models/gemini-3.1-flash"
+    )
+
+    resolved = ModelRouter(settings).resolve("claude-haiku-4-20250514")
+
+    assert resolved.fallbacks == (
+        "open_router/anthropic/claude-sonnet-4",
+        "gemini/models/gemini-3.1-flash",
+    )
+
+
+def test_per_tier_fallback_fable(settings):
+    settings.model_fallbacks_fable = "deepseek/deepseek-chat"
+
+    resolved = ModelRouter(settings).resolve("claude-fable")
+
+    assert resolved.fallbacks == ("deepseek/deepseek-chat",)
+
+
+def test_no_tier_detected_uses_global(settings):
+    settings.model_fallbacks = "open_router/anthropic/claude-sonnet-4"
+
+    resolved = ModelRouter(settings).resolve("deepseek/deepseek-chat")
+
+    assert resolved.fallbacks == ("open_router/anthropic/claude-sonnet-4",)

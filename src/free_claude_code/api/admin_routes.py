@@ -123,6 +123,23 @@ async def admin_status(
     return services.admin.admin_status()
 
 
+@router.get("/admin/api/providers/health")
+async def provider_health(
+    request: Request,
+    services: ApiServices = Depends(get_services),
+):
+    """Circuit breaker and credential pool health per provider."""
+    require_loopback_admin(request)
+    circuit_status = (
+        services.circuit_breakers.status_snapshot()
+        if services.circuit_breakers is not None
+        else {}
+    )
+    return {
+        "circuit_breakers": circuit_status,
+    }
+
+
 @router.get("/admin/api/providers/local-status")
 async def local_provider_status(request: Request):
     require_loopback_admin(request)

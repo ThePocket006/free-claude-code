@@ -153,11 +153,41 @@ class Settings(BaseSettings):
     # when the resolved provider fails with a quota/availability error.
     model_fallbacks: str = Field(default="", validation_alias="MODEL_FALLBACKS")
 
+    # Per-tier fallback overrides. When set, these take precedence over the
+    # global MODEL_FALLBACKS for requests matching that Claude tier.
+    model_fallbacks_fable: str = Field(
+        default="", validation_alias="MODEL_FALLBACKS_FABLE"
+    )
+    model_fallbacks_opus: str = Field(
+        default="", validation_alias="MODEL_FALLBACKS_OPUS"
+    )
+    model_fallbacks_sonnet: str = Field(
+        default="", validation_alias="MODEL_FALLBACKS_SONNET"
+    )
+    model_fallbacks_haiku: str = Field(
+        default="", validation_alias="MODEL_FALLBACKS_HAIKU"
+    )
+
     # Extra API keys per provider, used for automatic rotation on quota
     # exhaustion or unavailability. JSON map: provider_id -> comma-separated keys.
     # Example: {"nvidia_nim": "key1,key2", "open_router": "keyA,keyB"}
     provider_api_keys: Annotated[dict[str, str], NoDecode] = Field(
         default_factory=dict, validation_alias="PROVIDER_API_KEYS"
+    )
+
+    # Cooldown in seconds before a temporarily-failed API key is retried.
+    provider_key_cooldown_seconds: float = Field(
+        default=60.0, validation_alias="PROVIDER_KEY_COOLDOWN_SECONDS"
+    )
+
+    # Circuit breaker: number of recent failures (within cooldown window) that
+    # trip a provider to OPEN state (skip it for the cooldown period).
+    circuit_breaker_threshold: int = Field(
+        default=3, validation_alias="CIRCUIT_BREAKER_THRESHOLD"
+    )
+    # Circuit breaker: seconds a provider stays OPEN before allowing a probe.
+    circuit_breaker_cooldown: float = Field(
+        default=120.0, validation_alias="CIRCUIT_BREAKER_COOLDOWN"
     )
 
     # ==================== Per-Provider Proxy ====================
@@ -438,18 +468,43 @@ class Settings(BaseSettings):
     @classmethod
     def validate_model_fallbacks(cls, v: str) -> str:
         """Validate every comma-separated fallback ref with model-format rules."""
+        return cls._validate_fallback_refs(v, "MODEL_FALLBACKS")
+
+    @field_validator("model_fallbacks_fable")
+    @classmethod
+    def validate_model_fallbacks_fable(cls, v: str) -> str:
+        return cls._validate_fallback_refs(v, "MODEL_FALLBACKS_FABLE")
+
+    @field_validator("model_fallbacks_opus")
+    @classmethod
+    def validate_model_fallbacks_opus(cls, v: str) -> str:
+        return cls._validate_fallback_refs(v, "MODEL_FALLBACKS_OPUS")
+
+    @field_validator("model_fallbacks_sonnet")
+    @classmethod
+    def validate_model_fallbacks_sonnet(cls, v: str) -> str:
+        return cls._validate_fallback_refs(v, "MODEL_FALLBACKS_SONNET")
+
+    @field_validator("model_fallbacks_haiku")
+    @classmethod
+    def validate_model_fallbacks_haiku(cls, v: str) -> str:
+        return cls._validate_fallback_refs(v, "MODEL_FALLBACKS_HAIKU")
+
+    @staticmethod
+    def _validate_fallback_refs(v: str, field_name: str) -> str:
+        """Validate comma-separated fallback refs with model-format rules."""
         refs = [part.strip() for part in v.split(",") if part.strip()]
         for ref in refs:
             if "/" not in ref:
                 raise ValueError(
-                    f"MODEL_FALLBACKS entry must be prefixed with provider type. "
+                    f"{field_name} entry must be prefixed with provider type. "
                     f"Format: provider_type/model/name. Got: {ref!r}"
                 )
             provider = ref.split("/", 1)[0]
             if provider not in SUPPORTED_PROVIDER_IDS:
                 supported = ", ".join(f"'{p}'" for p in SUPPORTED_PROVIDER_IDS)
                 raise ValueError(
-                    f"Invalid provider in MODEL_FALLBACKS: '{provider}'. "
+                    f"Invalid provider in {field_name}: '{provider}'. "
                     f"Supported: {supported}"
                 )
         return ",".join(refs)
@@ -476,6 +531,14 @@ class Settings(BaseSettings):
                     "provider_id -> comma-separated keys"
                 )
             return parsed
+        return v
+
+    @field_validator("provider_key_cooldown_seconds")
+    @classmethod
+    def validate_key_cooldown(cls, v: float) -> float:
+        """Key cooldown must be non-negative."""
+        if v < 0:
+            raise ValueError(f"PROVIDER_KEY_COOLDOWN_SECONDS must be >= 0. Got: {v}")
         return v
 
     @model_validator(mode="after")

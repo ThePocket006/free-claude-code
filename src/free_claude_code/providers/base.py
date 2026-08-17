@@ -40,6 +40,8 @@ class ProviderConfig:
     # unavailability. ``api_key`` stays as the primary credential so callers
     # that only read the singular field keep working unchanged.
     api_keys: tuple[str, ...] = ()
+    # Seconds before a temporarily-failed key is retried (429 / 5xx cooldown).
+    key_cooldown_seconds: float = 60.0
 
 
 class BaseProvider(ABC):

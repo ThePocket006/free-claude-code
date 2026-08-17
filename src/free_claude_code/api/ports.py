@@ -6,6 +6,7 @@ from typing import Any, Protocol
 
 from free_claude_code.application.model_metadata import ProviderModelRefreshResult
 from free_claude_code.application.ports import RequestRuntimePort, TaskController
+from free_claude_code.core.circuit_breaker import CircuitBreakerRegistry
 
 
 class AdminRuntimePort(Protocol):
@@ -31,3 +32,4 @@ class ApiServices:
     requests: RequestRuntimePort
     admin: AdminRuntimePort
     tasks: TaskController
+    circuit_breakers: CircuitBreakerRegistry | None = None
