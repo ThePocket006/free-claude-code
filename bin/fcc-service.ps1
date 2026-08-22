@@ -194,12 +194,12 @@ function Get-FccLogs {
         return
     }
     if ($Follow) {
-        Get-Content -Path $target -Wait -Tail 30
+        Get-Content -Path $target -Wait -Tail 40
     }
     else {
         foreach ($log in $target) {
             Write-Host "===== $log =====" -ForegroundColor Cyan
-            Get-Content -Path $log -Tail 30
+            Get-Content -Path $log -Tail 40
         }
     }
 }
