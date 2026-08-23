@@ -1,6 +1,7 @@
 """Single production composition root for the FCC server."""
 
 import os
+from functools import partial
 from pathlib import Path
 
 from free_claude_code.api.app import create_app
@@ -8,13 +9,22 @@ from free_claude_code.api.ports import ApiServices
 from free_claude_code.config.logging_config import configure_logging
 from free_claude_code.config.paths import server_log_path
 from free_claude_code.config.settings import Settings
+from free_claude_code.core.circuit_breaker import CircuitBreakerRegistry
 from free_claude_code.messaging.transcription import TranscriptionService
 from free_claude_code.messaging.voice import Transcriber
-from free_claude_code.core.circuit_breaker import CircuitBreakerRegistry
+from free_claude_code.providers.admission import ProviderAdmissionController
+from free_claude_code.providers.base import BaseProvider, ProviderConfig
 from free_claude_code.providers.nvidia_nim.voice import NvidiaNimTranscriber
+from free_claude_code.providers.openai_codex import (
+    OpenAIAuthManager,
+    OpenAICodexProvider,
+)
+from free_claude_code.providers.runtime import ProviderRuntime
+from free_claude_code.providers.runtime.factory import create_provider
 
 from .application import ApplicationRuntime, RestartCallback
 from .asgi import RuntimeASGIApp
+from .codex_catalog import CodexModelCatalogPublisher
 from .provider_manager import ProviderRuntimeManager
 
 
@@ -29,11 +39,27 @@ def build_asgi_app(
         level=settings.log_level,
         verbose_third_party=settings.log_raw_api_payloads,
     )
-    provider_manager = ProviderRuntimeManager(settings)
+    openai_auth = OpenAIAuthManager(proxy=settings.openai_proxy)
+    openai_factory = partial(_create_openai_provider, auth=openai_auth)
+    provider_constructor = partial(
+        create_provider,
+        injected_factories={"openai": openai_factory},
+    )
+    runtime_factory = partial(
+        ProviderRuntime,
+        provider_constructor=provider_constructor,
+    )
+    provider_manager = ProviderRuntimeManager(
+        settings,
+        runtime_factory=runtime_factory,
+        connected_provider_ids=openai_auth.connected_provider_ids,
+        model_catalog_publisher=CodexModelCatalogPublisher(),
+    )
     runtime = ApplicationRuntime(
         provider_manager,
         transcriber=_create_transcriber(settings),
         restart_callback=restart_callback,
+        connected_accounts={"openai": openai_auth},
     )
     services = ApiServices(
         requests=provider_manager,
@@ -47,16 +73,32 @@ def build_asgi_app(
     return RuntimeASGIApp(create_app(services), runtime)
 
 
+def _create_openai_provider(
+    config: ProviderConfig,
+    _settings: Settings,
+    admission: ProviderAdmissionController,
+    *,
+    auth: OpenAIAuthManager,
+) -> BaseProvider:
+    return OpenAICodexProvider(config, auth=auth, admission=admission)
+
+
 def _create_transcriber(settings: Settings) -> Transcriber | None:
     if not settings.voice_note_enabled:
         return None
     if settings.whisper_device == "nvidia_nim":
         return NvidiaNimTranscriber(
             model=settings.whisper_model,
-            api_key=settings.nvidia_nim_api_key,
+            api_key=_required_voice_key(settings.nvidia_nim_api_key),
         )
     return TranscriptionService(
         model=settings.whisper_model,
         device=settings.whisper_device,
         huggingface_api_key=settings.huggingface_api_key,
     )
+
+
+def _required_voice_key(api_key: str | None) -> str:
+    if api_key is None:
+        raise AssertionError("NIM voice settings were not validated")
+    return api_key

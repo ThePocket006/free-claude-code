@@ -1,7 +1,5 @@
 """Pure FastAPI application factory."""
 
-from typing import Any
-
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -30,6 +28,7 @@ from .request_ids import (
     attach_request_id_headers,
     get_request_id,
 )
+from .request_lifetime import InferenceRequestLifetimeMiddleware
 from .routes import router
 from .validation_log import summarize_request_validation_body
 
@@ -38,8 +37,9 @@ def create_app(services: ApiServices) -> FastAPI:
     """Create the HTTP adapter around explicitly supplied runtime services."""
     app = FastAPI(title="Claude Code Proxy", version=package_version())
     app.state.services = services
-    app.add_middleware(RequestCorrelationMiddleware)
     app.add_middleware(AdminNoStoreMiddleware)
+    app.add_middleware(InferenceRequestLifetimeMiddleware)
+    app.add_middleware(RequestCorrelationMiddleware)
 
     app.include_router(admin_router)
     app.include_router(router)
@@ -47,7 +47,7 @@ def create_app(services: ApiServices) -> FastAPI:
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError):
         """Log request shape for 422 debugging without content values."""
-        body: Any
+        body: object
         try:
             body = await request.json()
         except Exception as error:

@@ -4,12 +4,12 @@ import time
 
 import pytest
 
-from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from free_claude_code.core.circuit_breaker import (
     CircuitBreakerRegistry,
     CircuitState,
     ProviderCircuitBreaker,
 )
+from free_claude_code.core.failures import ExecutionFailure, FailureKind
 
 
 def _failure(kind: FailureKind) -> ExecutionFailure:

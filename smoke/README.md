@@ -55,8 +55,8 @@ Default targets do not send real bot messages or load voice backends:
 | --- | --- | --- |
 | `api` | messages, count_tokens full payload, errors, `/stop`, optimizations | configured provider only for streaming messages |
 | `auth` | canonical bearer auth, conflicting legacy headers, invalid/missing auth | none; test sets an isolated token |
-| `cli` | server entrypoint, Claude CLI adaptive thinking, session cleanup | Claude CLI binary and provider only for real CLI |
-| `clients` | VS Code and JetBrains protocol payloads | configured provider |
+| `cli` | server entrypoint, Claude CLI adaptive thinking, automatic WebSearch, Auto-mode classifier, session cleanup | Claude CLI binary and provider only for real CLI; connected OpenAI account for Auto mode; `FCC_SMOKE_RUN_WEB_TOOLS=1` for WebSearch |
+| `clients` | VS Code and JetBrains protocol payloads; Pi, OpenCode, Cline, Hermes, DeepSeek Harness, Grok Build, and Muse Code CLI prompts | configured provider; installed Pi/OpenCode/Cline binaries; Hermes, DSH, Grok, and Muse use a local fake upstream |
 | `config` | env precedence, removed-env migration, proxy/timeouts | none |
 | `extensibility` | provider runtime and platform factory construction | none |
 | `messaging` | fake Discord/Telegram full flow, literal clear scopes, trees, persistence, voice cancel | none |
@@ -115,31 +115,30 @@ uv run pytest smoke/product -n 0 -s --tb=short
 
 ```powershell
 $env:FCC_LIVE_SMOKE = "1"
+$env:FCC_SMOKE_TARGETS = "cli"
+$env:FCC_SMOKE_PROVIDER_MATRIX = "openai"
+$env:FCC_SMOKE_MODEL_OPENAI = "gpt-5.6-luna"
+uv run pytest smoke/product/test_client_product_live.py -n 0 -s --tb=short -k claude_auto_mode_openai_connected
+```
+
+```powershell
+$env:FCC_LIVE_SMOKE = "1"
 $env:FCC_SMOKE_TARGETS = "messaging,config,extensibility"
 uv run pytest smoke/product -n 0 -s --tb=short
 ```
 
 ## Environment
 
-- `FCC_ENV_FILE`: explicit dotenv path for startup/config scenarios.
+- Runtime settings use the isolated managed `~/.fcc/.env`; `FCC_ENV_FILE` is
+  exercised only by the one-time legacy migration smoke.
 - `FCC_LIVE_SMOKE=1`: enables live smoke execution.
 - `FCC_ALLOW_NO_PROVIDER_SMOKE=1`: permits no-provider live smoke for harness work.
 - `FCC_SMOKE_TARGETS`: comma-separated targets, or `all`.
 - `FCC_SMOKE_PROVIDER_MATRIX`: comma-separated provider prefixes to require.
-- `FCC_SMOKE_MODEL_NVIDIA_NIM`, `FCC_SMOKE_MODEL_OPEN_ROUTER`,
-  `FCC_SMOKE_MODEL_MISTRAL`, `FCC_SMOKE_MODEL_MISTRAL_REASONING`,
-  `FCC_SMOKE_MODEL_MISTRAL_CODESTRAL`,
-  `FCC_SMOKE_MODEL_DEEPSEEK`, `FCC_SMOKE_MODEL_KIMI`,
-  `FCC_SMOKE_MODEL_KIMI_CODE`,
-  `FCC_SMOKE_MODEL_WAFER`, `FCC_SMOKE_MODEL_MINIMAX`,
-  `FCC_SMOKE_MODEL_OPENCODE`, `FCC_SMOKE_MODEL_OPENCODE_GO`,
-  `FCC_SMOKE_MODEL_BEDROCK`,
-  `FCC_SMOKE_MODEL_ZAI`, `FCC_SMOKE_MODEL_FIREWORKS`, `FCC_SMOKE_MODEL_CLOUDFLARE`,
-  `FCC_SMOKE_MODEL_GEMINI`, `FCC_SMOKE_MODEL_GROQ`, `FCC_SMOKE_MODEL_CEREBRAS`,
-  `FCC_SMOKE_MODEL_OLLAMA_CLOUD`, `FCC_SMOKE_MODEL_LMSTUDIO`,
-  `FCC_SMOKE_MODEL_LLAMACPP`, `FCC_SMOKE_MODEL_OLLAMA`: optional per-provider
-  smoke model overrides. Values may include the provider prefix or just the model
-  name for that provider.
+- `FCC_SMOKE_MODEL_<PROVIDER>`: optional per-provider smoke model override.
+  Use the uppercase provider ID, such as `FCC_SMOKE_MODEL_KILO`; the complete
+  variable inventory is in [.env.example](../.env.example). Values may include
+  the provider prefix or just the model name for that provider.
 - `FCC_SMOKE_MODEL_MISTRAL_REASONING`: optional override for the dedicated
   Mistral native reasoning smoke, default `mistral/mistral-medium-3-5`.
 - `FCC_SMOKE_NIM_MODELS`: optional comma-separated NVIDIA NIM CLI matrix models
@@ -152,6 +151,9 @@ uv run pytest smoke/product -n 0 -s --tb=short
   free CLI matrix models appended to the default or replacement set.
 - `FCC_SMOKE_TIMEOUT_S`: per-request/subprocess timeout, default `45`.
 - `FCC_SMOKE_CLAUDE_BIN`: Claude CLI executable name, default `claude`.
+- `FCC_SMOKE_RUN_WEB_TOOLS=1`: enables the combined real-provider automatic
+  WebSearch and installed Claude Code WebSearch scenario, including a public
+  DuckDuckGo request.
 - `FCC_SMOKE_TELEGRAM_CHAT_ID`: Telegram chat/user ID for send/edit/delete.
 - `FCC_SMOKE_DISCORD_CHANNEL_ID`: Discord channel ID for send/edit/delete.
 - `FCC_SMOKE_INTERACTIVE=1`: enables manual inbound Telegram/Discord checks.

@@ -1,13 +1,14 @@
 const state = {
   config: null,
   fields: new Map(),
-  localStatus: new Map(),
   modelOptions: [],
   modelComboboxes: new Set(),
+  authPollers: new Map(),
   activeView: "providers",
 };
 
 const MASKED_SECRET = "********";
+const NULL_VALUE = "__FCC_NULL__";
 const VIEW_GROUPS = [
   {
     id: "providers",
@@ -37,10 +38,7 @@ const byId = (id) => document.getElementById(id);
 function sourceLabel(source) {
   const labels = {
     default: "default",
-    template: "template",
-    repo_env: "repo .env",
     managed_env: "",
-    explicit_env_file: "FCC_ENV_FILE",
     process: "process env",
   };
   return Object.prototype.hasOwnProperty.call(labels, source) ? labels[source] : source;
@@ -59,8 +57,8 @@ function sourceText(field) {
 }
 
 function statusClass(status) {
-  if (["configured", "reachable", "running"].includes(status)) return "ok";
-  if (["missing_key", "missing_config", "missing_url", "unknown"].includes(status)) return "warn";
+  if (["configured", "reachable", "running", "connected"].includes(status)) return "ok";
+  if (["missing_key", "missing_config", "missing_url", "unknown", "connecting"].includes(status)) return "warn";
   if (["offline", "error"].includes(status)) return "error";
   return "neutral";
 }
@@ -72,7 +70,14 @@ async function api(path, options = {}) {
     cache: "no-store",
   });
   if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}`);
+    let detail = "";
+    try {
+      const payload = await response.json();
+      detail = typeof payload.detail === "string" ? payload.detail : "";
+    } catch {
+      // The status remains useful when an upstream proxy returns a non-JSON page.
+    }
+    throw new Error(detail || `${response.status} ${response.statusText}`);
   }
   return response.json();
 }
@@ -86,6 +91,7 @@ async function load() {
   renderProviders(config.provider_status);
   renderSections(config.sections, config.fields);
   byId("configPath").textContent = config.paths.managed;
+  await refreshConnectedAccounts();
   await hydrateModelOptions();
   await validate(false);
   await refreshLocalStatus();
@@ -142,48 +148,335 @@ function setActiveView(viewId, { scroll = false } = {}) {
 
 function renderProviders(providerStatus) {
   const grid = byId("providerGrid");
+  const connectedGrid = byId("connectedAccountGrid");
   grid.innerHTML = "";
+  connectedGrid.innerHTML = "";
+  const connected = providerStatus.filter(
+    (provider) => provider.kind === "connected_account",
+  );
+  byId("connectedAccountsSection").hidden = connected.length === 0;
   providerStatus.forEach((provider) => {
+    if (provider.kind === "connected_account") {
+      connectedGrid.appendChild(renderConnectedAccountCard(provider));
+      return;
+    }
     const card = document.createElement("article");
     card.className = "provider-card";
     card.dataset.provider = provider.provider_id;
 
     const title = document.createElement("div");
     title.className = "provider-title";
-    title.innerHTML = `<strong>${provider.display_name || provider.provider_id}</strong>`;
+    const name = document.createElement("strong");
+    name.textContent = provider.display_name || provider.provider_id;
 
     const pill = document.createElement("span");
     pill.className = `status-pill ${statusClass(provider.status)}`;
     pill.textContent = provider.label;
-    title.appendChild(pill);
+    title.append(name, pill);
 
     const meta = document.createElement("div");
     meta.className = "provider-meta";
-    meta.textContent =
-      provider.kind === "local"
-        ? provider.base_url || "No local URL configured"
-        : provider.configuration;
+    const configurationKeys = Array.isArray(provider.configuration_keys)
+      ? provider.configuration_keys
+      : [];
+    const missingConfigurationKeys = Array.isArray(
+      provider.missing_configuration_keys,
+    )
+      ? provider.missing_configuration_keys
+      : [];
+    meta.textContent = configurationKeys.join(" + ");
 
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "test-button";
-    button.textContent = provider.kind === "local" ? "Test" : "Refresh models";
-    button.addEventListener("click", () => testProvider(provider.provider_id, button));
+    const result = document.createElement("div");
+    result.className = "provider-check-result";
+    result.dataset.providerCheckResult = provider.provider_id;
+    result.setAttribute("aria-live", "polite");
+    result.hidden = true;
 
-    card.append(title, meta, button);
+    const actions = document.createElement("div");
+    actions.className = "provider-actions";
+    if (configurationKeys.length) {
+      const configuring = missingConfigurationKeys.length > 0;
+      actions.appendChild(
+        providerActionButton(configuring ? "Configure" : "Edit", () =>
+          navigateToProviderConfiguration(provider, configuring),
+        ),
+      );
+    }
+
+    if (missingConfigurationKeys.length === 0) {
+      const button = providerActionButton(
+        provider.kind === "local" ? "Test" : "Refresh models",
+        () => testProvider(provider.provider_id, button),
+        "secondary-button",
+      );
+      actions.appendChild(button);
+    }
+
+    card.append(title, meta, result, actions);
     grid.appendChild(card);
   });
 }
 
-function updateProviderCard(providerId, status, label, metaText) {
+function providerActionButton(label, action, className = "test-button") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.textContent = label;
+  button.addEventListener("click", action);
+  return button;
+}
+
+function navigateToProviderConfiguration(provider, configuring) {
+  const keys = configuring
+    ? provider.missing_configuration_keys
+    : provider.configuration_keys;
+  const fieldKey = Array.isArray(keys) ? keys[0] : null;
+  const input = fieldKey ? byId(`field-${fieldKey}`) : null;
+  if (!input) {
+    showMessage("Provider configuration field is unavailable.", "error");
+    return;
+  }
+  const reducedMotion = window.matchMedia(
+    "(prefers-reduced-motion: reduce)",
+  ).matches;
+  input.scrollIntoView({
+    behavior: reducedMotion ? "instant" : "smooth",
+    block: "center",
+  });
+  input.focus({ preventScroll: true });
+}
+
+function renderConnectedAccountCard(provider, status = provider) {
+  const card = document.createElement("article");
+  card.className = "provider-card";
+  card.dataset.provider = provider.provider_id;
+  card.dataset.connectedAccount = "true";
+
+  const title = document.createElement("div");
+  title.className = "provider-title";
+  const name = document.createElement("strong");
+  name.textContent = provider.display_name || provider.provider_id;
+  const pill = document.createElement("span");
+  pill.className = `status-pill ${statusClass(status.state || status.status)}`;
+  pill.textContent = connectedAccountLabel(status);
+  title.append(name, pill);
+
+  const meta = document.createElement("div");
+  meta.className = "provider-meta";
+  meta.textContent = connectedAccountMeta(status);
+
+  const actions = document.createElement("div");
+  actions.className = "provider-actions";
+  populateConnectedAccountActions(provider, status, actions);
+  card.append(title, meta, actions);
+  return card;
+}
+
+function connectedAccountLabel(status) {
+  const labels = {
+    disconnected: "Not connected",
+    connecting: "Connecting",
+    connected: "Connected",
+    error: "Needs attention",
+  };
+  return labels[status.state] || status.label || "Not connected";
+}
+
+function connectedAccountMeta(status) {
+  if (status.connected) {
+    const identity = status.email || "ChatGPT subscription connected";
+    const models = Number.isInteger(status.model_count)
+      ? `${status.model_count} model${status.model_count === 1 ? "" : "s"} available. `
+      : "";
+    const error = status.message ? `${status.message} ` : "";
+    return `${identity}. ${models}${error}Restart your agent to refresh its model picker.`;
+  }
+  if (status.mode === "device" && status.user_code) {
+    return `Enter code ${status.user_code} at ${status.verification_url}`;
+  }
+  if (status.state === "connecting") {
+    return "Finish signing in, then return to this page.";
+  }
+  return status.message || "Connect a ChatGPT account to discover subscription models.";
+}
+
+function populateConnectedAccountActions(provider, status, actions) {
+  const providerId = provider.provider_id;
+  if (status.state === "connecting") {
+    const target = status.authorization_url || status.verification_url;
+    if (target) {
+      actions.appendChild(authButton("Open sign-in", () => window.open(target, "_blank", "noopener")));
+    }
+    if (status.mode === "device" && status.user_code) {
+      actions.appendChild(
+        authButton(
+          "Copy code",
+          () => copyDeviceCode(status.user_code),
+          "secondary-button",
+        ),
+      );
+    }
+    actions.appendChild(
+      authButton("Cancel", () => cancelConnectedAccountLogin(providerId), "secondary-button"),
+    );
+    return;
+  }
+  if (status.connected) {
+    actions.appendChild(
+      authButton(
+        "Reconnect",
+        (button) => startConnectedAccountLogin(providerId, "browser", button),
+      ),
+    );
+    actions.appendChild(
+      authButton(
+        "Disconnect",
+        () => disconnectConnectedAccount(providerId),
+        "secondary-button",
+      ),
+    );
+    return;
+  }
+  actions.appendChild(
+    authButton("Connect", (button) => startConnectedAccountLogin(providerId, "browser", button)),
+    authButton(
+      "Use device code",
+      (button) => startConnectedAccountLogin(providerId, "device", button),
+      "secondary-button",
+    ),
+  );
+}
+
+function authButton(label, action, className = "test-button") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.textContent = label;
+  button.addEventListener("click", () => action(button));
+  return button;
+}
+
+async function refreshConnectedAccounts() {
+  const providers = (state.config?.provider_status || []).filter(
+    (provider) => provider.kind === "connected_account",
+  );
+  await Promise.all(
+    providers.map(async (provider) => {
+      try {
+        const status = await api(`/admin/api/providers/${provider.provider_id}/auth`);
+        updateConnectedAccountCard(provider, status);
+        if (status.state === "connecting") pollConnectedAccount(provider);
+      } catch (error) {
+        updateConnectedAccountCard(provider, {
+          state: "error",
+          connected: false,
+          message: error.message,
+        });
+      }
+    }),
+  );
+}
+
+function updateConnectedAccountCard(provider, status) {
+  const current = document.querySelector(
+    `[data-provider="${provider.provider_id}"][data-connected-account="true"]`,
+  );
+  if (current) current.replaceWith(renderConnectedAccountCard(provider, status));
+}
+
+async function startConnectedAccountLogin(providerId, mode, button) {
+  button.disabled = true;
+  const popup = window.open("about:blank", "_blank");
+  if (popup) popup.opener = null;
+  try {
+    const status = await api(`/admin/api/providers/${providerId}/auth/login`, {
+      method: "POST",
+      body: JSON.stringify({ mode }),
+    });
+    const provider = connectedAccountDescriptor(providerId);
+    updateConnectedAccountCard(provider, status);
+    const target = status.authorization_url || status.verification_url;
+    if (target && popup) {
+      popup.location.replace(target);
+    } else if (target) {
+      window.open(target, "_blank", "noopener");
+    } else if (popup) {
+      popup.close();
+    }
+    pollConnectedAccount(provider);
+  } catch (error) {
+    if (popup) popup.close();
+    showMessage(error.message, true);
+    button.disabled = false;
+  }
+}
+
+async function cancelConnectedAccountLogin(providerId) {
+  clearConnectedAccountPoll(providerId);
+  const status = await api(`/admin/api/providers/${providerId}/auth/cancel`, {
+    method: "POST",
+  });
+  updateConnectedAccountCard(connectedAccountDescriptor(providerId), status);
+}
+
+async function disconnectConnectedAccount(providerId) {
+  if (!window.confirm("Disconnect this ChatGPT account from FCC?")) return;
+  clearConnectedAccountPoll(providerId);
+  const status = await api(`/admin/api/providers/${providerId}/auth`, {
+    method: "DELETE",
+  });
+  updateConnectedAccountCard(connectedAccountDescriptor(providerId), status);
+  await hydrateModelOptions();
+}
+
+function pollConnectedAccount(provider) {
+  clearConnectedAccountPoll(provider.provider_id);
+  const poll = async () => {
+    try {
+      const status = await api(`/admin/api/providers/${provider.provider_id}/auth`);
+      updateConnectedAccountCard(provider, status);
+      if (status.state === "connecting") {
+        state.authPollers.set(provider.provider_id, window.setTimeout(poll, 1000));
+      } else {
+        state.authPollers.delete(provider.provider_id);
+        if (status.connected) await hydrateModelOptions();
+      }
+    } catch (error) {
+      state.authPollers.delete(provider.provider_id);
+      showMessage(error.message, true);
+    }
+  };
+  state.authPollers.set(provider.provider_id, window.setTimeout(poll, 1000));
+}
+
+function clearConnectedAccountPoll(providerId) {
+  const timer = state.authPollers.get(providerId);
+  if (timer) window.clearTimeout(timer);
+  state.authPollers.delete(providerId);
+}
+
+function connectedAccountDescriptor(providerId) {
+  return state.config.provider_status.find(
+    (provider) => provider.provider_id === providerId,
+  );
+}
+
+async function copyDeviceCode(code) {
+  try {
+    await navigator.clipboard.writeText(code);
+    showMessage("Device code copied.");
+  } catch {
+    showMessage(`Copy this device code: ${code}`);
+  }
+}
+
+function updateProviderCheckResult(providerId, status, message) {
   const card = document.querySelector(`[data-provider="${providerId}"]`);
   if (!card) return;
-  const pill = card.querySelector(".status-pill");
-  pill.className = `status-pill ${statusClass(status)}`;
-  pill.textContent = label;
-  if (metaText) {
-    card.querySelector(".provider-meta").textContent = metaText;
-  }
+  const result = card.querySelector(".provider-check-result");
+  result.className = `provider-check-result ${status}`;
+  result.textContent = message;
+  result.hidden = !message;
 }
 
 function renderSections(sections, fields) {
@@ -270,13 +563,18 @@ function renderField(field) {
   const input = inputForField(field);
   input.id = `field-${field.key}`;
   input.dataset.key = field.key;
-  input.dataset.original = field.value || "";
+  input.dataset.original = comparableValue(field.value);
   input.dataset.secret = field.secret ? "true" : "false";
   input.dataset.configured = field.configured ? "true" : "false";
+  input.dataset.nullable = field.nullable ? "true" : "false";
+  input.dataset.remove = "false";
   input.dataset.fieldType = field.type;
   input.disabled = field.locked;
   input.addEventListener("input", updateDirtyState);
   input.addEventListener("change", updateDirtyState);
+  input.addEventListener("input", () => {
+    input.dataset.remove = "false";
+  });
   if (field.type === "optional_model") {
     input.addEventListener("blur", () => {
       if (!input.value.trim() || input.value.trim().toLowerCase() === "none") {
@@ -286,11 +584,29 @@ function renderField(field) {
     });
   }
 
-  const control =
-    field.type === "model" || field.type === "optional_model"
-      ? new ModelCombobox(input, field).element
-      : input;
+  let control = input;
+  if (field.type === "model" || field.type === "optional_model") {
+    control = new ModelCombobox(input, field).element;
+  } else if (field.type === "model_list") {
+    const editor = new ModelListEditor(input, field);
+    label.htmlFor = editor.inputId;
+    control = editor.element;
+  }
   wrapper.append(label, control);
+  if (field.secret && field.nullable && field.configured && !field.locked) {
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.className = "ghost-button secret-remove";
+    removeButton.textContent = "Remove";
+    removeButton.addEventListener("click", () => {
+      const removing = input.dataset.remove !== "true";
+      input.dataset.remove = removing ? "true" : "false";
+      input.readOnly = removing;
+      removeButton.textContent = removing ? "Undo removal" : "Remove";
+      updateDirtyState();
+    });
+    wrapper.appendChild(removeButton);
+  }
   if (field.description) {
     const description = document.createElement("div");
     description.className = "field-description";
@@ -329,6 +645,13 @@ function inputForField(field) {
     input.type = "text";
     input.value = field.value || (field.type === "optional_model" ? "None" : "");
     input.autocomplete = "off";
+    return input;
+  }
+
+  if (field.type === "model_list") {
+    const input = document.createElement("input");
+    input.type = "hidden";
+    input.value = field.value || "";
     return input;
   }
 
@@ -527,6 +850,132 @@ class ModelCombobox {
   }
 }
 
+class ModelListEditor {
+  constructor(input, field) {
+    this.input = input;
+    this.field = field;
+    this.values = input.value
+      ? input.value.split(",").map((value) => value.trim()).filter(Boolean)
+      : [];
+    this.inputId = `field-${field.key}-add`;
+
+    this.element = document.createElement("div");
+    this.element.className = "model-list-editor";
+
+    const addRow = document.createElement("div");
+    addRow.className = "model-list-add";
+    this.addInput = document.createElement("input");
+    this.addInput.id = this.inputId;
+    this.addInput.type = "text";
+    this.addInput.autocomplete = "off";
+    this.addInput.placeholder = "provider/model";
+    this.addInput.disabled = field.locked;
+    const addCombobox = new ModelCombobox(this.addInput, {
+      ...field,
+      key: `${field.key}-add`,
+      label: "fallback model",
+      type: "model",
+    });
+
+    this.addButton = document.createElement("button");
+    this.addButton.type = "button";
+    this.addButton.className = "secondary-button";
+    this.addButton.textContent = "Add";
+    this.addButton.disabled = field.locked;
+    this.addButton.addEventListener("click", () => this.add());
+    addRow.append(addCombobox.element, this.addButton);
+
+    this.rows = document.createElement("div");
+    this.rows.className = "model-list-rows";
+    this.element.append(input, addRow, this.rows);
+    this.renderRows();
+  }
+
+  add() {
+    const value = this.addInput.value.trim();
+    if (!value) {
+      showMessage("Enter a full provider/model fallback.", "error");
+      return;
+    }
+    if (this.values.includes(value)) {
+      showMessage("That fallback model is already in the list.", "error");
+      return;
+    }
+    this.values.push(value);
+    this.addInput.value = "";
+    showMessage("");
+    this.sync();
+  }
+
+  move(index, offset) {
+    const destination = index + offset;
+    if (destination < 0 || destination >= this.values.length) return;
+    [this.values[index], this.values[destination]] = [
+      this.values[destination],
+      this.values[index],
+    ];
+    this.sync();
+  }
+
+  remove(index) {
+    this.values.splice(index, 1);
+    this.sync();
+  }
+
+  sync() {
+    this.input.value = this.values.join(",");
+    this.input.dataset.remove = "false";
+    this.input.dispatchEvent(new Event("input", { bubbles: true }));
+    this.renderRows();
+  }
+
+  renderRows() {
+    this.rows.innerHTML = "";
+    if (this.values.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "model-list-empty";
+      empty.textContent = "No fallback models configured.";
+      this.rows.appendChild(empty);
+      return;
+    }
+
+    this.values.forEach((value, index) => {
+      const row = document.createElement("div");
+      row.className = "model-list-row";
+
+      const model = document.createElement("span");
+      model.className = "model-list-value";
+      model.textContent = value;
+
+      const up = this.actionButton("Move up", `Move ${value} up`, () =>
+        this.move(index, -1),
+      );
+      up.disabled = this.field.locked || index === 0;
+      const down = this.actionButton("Move down", `Move ${value} down`, () =>
+        this.move(index, 1),
+      );
+      down.disabled = this.field.locked || index === this.values.length - 1;
+      const remove = this.actionButton("Remove", `Remove ${value}`, () =>
+        this.remove(index),
+      );
+      remove.disabled = this.field.locked;
+
+      row.append(model, up, down, remove);
+      this.rows.appendChild(row);
+    });
+  }
+
+  actionButton(text, label, action) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ghost-button model-list-action";
+    button.textContent = text;
+    button.setAttribute("aria-label", label);
+    button.addEventListener("click", action);
+    return button;
+  }
+}
+
 function option(value, label) {
   const optionEl = document.createElement("option");
   optionEl.value = value;
@@ -536,16 +985,22 @@ function option(value, label) {
 
 function readFieldValue(input) {
   if (input.type === "checkbox") return input.checked ? "true" : "false";
+  if (input.dataset.remove === "true") return null;
   if (
     input.dataset.fieldType === "optional_model" &&
     input.value.trim().toLowerCase() === "none"
   ) {
-    return "";
+    return null;
   }
   if (input.dataset.secret === "true" && input.dataset.configured === "true") {
     return input.value ? input.value : MASKED_SECRET;
   }
+  if (input.dataset.nullable === "true" && !input.value.trim()) return null;
   return input.value;
+}
+
+function comparableValue(value) {
+  return value === null ? NULL_VALUE : String(value);
 }
 
 function changedValues() {
@@ -553,7 +1008,7 @@ function changedValues() {
   document.querySelectorAll("[data-key]").forEach((input) => {
     if (input.disabled || !input.matches("input, select, textarea")) return;
     const value = readFieldValue(input);
-    if (value !== input.dataset.original) {
+    if (comparableValue(value) !== input.dataset.original) {
       values[input.dataset.key] = value;
     }
   });
@@ -617,37 +1072,61 @@ async function apply() {
 async function refreshLocalStatus() {
   const result = await api("/admin/api/providers/local-status");
   result.providers.forEach((provider) => {
-    state.localStatus.set(provider.provider_id, provider);
-    const meta = provider.status_code
-      ? `${provider.base_url} returned HTTP ${provider.status_code}`
-      : provider.base_url;
-    updateProviderCard(provider.provider_id, provider.status, provider.label, meta);
+    if (provider.status === "missing_url") return;
+    if (provider.status === "reachable") {
+      updateProviderCheckResult(
+        provider.provider_id,
+        "ok",
+        `Reachable: ${provider.base_url}`,
+      );
+      return;
+    }
+    const detail = provider.message
+      ? provider.message
+      : provider.status_code
+        ? `${provider.base_url} returned HTTP ${provider.status_code}`
+        : "The local provider did not respond.";
+    updateProviderCheckResult(
+      provider.provider_id,
+      "error",
+      `Unavailable: ${detail}`,
+    );
   });
 }
 
 async function testProvider(providerId, button) {
   const original = button.textContent;
   button.disabled = true;
-  button.textContent = "Testing";
+  button.textContent = "Checking...";
+  updateProviderCheckResult(providerId, "checking", "Checking...");
   try {
     const result = await api(`/admin/api/providers/${providerId}/test`, {
       method: "POST",
       body: "{}",
     });
     if (result.ok) {
-      updateProviderCard(
+      updateProviderCheckResult(
         providerId,
-        "reachable",
-        `${result.models.length} models`,
-        result.models.slice(0, 3).join(", ") || "No models returned",
+        "ok",
+        `${result.models.length} models available`,
       );
       setModelOptions([
         ...state.modelOptions,
         ...result.models.map((model) => `${providerId}/${model}`),
       ]);
     } else {
-      updateProviderCard(providerId, "offline", result.error_type, result.error_type);
+      updateProviderCheckResult(
+        providerId,
+        "error",
+        `Unavailable: ${result.message || "Provider check failed."}`,
+      );
     }
+  } catch {
+    updateProviderCheckResult(
+      providerId,
+      "error",
+      "Provider check could not be completed.",
+    );
   } finally {
     button.disabled = false;
     button.textContent = original;

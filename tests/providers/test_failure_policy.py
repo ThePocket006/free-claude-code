@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import httpx
+import httpx2
 import openai
 import pytest
 
@@ -16,8 +17,10 @@ from free_claude_code.providers.failure_policy import (
     ProviderRecoveryExhausted,
     classify_provider_failure,
     is_retryable_provider_error,
+    is_retryable_stream_error,
     retryable_upstream_status,
 )
+from free_claude_code.providers.stream_recovery import TruncatedProviderStreamError
 
 
 def _openai_status_error(
@@ -27,8 +30,8 @@ def _openai_status_error(
     message: str,
     body: object | None = None,
 ) -> openai.APIStatusError:
-    request = httpx.Request("POST", "https://provider.test/v1/chat/completions")
-    response = httpx.Response(status_code, request=request)
+    request = httpx2.Request("POST", "https://provider.test/v1/chat/completions")
+    response = httpx2.Response(status_code, request=request)
     return error_type(
         message,
         response=response,
@@ -39,7 +42,7 @@ def _openai_status_error(
 def _statusless_openai_error(message: str, body: object | None) -> openai.APIError:
     return openai.APIError(
         message,
-        request=httpx.Request("POST", "https://provider.test/v1/chat/completions"),
+        request=httpx2.Request("POST", "https://provider.test/v1/chat/completions"),
         body=body,
     )
 
@@ -54,6 +57,63 @@ def _http_status_error(status_code: int, message: str) -> httpx.HTTPStatusError:
     return httpx.HTTPStatusError(message, request=request, response=response)
 
 
+def test_stream_retry_classification_distinguishes_protocol_and_status() -> None:
+    assert is_retryable_stream_error(TruncatedProviderStreamError("truncated"))
+    assert is_retryable_stream_error(httpx.ReadError("disconnected"))
+    assert is_retryable_stream_error(_http_status_error(503, "unavailable"))
+    assert not is_retryable_stream_error(_http_status_error(400, "bad request"))
+
+
+def test_stream_retry_classification_only_accepts_post_open_timeouts() -> None:
+    request = httpx.Request("POST", "https://provider.test/v1/messages")
+
+    assert is_retryable_stream_error(httpx.ReadTimeout("read", request=request))
+    assert not is_retryable_stream_error(
+        httpx.ConnectTimeout("connect", request=request)
+    )
+    assert not is_retryable_stream_error(httpx.WriteTimeout("write", request=request))
+    assert not is_retryable_stream_error(httpx.PoolTimeout("pool", request=request))
+
+
+@pytest.mark.parametrize(
+    ("message", "body"),
+    (
+        (
+            "stream embedded error",
+            {"error": {"message": "internal failure", "code": 500}},
+        ),
+        (
+            "stream embedded error",
+            {
+                "error": {
+                    "message": "internal failure",
+                    "type": "internal_server_error",
+                }
+            },
+        ),
+        (
+            "ResourceExhausted: limit reached while generating response",
+            {"error": {"message": "ResourceExhausted: limit reached"}},
+        ),
+    ),
+)
+def test_stream_retry_classification_accepts_statusless_transients(
+    message: str,
+    body: object,
+) -> None:
+    assert is_retryable_stream_error(_statusless_openai_error(message, body))
+
+
+def test_stream_retry_classification_rejects_openai_bad_request() -> None:
+    assert not is_retryable_stream_error(
+        _openai_status_error(
+            openai.BadRequestError,
+            status_code=400,
+            message="bad request",
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _ClassificationCase:
     name: str
@@ -61,6 +121,7 @@ class _ClassificationCase:
     kind: FailureKind
     status_code: int
     retryable: bool
+    message: str | None = None
 
 
 _CASES = (
@@ -96,6 +157,18 @@ _CASES = (
         FailureKind.AUTHENTICATION,
         401,
         False,
+    ),
+    _ClassificationCase(
+        "generic_openai_402",
+        lambda: _openai_status_error(
+            openai.APIStatusError,
+            status_code=402,
+            message="Inference credits exhausted",
+        ),
+        FailureKind.PERMISSION,
+        402,
+        False,
+        "Provider requires payment or additional credits. Add credits or resolve billing.",
     ),
     _ClassificationCase(
         "generic_openai_403",
@@ -190,6 +263,14 @@ _CASES = (
         False,
     ),
     _ClassificationCase(
+        "http_402_maps_billing_permission",
+        lambda: _http_status_error(402, "Inference credits exhausted"),
+        FailureKind.PERMISSION,
+        402,
+        False,
+        "Provider requires payment or additional credits. Add credits or resolve billing.",
+    ),
+    _ClassificationCase(
         "http_403_maps_permission",
         lambda: _http_status_error(403, "Forbidden"),
         FailureKind.PERMISSION,
@@ -230,7 +311,7 @@ _CASES = (
     _ClassificationCase(
         "openai_connection_error_keeps_status",
         lambda: openai.APIConnectionError(
-            request=httpx.Request("POST", "https://provider.test/v1/chat/completions")
+            request=httpx2.Request("POST", "https://provider.test/v1/chat/completions")
         ),
         FailureKind.UNAVAILABLE,
         500,
@@ -264,6 +345,8 @@ def test_raw_provider_failure_maps_to_canonical_failure(
     assert failure.message.strip()
     assert "Request ID: req_classification" in failure.message
     assert "SECRET" not in failure.message
+    if case.message is not None:
+        assert case.message in failure.message
 
 
 def test_classification_preserves_useful_body_while_redacting_credentials() -> None:
@@ -390,9 +473,9 @@ def test_http_405_diagnostic_names_rejected_upstream_endpoint() -> None:
 
 
 def test_connection_cause_chain_is_redacted_and_capped() -> None:
-    request = httpx.Request("POST", "https://provider.test/v1/chat/completions")
+    request = httpx2.Request("POST", "https://provider.test/v1/chat/completions")
     error = openai.APIConnectionError(request=request)
-    error.__cause__ = httpx.ConnectError(
+    error.__cause__ = httpx2.ConnectError(
         "connect failed authorization: Bearer CAUSE_SECRET "
         + "x" * (ERROR_DETAIL_DISPLAY_CAP_BYTES + 10),
         request=request,

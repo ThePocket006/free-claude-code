@@ -1,14 +1,17 @@
 """Tests for streaming error handling in providers/nvidia_nim/client.py."""
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import httpx2
 import openai
 import pytest
 
 from free_claude_code.config.nim import NimSettings
+from free_claude_code.core.anthropic import OpenAIToolNameCodec
 from free_claude_code.core.anthropic.stream_contracts import (
     parse_sse_text,
 )
@@ -19,20 +22,27 @@ from free_claude_code.core.anthropic.streaming import (
 )
 from free_claude_code.core.failures import ExecutionFailure
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
-from free_claude_code.providers.admission import UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS
-from free_claude_code.providers.base import ProviderConfig
+from free_claude_code.providers.admission import (
+    UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS,
+    ProviderOperationKind,
+)
 from free_claude_code.providers.nvidia_nim import NvidiaNimProvider
 from free_claude_code.providers.openai_chat.provider import (
     _OpenAIChatStreamRunner,
 )
 from free_claude_code.providers.openai_chat.tool_calls import (
     OpenAIToolCallAssembler,
+    OpenAIToolCallCollector,
     has_committed_sse_output,
     iter_heuristic_tool_use_sse,
 )
 from free_claude_code.providers.stream_recovery import TruncatedProviderStreamError
 from tests.providers.request_factory import make_messages_request
-from tests.providers.support import REASONING_OFF, immediate_admission
+from tests.providers.support import (
+    REASONING_OFF,
+    immediate_admission,
+    make_provider_config,
+)
 
 
 class AsyncStreamMock:
@@ -63,17 +73,44 @@ def _recovery_output(
 class ClosableAsyncStreamMock(AsyncStreamMock):
     """Async stream mock that records cleanup."""
 
-    def __init__(self, chunks, error=None):
+    def __init__(self, chunks, error=None, *, close_error=None):
         super().__init__(chunks, error=error)
         self.closed = False
+        self.close_calls = 0
+        self._close_error = close_error
 
     async def aclose(self):
+        self.close_calls += 1
         self.closed = True
+        if self._close_error is not None:
+            raise self._close_error
+
+
+class BlockingClosableAsyncStreamMock:
+    """Async stream that blocks until its consumer is cancelled."""
+
+    def __init__(self, *, close_error=None):
+        self.entered = asyncio.Event()
+        self.close_calls = 0
+        self._close_error = close_error
+
+    def __aiter__(self):
+        return self._aiter()
+
+    async def _aiter(self):
+        self.entered.set()
+        await asyncio.Event().wait()
+        yield
+
+    async def aclose(self):
+        self.close_calls += 1
+        if self._close_error is not None:
+            raise self._close_error
 
 
 def _make_provider():
     """Create a provider instance for testing."""
-    config = ProviderConfig(
+    config = make_provider_config(
         api_key="test_key",
         base_url="https://test.api.nvidia.com/v1",
         rate_limit=10,
@@ -141,6 +178,16 @@ def _make_chunk(
     chunk = MagicMock()
     chunk.choices = [choice]
     chunk.usage = None
+    return chunk
+
+
+def _make_usage_chunk(*, prompt_tokens: int, completion_tokens: int):
+    chunk = MagicMock()
+    chunk.choices = []
+    chunk.usage = SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
     return chunk
 
 
@@ -227,7 +274,7 @@ class TestStreamingExceptionHandling:
     async def test_stream_normalization_failure_closes_raw_stream(self):
         provider = _make_provider()
         stream = ClosableAsyncStreamMock([])
-        retry_session = provider._admission.new_retry_session()
+        execution = provider._admission.start_execution()
 
         with (
             patch.object(
@@ -243,7 +290,11 @@ class TestStreamingExceptionHandling:
             ),
             pytest.raises(ValueError, match="invalid stream wrapper"),
         ):
-            await provider._create_stream({"messages": []}, retry_session)
+            await provider._create_stream(
+                {"messages": []},
+                execution,
+                ProviderOperationKind.GENERATION,
+            )
 
         assert stream.closed
 
@@ -581,9 +632,9 @@ class TestStreamingExceptionHandling:
         """OpenAI SDK bodies should be raised so users can copy exact provider errors."""
         provider = _make_provider()
         request = _make_request()
-        response = httpx.Response(
+        response = httpx2.Response(
             status_code=400,
-            request=httpx.Request("POST", "https://example.com/v1/chat/completions"),
+            request=httpx2.Request("POST", "https://example.com/v1/chat/completions"),
         )
         body = {
             "error": {
@@ -622,9 +673,9 @@ class TestStreamingExceptionHandling:
         tool_chunk = _make_tool_calls_chunk(
             name="echo_smoke", arguments="{}", tool_id="call_body", index=0
         )
-        response = httpx.Response(
+        response = httpx2.Response(
             status_code=400,
-            request=httpx.Request("POST", "https://example.com/v1/chat/completions"),
+            request=httpx2.Request("POST", "https://example.com/v1/chat/completions"),
         )
         body = {"error": {"message": "bad after tool"}}
         error = openai.BadRequestError("Bad Request", response=response, body=body)
@@ -727,6 +778,235 @@ class TestStreamingExceptionHandling:
         )
 
     @pytest.mark.asyncio
+    async def test_function_tag_tool_stream_becomes_one_anthropic_tool_use(self):
+        """Exact control-only function tags use the established tool lifecycle."""
+        provider = _make_provider()
+        request = _make_request(
+            tools=[
+                {
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+        )
+        raw_call = (
+            "<think>Use the requested command.</think>"
+            "I will invoke Bash now.\n"
+            "<tool_call>\n<function=Bash>\n<parameter=command>\n"
+            "printf FCC_STEP_TOOL\n</parameter>\n</function>\n</tool_call>"
+        )
+        stream_mock = AsyncStreamMock(
+            [
+                _make_chunk(content=raw_call[:43]),
+                _make_chunk(content=raw_call[43:]),
+                _make_chunk(finish_reason="stop"),
+            ]
+        )
+
+        with patch.object(
+            provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            return_value=stream_mock,
+        ):
+            events = await _collect_stream(provider, request)
+
+        parsed = parse_sse_text("".join(events))
+        starts = [
+            event.data["content_block"]
+            for event in parsed
+            if event.event == "content_block_start"
+        ]
+        tool_starts = [block for block in starts if block["type"] == "tool_use"]
+        input_json = "".join(
+            event.data.get("delta", {}).get("partial_json", "")
+            for event in parsed
+            if event.event == "content_block_delta"
+            and event.data.get("delta", {}).get("type") == "input_json_delta"
+        )
+        visible_text = "".join(
+            event.data.get("delta", {}).get("text", "")
+            for event in parsed
+            if event.event == "content_block_delta"
+            and event.data.get("delta", {}).get("type") == "text_delta"
+        )
+
+        assert [block["name"] for block in tool_starts] == ["Bash"]
+        assert json.loads(input_json) == {"command": "printf FCC_STEP_TOOL"}
+        assert visible_text == "I will invoke Bash now.\n"
+        assert any(
+            event.event == "content_block_delta"
+            and event.data.get("delta", {}).get("type") == "thinking_delta"
+            for event in parsed
+        )
+        assert any(
+            event.event == "message_delta"
+            and event.data.get("delta", {}).get("stop_reason") == "tool_use"
+            for event in parsed
+        )
+
+    @pytest.mark.asyncio
+    async def test_native_tool_call_disables_function_tag_recovery(self):
+        """Native structured calls win and release earlier candidate text in order."""
+        provider = _make_provider()
+        request = _make_request(
+            tools=[
+                {
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                    },
+                }
+            ]
+        )
+        held_text = "<tool_call>\n<function=Bash>"
+        stream_mock = AsyncStreamMock(
+            [
+                _make_chunk(content=held_text),
+                _make_tool_calls_chunk(
+                    name="Bash",
+                    arguments='{"command":"printf native"}',
+                    tool_id="call_native",
+                ),
+                _make_chunk(finish_reason="tool_calls"),
+            ]
+        )
+
+        with patch.object(
+            provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            return_value=stream_mock,
+        ):
+            events = await _collect_stream(provider, request)
+
+        parsed = parse_sse_text("".join(events))
+        visible_text = "".join(
+            event.data.get("delta", {}).get("text", "")
+            for event in parsed
+            if event.event == "content_block_delta"
+            and event.data.get("delta", {}).get("type") == "text_delta"
+        )
+        tool_starts = [
+            event.data["content_block"]
+            for event in parsed
+            if event.event == "content_block_start"
+            and event.data.get("content_block", {}).get("type") == "tool_use"
+        ]
+
+        assert visible_text == held_text
+        assert [block["id"] for block in tool_starts] == ["call_native"]
+
+    @pytest.mark.asyncio
+    async def test_rejected_function_tag_candidate_bypasses_legacy_heuristics(self):
+        """Rejected reserved text is preserved without a second permissive parse."""
+        provider = _make_provider()
+        request = _make_request(
+            tools=[
+                {
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                    },
+                }
+            ]
+        )
+        raw = (
+            "<tool_call><function=Unknown></function></tool_call>"
+            "● <function=Bash><parameter=command>printf unsafe</parameter>"
+        )
+        stream_mock = AsyncStreamMock(
+            [_make_chunk(content=raw), _make_chunk(finish_reason="stop")]
+        )
+
+        with patch.object(
+            provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            return_value=stream_mock,
+        ):
+            events = await _collect_stream(provider, request)
+
+        parsed = parse_sse_text("".join(events))
+        visible_text = "".join(
+            event.data.get("delta", {}).get("text", "")
+            for event in parsed
+            if event.event == "content_block_delta"
+            and event.data.get("delta", {}).get("type") == "text_delta"
+        )
+        tool_starts = [
+            event
+            for event in parsed
+            if event.event == "content_block_start"
+            and event.data.get("content_block", {}).get("type") == "tool_use"
+        ]
+
+        assert visible_text == raw
+        assert tool_starts == []
+
+    @pytest.mark.asyncio
+    async def test_function_tag_candidate_is_reset_before_early_retry(self):
+        """An abandoned textual candidate cannot leak or duplicate after retry."""
+        provider = _make_provider()
+        request = _make_request(
+            tools=[
+                {
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                }
+            ]
+        )
+        abandoned = "<tool_call>\n<function=Bash>"
+        complete = (
+            "<tool_call>\n<function=Bash>\n<parameter=command>\n"
+            "printf retry\n</parameter>\n</function>\n</tool_call>"
+        )
+        first_stream = AsyncStreamMock(
+            [_make_chunk(content=abandoned)],
+            error=httpx.ReadError("early cutoff"),
+        )
+        second_stream = AsyncStreamMock(
+            [_make_chunk(content=complete), _make_chunk(finish_reason="stop")]
+        )
+
+        with patch.object(
+            provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            side_effect=[first_stream, second_stream],
+        ) as mock_create:
+            events = await _collect_stream(provider, request)
+
+        parsed = parse_sse_text("".join(events))
+        visible_text = "".join(
+            event.data.get("delta", {}).get("text", "")
+            for event in parsed
+            if event.event == "content_block_delta"
+            and event.data.get("delta", {}).get("type") == "text_delta"
+        )
+        tool_starts = [
+            event.data["content_block"]
+            for event in parsed
+            if event.event == "content_block_start"
+            and event.data.get("content_block", {}).get("type") == "tool_use"
+        ]
+
+        assert mock_create.await_count == 2
+        assert visible_text == ""
+        assert [block["name"] for block in tool_starts] == ["Bash"]
+
+    @pytest.mark.asyncio
     async def test_precommit_retry_emits_one_unduplicated_downstream_lifecycle(self):
         """An abandoned attempt contributes no frame to the successful replay."""
         provider = _make_provider()
@@ -769,6 +1049,160 @@ class TestStreamingExceptionHandling:
         assert parsed[-1].event == "message_stop"
 
     @pytest.mark.asyncio
+    async def test_precommit_retry_discards_abandoned_parser_and_usage_state(self):
+        """A replay owns fresh parsers and terminal usage metadata."""
+        provider = _make_provider()
+        request = _make_request()
+        first_stream = AsyncStreamMock(
+            [
+                _make_usage_chunk(prompt_tokens=111, completion_tokens=222),
+                _make_chunk(content="<thi"),
+            ],
+            error=httpx.ReadError("early cutoff"),
+        )
+        second_stream = AsyncStreamMock(
+            [
+                _make_chunk(content="visible"),
+                _make_chunk(finish_reason="stop"),
+                _make_usage_chunk(prompt_tokens=7, completion_tokens=3),
+            ]
+        )
+
+        with patch.object(
+            provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            side_effect=[first_stream, second_stream],
+        ) as create:
+            events = await _collect_stream(provider, request)
+
+        parsed = parse_sse_text("".join(events))
+        visible_text = "".join(
+            event.data.get("delta", {}).get("text", "")
+            for event in parsed
+            if event.event == "content_block_delta"
+            and event.data.get("delta", {}).get("type") == "text_delta"
+        )
+        final_usage = next(
+            event.data["usage"] for event in parsed if event.event == "message_delta"
+        )
+
+        assert create.await_count == 2
+        assert visible_text == "visible"
+        assert final_usage == {"input_tokens": 7, "output_tokens": 3}
+        assert sum(event.event == "message_start" for event in parsed) == 1
+        assert sum(event.event == "message_delta" for event in parsed) == 1
+        assert sum(event.event == "message_stop" for event in parsed) == 1
+
+    @pytest.mark.asyncio
+    async def test_create_correction_survives_later_precommit_retry(self):
+        """A corrected request body outlives the replay-local stream state."""
+        provider = _make_provider()
+        request = _make_request()
+        response = httpx2.Response(
+            status_code=400,
+            request=httpx2.Request("POST", "https://example.com/v1/chat/completions"),
+        )
+        usage_rejection = openai.BadRequestError(
+            "stream_options is unsupported",
+            response=response,
+            body={"error": {"message": "stream_options is unsupported"}},
+        )
+        first_stream = AsyncStreamMock(
+            [_make_chunk(content="hidden")],
+            error=httpx.ReadError("early cutoff"),
+        )
+        second_stream = AsyncStreamMock(
+            [_make_chunk(content="visible"), _make_chunk(finish_reason="stop")]
+        )
+
+        with patch.object(
+            provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            side_effect=[usage_rejection, first_stream, second_stream],
+        ) as create:
+            events = await _collect_stream(provider, request)
+
+        parsed = parse_sse_text("".join(events))
+        text_deltas = [
+            event.data.get("delta", {}).get("text", "")
+            for event in parsed
+            if event.event == "content_block_delta"
+            and event.data.get("delta", {}).get("type") == "text_delta"
+        ]
+
+        assert create.await_count == 3
+        assert create.await_args_list[0].kwargs["stream_options"] == {
+            "include_usage": True
+        }
+        assert "stream_options" not in create.await_args_list[1].kwargs
+        assert "stream_options" not in create.await_args_list[2].kwargs
+        assert text_deltas == ["visible"]
+        assert sum(event.event == "message_start" for event in parsed) == 1
+        assert sum(event.event == "message_stop" for event in parsed) == 1
+
+    @pytest.mark.asyncio
+    async def test_precommit_retry_discards_abandoned_tool_name_fragment(self):
+        """A retried alias fragment cannot prefix or duplicate the successful call."""
+        provider = _make_provider()
+        original = "mcp__retry_tool_name__" + "x" * 70
+        request = _make_request(
+            tools=[{"name": original, "input_schema": {"type": "object"}}]
+        )
+        alias = OpenAIToolNameCodec.from_request(request).encode(original)
+        first_stream = AsyncStreamMock(
+            [
+                _make_tool_calls_chunk(
+                    name=alias[:20],
+                    arguments="",
+                    tool_id="call_abandoned",
+                ),
+                _make_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        second_stream = AsyncStreamMock(
+            [
+                _make_tool_calls_chunk(
+                    name=alias,
+                    arguments="{}",
+                    tool_id="call_success",
+                ),
+                _make_chunk(finish_reason="tool_calls"),
+            ]
+        )
+
+        with patch.object(
+            provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            side_effect=[first_stream, second_stream],
+        ) as create:
+            events = await _collect_stream(provider, request)
+
+        event_text = "".join(events)
+        parsed = parse_sse_text(event_text)
+        tool_starts = [
+            event.data["content_block"]
+            for event in parsed
+            if event.event == "content_block_start"
+            and event.data.get("content_block", {}).get("type") == "tool_use"
+        ]
+        assert create.await_count == 2
+        assert tool_starts == [
+            {
+                "type": "tool_use",
+                "id": "call_success",
+                "name": original,
+                "input": {},
+            }
+        ]
+        assert alias not in event_text
+        assert "call_abandoned" not in event_text
+        assert sum(event.event == "message_start" for event in parsed) == 1
+        assert sum(event.event == "message_stop" for event in parsed) == 1
+
+    @pytest.mark.asyncio
     async def test_primary_replay_and_continuation_share_five_attempts(self):
         """Four replays plus continuation emit one unduplicated response."""
         provider = _make_provider()
@@ -783,12 +1217,15 @@ class TestStreamingExceptionHandling:
             ]
         )
 
-        with patch.object(
-            provider._client.chat.completions,
-            "create",
-            new_callable=AsyncMock,
-            side_effect=[*primary_streams, continuation],
-        ) as create:
+        with (
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                side_effect=[*primary_streams, continuation],
+            ) as create,
+            patch("free_claude_code.providers.admission.trace_event") as attempt_trace,
+        ):
             events = await _collect_stream(provider, request)
 
         assert create.await_count == UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS
@@ -810,6 +1247,19 @@ class TestStreamingExceptionHandling:
         assert sum(event.event == "message_start" for event in parsed) == 1
         assert sum(event.event == "message_delta" for event in parsed) == 1
         assert sum(event.event == "message_stop" for event in parsed) == 1
+        starts = [
+            call.kwargs
+            for call in attempt_trace.call_args_list
+            if call.kwargs.get("event") == "provider.attempt.started"
+        ]
+        assert [row["operation_kind"] for row in starts] == [
+            ProviderOperationKind.GENERATION.value,
+            ProviderOperationKind.GENERATION.value,
+            ProviderOperationKind.GENERATION.value,
+            ProviderOperationKind.GENERATION.value,
+            ProviderOperationKind.CONTINUATION.value,
+        ]
+        assert len({row["execution_id"] for row in starts}) == 1
 
     @pytest.mark.asyncio
     async def test_clean_eof_after_text_continues_with_overlap_trim(self):
@@ -897,7 +1347,7 @@ class TestStreamingExceptionHandling:
         ]
         provider = _make_provider()
         runner = _make_stream_runner(provider)
-        retry_session = provider._admission.new_retry_session()
+        execution = provider._admission.start_execution()
 
         with (
             patch.object(
@@ -911,7 +1361,8 @@ class TestStreamingExceptionHandling:
             await runner._collect_recovery_output(
                 {"messages": []},
                 include_reasoning=True,
-                retry_session=retry_session,
+                execution=execution,
+                operation_kind=ProviderOperationKind.CONTINUATION,
             )
 
         assert create.await_count == UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS
@@ -929,7 +1380,7 @@ class TestStreamingExceptionHandling:
         ]
         provider = _make_provider()
         runner = _make_stream_runner(provider)
-        retry_session = provider._admission.new_retry_session()
+        execution = provider._admission.start_execution()
 
         with (
             patch.object(
@@ -943,7 +1394,8 @@ class TestStreamingExceptionHandling:
             await runner._collect_recovery_output(
                 {"messages": []},
                 include_reasoning=True,
-                retry_session=retry_session,
+                execution=execution,
+                operation_kind=ProviderOperationKind.CONTINUATION,
             )
 
         assert create.await_count == UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS
@@ -960,7 +1412,7 @@ class TestStreamingExceptionHandling:
         )
         provider = _make_provider()
         runner = _make_stream_runner(provider)
-        retry_session = provider._admission.new_retry_session()
+        execution = provider._admission.start_execution()
 
         with patch.object(
             provider._client.chat.completions,
@@ -971,7 +1423,8 @@ class TestStreamingExceptionHandling:
             result = await runner._collect_recovery_output(
                 {"messages": []},
                 include_reasoning=True,
-                retry_session=retry_session,
+                execution=execution,
+                operation_kind=ProviderOperationKind.CONTINUATION,
             )
 
         assert result.text == "world"
@@ -980,17 +1433,150 @@ class TestStreamingExceptionHandling:
         assert stream.closed is True
 
     @pytest.mark.asyncio
+    async def test_recovery_close_failure_preserves_completed_output(self):
+        """A failed stream close cannot replace completed recovery output."""
+        stream = ClosableAsyncStreamMock(
+            [
+                _make_chunk(content="world"),
+                _make_chunk(finish_reason="stop"),
+            ],
+            close_error=RuntimeError("cleanup failed"),
+        )
+        provider = _make_provider()
+        runner = _make_stream_runner(provider, request_id="req_recovery_success")
+        execution = provider._admission.start_execution(
+            request_id="req_recovery_success"
+        )
+
+        with patch.object(
+            provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            return_value=stream,
+        ):
+            result = await runner._collect_recovery_output(
+                {"messages": []},
+                include_reasoning=True,
+                execution=execution,
+                operation_kind=ProviderOperationKind.CONTINUATION,
+            )
+
+        replacement = await execution.open_attempt(ProviderOperationKind.CONTINUATION)
+        await replacement.aclose()
+        assert result.text == "world"
+        assert stream.close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_recovery_close_failure_does_not_block_retry(self):
+        """Cleanup failure cannot replace a retryable recovery failure."""
+        failed = ClosableAsyncStreamMock(
+            [],
+            error=TimeoutError("original retryable failure"),
+            close_error=RuntimeError("cleanup failed"),
+        )
+        recovered = ClosableAsyncStreamMock(
+            [
+                _make_chunk(content="world"),
+                _make_chunk(finish_reason="stop"),
+            ]
+        )
+        provider = _make_provider()
+        runner = _make_stream_runner(provider)
+        execution = provider._admission.start_execution()
+
+        with patch.object(
+            provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            side_effect=[failed, recovered],
+        ) as create:
+            result = await runner._collect_recovery_output(
+                {"messages": []},
+                include_reasoning=True,
+                execution=execution,
+                operation_kind=ProviderOperationKind.CONTINUATION,
+            )
+
+        assert result.text == "world"
+        assert create.await_count == 2
+        assert failed.close_calls == 1
+        assert recovered.close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_recovery_close_failure_preserves_terminal_failure(self):
+        """Cleanup failure cannot mask a non-retryable recovery failure."""
+        stream = ClosableAsyncStreamMock(
+            [],
+            error=ValueError("original terminal failure"),
+            close_error=RuntimeError("cleanup failed"),
+        )
+        provider = _make_provider()
+        runner = _make_stream_runner(provider)
+        execution = provider._admission.start_execution()
+
+        with (
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                return_value=stream,
+            ),
+            pytest.raises(ValueError, match="original terminal failure"),
+        ):
+            await runner._collect_recovery_output(
+                {"messages": []},
+                include_reasoning=True,
+                execution=execution,
+                operation_kind=ProviderOperationKind.CONTINUATION,
+            )
+
+        assert stream.close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_recovery_close_failure_preserves_cancellation(self):
+        """Cleanup failure cannot turn caller cancellation into a provider error."""
+        stream = BlockingClosableAsyncStreamMock(
+            close_error=RuntimeError("cleanup failed")
+        )
+        provider = _make_provider()
+        runner = _make_stream_runner(provider)
+        execution = provider._admission.start_execution()
+
+        with patch.object(
+            provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            return_value=stream,
+        ):
+            task = asyncio.create_task(
+                runner._collect_recovery_output(
+                    {"messages": []},
+                    include_reasoning=True,
+                    execution=execution,
+                    operation_kind=ProviderOperationKind.CONTINUATION,
+                )
+            )
+            await asyncio.wait_for(stream.entered.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        replacement = await execution.open_attempt(ProviderOperationKind.CONTINUATION)
+        await replacement.aclose()
+        assert stream.close_calls == 1
+
+    @pytest.mark.asyncio
     async def test_recovery_collect_text_honors_provider_retry_classification(self):
         """Provider semantics apply before the first recovery chunk as well."""
         provider = _make_provider()
         runner = _make_stream_runner(provider)
-        retry_session = provider._admission.new_retry_session()
-        request = httpx.Request(
+        execution = provider._admission.start_execution()
+        request = httpx2.Request(
             "POST", "https://test.api.nvidia.com/v1/chat/completions"
         )
         degraded = openai.BadRequestError(
             "Bad Request",
-            response=httpx.Response(400, request=request),
+            response=httpx2.Response(400, request=request),
             body={
                 "status": 400,
                 "detail": (
@@ -1015,7 +1601,8 @@ class TestStreamingExceptionHandling:
             result = await runner._collect_recovery_output(
                 {"messages": []},
                 include_reasoning=True,
-                retry_session=retry_session,
+                execution=execution,
+                operation_kind=ProviderOperationKind.CONTINUATION,
             )
 
         assert result.text == "world"
@@ -1088,14 +1675,14 @@ class TestStreamingExceptionHandling:
                 thinking="hidden reasoning more",
             ),
         ) as mock_collect:
-            retry_session = runner._provider._admission.new_retry_session()
+            execution = runner._provider._admission.start_execution()
             events = await runner._recovery_events(
                 body={"messages": [{"role": "user", "content": "hello"}]},
                 ledger=ledger,
                 error=TimeoutError("cutoff"),
                 tool_argument_alias_buffers={},
                 output_reasoning=True,
-                retry_session=retry_session,
+                execution=execution,
             )
 
         assert events is not None
@@ -1292,6 +1879,233 @@ class TestProcessToolCall:
         assert "tool_use" in event_text
         assert "search" in event_text
         assert "call_123" in event_text
+
+    def test_structured_tool_call_restores_portable_wire_alias(self):
+        """A wire alias never escapes in the Anthropic tool block."""
+        provider = _make_provider()
+        original = "mcp__portable_output__" + "x" * 70
+        request = _make_request(
+            tools=[{"name": original, "input_schema": {"type": "object"}}]
+        )
+        codec = OpenAIToolNameCodec.from_request(request)
+        alias = codec.encode(original)
+        sse = AnthropicStreamLedger("msg_test", "test-model")
+
+        events = list(
+            _make_tool_assembler(provider).process_tool_call(
+                {
+                    "index": 0,
+                    "id": "call_alias",
+                    "function": {"name": alias, "arguments": "{}"},
+                },
+                sse,
+                tool_names=codec,
+                tool_name_buffers={},
+            )
+        )
+
+        event_text = "".join(events)
+        assert original in event_text
+        assert alias not in event_text
+        assert (
+            sum(
+                event.event == "content_block_start"
+                for event in parse_sse_text(event_text)
+            )
+            == 1
+        )
+
+    def test_tool_name_restores_before_nim_argument_alias_lookup(self):
+        """Generic name decoding composes with original-name NIM arg metadata."""
+        provider = _make_provider()
+        original = "mcp__nim_argument_composition__" + "x" * 70
+        request = _make_request(
+            tools=[
+                {
+                    "name": original,
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"type": {"type": "string"}},
+                        "required": ["type"],
+                    },
+                }
+            ]
+        )
+        codec = OpenAIToolNameCodec.from_request(request)
+        sse = AnthropicStreamLedger("msg_test", "test-model")
+
+        events = list(
+            _make_tool_assembler(provider).process_tool_call(
+                {
+                    "index": 0,
+                    "id": "call_composed",
+                    "function": {
+                        "name": codec.encode(original),
+                        "arguments": '{"_fcc_arg_type":"file"}',
+                    },
+                },
+                sse,
+                tool_names=codec,
+                tool_name_buffers={},
+                tool_argument_aliases={original: {"_fcc_arg_type": "type"}},
+                tool_argument_alias_buffers={},
+            )
+        )
+
+        parsed = parse_sse_text("".join(events))
+        start = next(
+            event.data["content_block"]
+            for event in parsed
+            if event.event == "content_block_start"
+        )
+        argument_delta = next(
+            event.data["delta"]["partial_json"]
+            for event in parsed
+            if event.event == "content_block_delta"
+        )
+        assert start["name"] == original
+        assert json.loads(argument_delta) == {"type": "file"}
+
+    def test_fragmented_wire_alias_starts_one_original_tool_block(self):
+        """A split alias is held until the exact request alias is complete."""
+        provider = _make_provider()
+        original = "mcp__fragmented_output__" + "x" * 70
+        request = _make_request(
+            tools=[{"name": original, "input_schema": {"type": "object"}}]
+        )
+        codec = OpenAIToolNameCodec.from_request(request)
+        alias = codec.encode(original)
+        split = len(alias) // 2
+        buffers: dict[int, str] = {}
+        sse = AnthropicStreamLedger("msg_test", "test-model")
+        assembler = _make_tool_assembler(provider)
+
+        first = list(
+            assembler.process_tool_call(
+                {
+                    "index": 0,
+                    "id": "call_split_alias",
+                    "function": {"name": alias[:split], "arguments": ""},
+                },
+                sse,
+                tool_names=codec,
+                tool_name_buffers=buffers,
+            )
+        )
+        second = list(
+            assembler.process_tool_call(
+                {
+                    "index": 0,
+                    "id": None,
+                    "function": {"name": alias[split:], "arguments": "{}"},
+                },
+                sse,
+                tool_names=codec,
+                tool_name_buffers=buffers,
+            )
+        )
+
+        assert first == []
+        event_text = "".join(second)
+        assert original in event_text
+        assert alias not in event_text
+        assert (
+            sum(
+                event.event == "content_block_start"
+                for event in parse_sse_text(event_text)
+            )
+            == 1
+        )
+        assert buffers == {}
+
+    def test_valid_name_that_prefixes_alias_is_resolved_on_flush(self):
+        """An ambiguous valid name is delayed, not mistaken for an alias fragment."""
+        provider = _make_provider()
+        original = "tool"
+        long_name = "tool." + "x" * 70
+        request = _make_request(
+            tools=[
+                {"name": original, "input_schema": {"type": "object"}},
+                {"name": long_name, "input_schema": {"type": "object"}},
+            ]
+        )
+        codec = OpenAIToolNameCodec.from_request(request)
+        assert codec.is_alias_prefix(original)
+        buffers: dict[int, str] = {}
+        sse = AnthropicStreamLedger("msg_test", "test-model")
+        assembler = _make_tool_assembler(provider)
+
+        initial = list(
+            assembler.process_tool_call(
+                {
+                    "index": 0,
+                    "id": "call_valid",
+                    "function": {"name": original, "arguments": "{}"},
+                },
+                sse,
+                tool_names=codec,
+                tool_name_buffers=buffers,
+            )
+        )
+        flushed = list(
+            assembler.flush_tool_name_buffers(
+                sse,
+                tool_names=codec,
+                tool_name_buffers=buffers,
+                tool_argument_aliases={},
+                tool_argument_alias_buffers={},
+            )
+        )
+
+        assert initial == []
+        assert original in "".join(flushed)
+        assert buffers == {}
+
+    def test_buffered_collector_decodes_before_schema_validation(self):
+        """Recovery validates the original tool identity, not its wire alias."""
+        original = "mcp__recovery_output__" + "x" * 70
+        request = _make_request(
+            tools=[{"name": original, "input_schema": {"type": "object"}}]
+        )
+        codec = OpenAIToolNameCodec.from_request(request)
+        collector = OpenAIToolCallCollector()
+        collector.add(
+            SimpleNamespace(
+                index=0,
+                id="call_recovered",
+                function=SimpleNamespace(name=codec.encode(original), arguments="{}"),
+            )
+        )
+
+        calls = collector.completed_calls(request, tool_names=codec)
+
+        assert calls is not None
+        assert calls[0]["function"]["name"] == original
+
+    def test_heuristic_tool_call_restores_original_name(self):
+        """Complete heuristic calls share the same outbound name contract."""
+        original = "mcp__heuristic_output__" + "x" * 70
+        request = _make_request(
+            tools=[{"name": original, "input_schema": {"type": "object"}}]
+        )
+        codec = OpenAIToolNameCodec.from_request(request)
+        sse = AnthropicStreamLedger("msg_test", "test-model")
+
+        events = list(
+            iter_heuristic_tool_use_sse(
+                sse,
+                {
+                    "id": "call_heuristic",
+                    "name": codec.encode(original),
+                    "input": {},
+                },
+                tool_names=codec,
+            )
+        )
+
+        event_text = "".join(events)
+        assert original in event_text
+        assert codec.encode(original) not in event_text
 
     def test_tool_call_id_arrives_before_name_still_emits_id_and_name(self):
         """Split-stream tool: id (no name) then name then args; id preserved on start."""

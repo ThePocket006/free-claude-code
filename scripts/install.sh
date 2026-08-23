@@ -7,32 +7,58 @@ MIN_UV_VERSION="0.11.16"
 CLAUDE_INSTALL_URL="https://claude.ai/install.sh"
 CODEX_INSTALL_URL="https://chatgpt.com/codex/install.sh"
 PI_INSTALL_URL="https://pi.dev/install.sh"
+OPENCODE_INSTALL_URL="https://opencode.ai/install"
+MIN_OPENCODE_VERSION="1.18.18"
+MIN_CLINE_VERSION="3.0.55"
+HERMES_INSTALL_URL="https://hermes-agent.nousresearch.com/install.sh"
+MIN_HERMES_VERSION="0.20.4"
+DSH_VERSION="0.1.0-rc.8"
+DSH_PACKAGE="@deepseek-ai/dsh@$DSH_VERSION"
+GROK_INSTALL_URL="https://x.ai/cli/install.sh"
+MIN_GROK_VERSION="1.0.5"
+MUSE_INSTALL_URL="https://dev.meta.ai/install.sh"
+MIN_MUSE_VERSION="0.2.1"
+RTK_VERSION="0.44.2"
+RTK_RELEASE_BASE_URL="https://github.com/rtk-ai/rtk/releases/download/v$RTK_VERSION"
 UV_INSTALL_URL="https://astral.sh/uv/install.sh"
 FCC_MACOS_BUNDLE_ID="io.github.alishahryar1.free-claude-code"
 FCC_MACOS_OWNER_FILE=".free-claude-code-owner"
 # Include retired entry points so updates reject older FCC processes before replacement.
-FCC_COMMANDS="fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi fcc-init free-claude-code"
+FCC_COMMANDS="fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi fcc-opencode fcc-cline fcc-hermes fcc-dsh fcc-grok fcc-muse fcc-init free-claude-code"
 
 dry_run=0
 voice_nim=0
 voice_local=0
 voice_all=0
+install_claude=1
+install_codex=1
+install_pi=1
+install_opencode=1
+install_cline=0
+install_hermes=1
+install_dsh=1
+install_grok=1
+install_muse=1
+enable_rtk=0
 torch_backend=""
-temporary_script=""
+temporary_file=""
+temporary_binary=""
 tool_bin=""
 pi_available=0
+rtk_path=""
 
 show_usage() {
     cat <<'USAGE'
 Usage: install.sh [options]
 
-Installs Claude Code and Codex, offers to install Pi, ensures a compatible uv, and installs or updates Free Claude Code.
+Installs or updates Free Claude Code and lets you choose which coding agents to install or verify.
 
 Options:
   --voice-nim              Install NVIDIA NIM voice transcription support.
   --voice-local            Install local Whisper voice transcription support.
   --voice-all              Install all voice transcription backends.
   --torch-backend VALUE    Use a uv PyTorch backend, such as cu130. Requires local voice.
+  --rtk                    Install and configure RTK for the selected coding agents.
   --dry-run                Print commands without running them.
   --help                   Show this help text.
 USAGE
@@ -41,6 +67,136 @@ USAGE
 fail() {
     printf 'error: %s\n' "$*" >&2
     exit 1
+}
+
+installer_is_interactive() {
+    [ -t 1 ] && ( : </dev/tty ) 2>/dev/null
+}
+
+prompt_yes_no() {
+    question=$1
+    default_answer=${2:-yes}
+    case "$default_answer" in
+        yes) prompt='[Y/n]' ;;
+        no) prompt='[y/N]' ;;
+        *) fail "Unsupported prompt default: $default_answer" ;;
+    esac
+
+    while :; do
+        printf '%s %s ' "$question" "$prompt" >&4
+        if ! IFS= read -r answer <&3; then
+            fail "Could not read the installer selection."
+        fi
+        case "$answer" in
+            '')
+                if [ "$default_answer" = "yes" ]; then
+                    return 0
+                fi
+                return 1
+                ;;
+            [Yy]|[Yy][Ee][Ss]) return 0 ;;
+            [Nn]|[Nn][Oo]) return 1 ;;
+            *) printf 'Please answer Y or N.\n' >&4 ;;
+        esac
+    done
+}
+
+choose_coding_agents() {
+    selection_input=$1
+    selection_output=$2
+    exec 3<"$selection_input"
+    exec 4>"$selection_output"
+
+    while :; do
+        if prompt_yes_no "Install or verify Claude Code for fcc-claude?"; then
+            install_claude=1
+        else
+            install_claude=0
+        fi
+        if prompt_yes_no "Install or verify Codex for fcc-codex?"; then
+            install_codex=1
+        else
+            install_codex=0
+        fi
+        if prompt_yes_no "Install or verify Pi for fcc-pi?"; then
+            install_pi=1
+        else
+            install_pi=0
+        fi
+        if prompt_yes_no "Install or verify OpenCode for fcc-opencode?"; then
+            install_opencode=1
+        else
+            install_opencode=0
+        fi
+
+        if [ "$install_cline" -eq 1 ]; then
+            cline_default=yes
+        else
+            cline_default=no
+        fi
+        if prompt_yes_no "Install or verify Cline CLI for fcc-cline?" "$cline_default"; then
+            install_cline=1
+        else
+            install_cline=0
+        fi
+
+        if [ "$install_hermes" -eq 1 ]; then
+            hermes_default=yes
+        else
+            hermes_default=no
+        fi
+        if prompt_yes_no "Install or verify Hermes Agent for fcc-hermes?" "$hermes_default"; then
+            install_hermes=1
+        else
+            install_hermes=0
+        fi
+
+        if [ "$install_dsh" -eq 1 ]; then
+            dsh_default=yes
+        else
+            dsh_default=no
+        fi
+        if prompt_yes_no "Install or verify DeepSeek Harness for fcc-dsh?" "$dsh_default"; then
+            install_dsh=1
+        else
+            install_dsh=0
+        fi
+
+        if [ "$install_grok" -eq 1 ]; then
+            grok_default=yes
+        else
+            grok_default=no
+        fi
+        if prompt_yes_no "Install or verify Grok Build for fcc-grok?" "$grok_default"; then
+            install_grok=1
+        else
+            install_grok=0
+        fi
+
+        if [ "$install_muse" -eq 1 ]; then
+            muse_default=yes
+        else
+            muse_default=no
+        fi
+        if prompt_yes_no "Install or verify Muse Code for fcc-muse?" "$muse_default"; then
+            install_muse=1
+        else
+            install_muse=0
+        fi
+
+        if [ "$install_claude" -eq 1 ] || [ "$install_codex" -eq 1 ] || [ "$install_pi" -eq 1 ] || [ "$install_opencode" -eq 1 ] || [ "$install_cline" -eq 1 ] || [ "$install_hermes" -eq 1 ] || [ "$install_dsh" -eq 1 ] || [ "$install_grok" -eq 1 ] || [ "$install_muse" -eq 1 ]; then
+            break
+        fi
+        printf 'Select at least one coding agent.\n\n' >&4
+    done
+
+    if [ "$enable_rtk" -eq 0 ] &&
+        prompt_yes_no "Enable RTK token optimization globally for the selected coding agents?" no; then
+        enable_rtk=1
+    fi
+
+    exec 3<&-
+    exec 4>&-
 }
 
 step() {
@@ -84,8 +240,11 @@ run() {
 }
 
 cleanup() {
-    if [ -n "$temporary_script" ] && [ -e "$temporary_script" ]; then
-        rm -f "$temporary_script"
+    if [ -n "$temporary_file" ] && [ -e "$temporary_file" ]; then
+        rm -f "$temporary_file"
+    fi
+    if [ -n "$temporary_binary" ] && [ -e "$temporary_binary" ]; then
+        rm -f "$temporary_binary"
     fi
 }
 
@@ -109,14 +268,21 @@ add_known_bin_directories() {
     if [ -n "${HOME:-}" ]; then
         add_path_entry "$HOME/.local/bin"
         add_path_entry "$HOME/.cargo/bin"
+        add_path_entry "$HOME/.opencode/bin"
         add_path_entry "${XDG_DATA_HOME:-$HOME/.local/share}/pi-node/current/bin"
+    fi
+
+    if [ -n "${GROK_BIN_DIR:-}" ]; then
+        add_path_entry "$GROK_BIN_DIR"
+    elif [ -n "${HOME:-}" ]; then
+        add_path_entry "$HOME/.grok/bin"
     fi
 
     export PATH
     hash -r 2>/dev/null || true
 }
 
-add_pi_bin_directories() {
+add_npm_bin_directories() {
     [ "$dry_run" -eq 0 ] || return 0
     add_known_bin_directories
     if command -v npm >/dev/null 2>&1; then
@@ -186,30 +352,40 @@ download_and_run() {
     url=$1
     interpreter=$2
     label=$3
-    non_interactive=${4:-0}
+    shift 3
+    non_interactive=0
+    if [ "$#" -gt 0 ]; then
+        non_interactive=$1
+        shift
+    fi
 
     if [ "$dry_run" -eq 1 ]; then
         print_command curl -fsSL "$url" -o "<temporary-script>"
         if [ "$non_interactive" -eq 1 ]; then
             printf '+ CODEX_NON_INTERACTIVE=1 '
             quote_arg "$interpreter"
-            printf ' <temporary-script>\n'
+            printf ' <temporary-script>'
+            for arg in "$@"; do
+                printf ' '
+                quote_arg "$arg"
+            done
+            printf '\n'
         else
-            print_command "$interpreter" "<temporary-script>"
+            print_command "$interpreter" "<temporary-script>" "$@"
         fi
         return 0
     fi
 
-    temporary_script=$(mktemp "${TMPDIR:-/tmp}/fcc-install.XXXXXX") || fail "Unable to create a temporary file for $label."
-    print_command curl -fsSL "$url" -o "$temporary_script"
-    if curl -fsSL "$url" -o "$temporary_script"; then
+    temporary_file=$(mktemp "${TMPDIR:-/tmp}/fcc-install.XXXXXX") || fail "Unable to create a temporary file for $label."
+    print_command curl -fsSL "$url" -o "$temporary_file"
+    if curl -fsSL "$url" -o "$temporary_file"; then
         :
     else
         status=$?
         fail "Could not download the $label installer (curl exit code $status)."
     fi
 
-    if [ ! -s "$temporary_script" ]; then
+    if [ ! -s "$temporary_file" ]; then
         fail "The downloaded $label installer was empty."
     fi
 
@@ -217,17 +393,21 @@ download_and_run() {
         printf '+ CODEX_NON_INTERACTIVE=1 '
         quote_arg "$interpreter"
         printf ' '
-        quote_arg "$temporary_script"
+        quote_arg "$temporary_file"
+        for arg in "$@"; do
+            printf ' '
+            quote_arg "$arg"
+        done
         printf '\n'
-        if CODEX_NON_INTERACTIVE=1 "$interpreter" "$temporary_script"; then
+        if CODEX_NON_INTERACTIVE=1 "$interpreter" "$temporary_file" "$@"; then
             :
         else
             status=$?
             fail "$label installation failed with exit code $status."
         fi
     else
-        print_command "$interpreter" "$temporary_script"
-        if "$interpreter" "$temporary_script"; then
+        print_command "$interpreter" "$temporary_file" "$@"
+        if "$interpreter" "$temporary_file" "$@"; then
             :
         else
             status=$?
@@ -235,8 +415,8 @@ download_and_run() {
         fi
     fi
 
-    rm -f "$temporary_script"
-    temporary_script=""
+    rm -f "$temporary_file"
+    temporary_file=""
 }
 
 verify_command() {
@@ -277,6 +457,168 @@ verify_pi_command() {
     run "$pi_command_path" --version
 }
 
+verify_rtk_command() {
+    if [ "$dry_run" -eq 1 ]; then
+        print_command env RTK_TELEMETRY_DISABLED=1 rtk --version
+        print_command env RTK_TELEMETRY_DISABLED=1 rtk gain
+        return 0
+    fi
+
+    rtk_path=$(command -v rtk 2>/dev/null) || fail "RTK was installed, but 'rtk' is not available on PATH."
+    print_command env RTK_TELEMETRY_DISABLED=1 "$rtk_path" --version
+    if ! RTK_TELEMETRY_DISABLED=1 "$rtk_path" --version; then
+        fail "The 'rtk' command at $rtk_path is not a compatible Rust Token Killer installation. Remove the conflicting command from PATH, then rerun the installer."
+    fi
+
+    print_command env RTK_TELEMETRY_DISABLED=1 "$rtk_path" gain
+    if ! RTK_TELEMETRY_DISABLED=1 "$rtk_path" gain; then
+        fail "The 'rtk' command at $rtk_path is not a compatible Rust Token Killer installation. Remove the conflicting command from PATH, then rerun the installer."
+    fi
+}
+
+select_rtk_release() {
+    rtk_platform=$(uname -s)
+    rtk_architecture=$(uname -m)
+    case "$rtk_platform:$rtk_architecture" in
+        Linux:x86_64|Linux:amd64)
+            rtk_asset_name="rtk-x86_64-unknown-linux-musl.tar.gz"
+            rtk_asset_sha256="d94cc2a3e57fa534892b5235a726e7eeb7523f205a5f8f48f853bfcae7be7e33"
+            ;;
+        Linux:aarch64|Linux:arm64)
+            rtk_asset_name="rtk-aarch64-unknown-linux-gnu.tar.gz"
+            rtk_asset_sha256="5cd3f7fa2697faf9e5b77a10ce4e699006e02d4752d792f06550697eb4b8e8a9"
+            ;;
+        Darwin:x86_64|Darwin:amd64)
+            rtk_asset_name="rtk-x86_64-apple-darwin.tar.gz"
+            rtk_asset_sha256="636f808db86b2cefab7db7dd9393da8b6e4721bb2ffaa0644e3ffa52d3420d81"
+            ;;
+        Darwin:aarch64|Darwin:arm64)
+            rtk_asset_name="rtk-aarch64-apple-darwin.tar.gz"
+            rtk_asset_sha256="b7c2218eca538b54e63fa594a8ce58bd3716851b01b3b0dc026515323baf6393"
+            ;;
+        *)
+            fail "RTK $RTK_VERSION does not provide a release for $rtk_platform $rtk_architecture."
+            ;;
+    esac
+}
+
+install_rtk() {
+    select_rtk_release
+    rtk_archive_url="$RTK_RELEASE_BASE_URL/$rtk_asset_name"
+    if [ "$dry_run" -eq 1 ]; then
+        print_command curl -fsSL "$rtk_archive_url" -o "<temporary-archive>"
+        printf '+ verify pinned SHA-256 for %s\n' "$rtk_asset_name"
+        printf '+ extract rtk to %s\n' "${HOME:-~}/.local/bin/rtk"
+        return 0
+    fi
+
+    [ -n "${HOME:-}" ] || fail "HOME is required to install RTK."
+    temporary_file=$(mktemp "${TMPDIR:-/tmp}/fcc-rtk.XXXXXX") || fail "Unable to create a temporary RTK archive."
+    print_command curl -fsSL "$rtk_archive_url" -o "$temporary_file"
+    if curl -fsSL "$rtk_archive_url" -o "$temporary_file"; then
+        :
+    else
+        status=$?
+        fail "Could not download RTK $RTK_VERSION (curl exit code $status)."
+    fi
+    [ -s "$temporary_file" ] || fail "The downloaded RTK archive was empty."
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        print_command sha256sum "$temporary_file"
+        rtk_actual_sha256=$(sha256sum "$temporary_file") || fail "Could not hash the downloaded RTK archive."
+    elif command -v shasum >/dev/null 2>&1; then
+        print_command shasum -a 256 "$temporary_file"
+        rtk_actual_sha256=$(shasum -a 256 "$temporary_file") || fail "Could not hash the downloaded RTK archive."
+    else
+        fail "RTK installation requires sha256sum or shasum for checksum verification."
+    fi
+    rtk_actual_sha256=${rtk_actual_sha256%% *}
+    [ "$rtk_actual_sha256" = "$rtk_asset_sha256" ] || fail "RTK checksum verification failed for $rtk_asset_name."
+
+    if rtk_archive_entries=$(tar -tzf "$temporary_file"); then
+        :
+    else
+        fail "The verified RTK archive could not be inspected."
+    fi
+    [ "$rtk_archive_entries" = "rtk" ] || fail "The verified RTK archive did not contain exactly one root rtk executable."
+
+    rtk_install_directory="$HOME/.local/bin"
+    run mkdir -p "$rtk_install_directory"
+    temporary_binary=$(mktemp "$rtk_install_directory/.rtk.XXXXXX") || fail "Unable to create a temporary RTK executable."
+    print_command tar -xOzf "$temporary_file" rtk
+    if tar -xOzf "$temporary_file" rtk >"$temporary_binary"; then
+        :
+    else
+        fail "The verified RTK archive could not be extracted."
+    fi
+    [ -s "$temporary_binary" ] || fail "The verified RTK executable was empty."
+    run chmod +x "$temporary_binary"
+    run mv "$temporary_binary" "$rtk_install_directory/rtk"
+    temporary_binary=""
+    rm -f "$temporary_file"
+    temporary_file=""
+}
+
+ensure_rtk() {
+    if command -v rtk >/dev/null 2>&1; then
+        printf 'RTK already found on PATH; verifying it without updating it.\n'
+    else
+        install_rtk
+        add_known_bin_directories
+    fi
+
+    verify_rtk_command
+}
+
+run_rtk_init() {
+    print_command env RTK_TELEMETRY_DISABLED=1 rtk "$@"
+    if [ "$dry_run" -eq 1 ]; then
+        return 0
+    fi
+
+    if RTK_TELEMETRY_DISABLED=1 "$rtk_path" "$@"; then
+        return 0
+    else
+        status=$?
+    fi
+
+    fail "RTK configuration failed with exit code $status. Correct the reported RTK error, then rerun the installer."
+}
+
+ensure_rtk_claude_config_directory() {
+    if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+        rtk_claude_config_directory=$CLAUDE_CONFIG_DIR
+    else
+        [ -n "${HOME:-}" ] || fail "HOME is required to configure RTK for Claude Code."
+        rtk_claude_config_directory="$HOME/.claude"
+    fi
+    run mkdir -p "$rtk_claude_config_directory"
+}
+
+configure_rtk_for_selected_agents() {
+    [ "$enable_rtk" -eq 1 ] || return 0
+
+    step "Installing and configuring RTK token optimization"
+    ensure_rtk
+
+    if [ "$install_claude" -eq 1 ]; then
+        ensure_rtk_claude_config_directory
+        run_rtk_init init --global --auto-patch
+    fi
+    if [ "$install_codex" -eq 1 ]; then
+        run_rtk_init init --global --codex
+    fi
+    if [ "$install_pi" -eq 1 ] && [ "$pi_available" -eq 1 ]; then
+        run_rtk_init init --global --agent pi
+    fi
+    if [ "$install_opencode" -eq 1 ]; then
+        run_rtk_init init --global --opencode
+    fi
+    if [ "$install_cline" -eq 1 ]; then
+        printf 'Optional for each project: cd <project> && RTK_TELEMETRY_DISABLED=1 rtk init --agent cline\n'
+    fi
+}
+
 ensure_claude() {
     if command -v claude >/dev/null 2>&1; then
         printf 'Claude Code already found on PATH; verifying it.\n'
@@ -301,7 +643,7 @@ ensure_codex() {
 
 ensure_pi() {
     pi_available=0
-    add_pi_bin_directories
+    add_npm_bin_directories
     existing_pi_path=$(command -v pi 2>/dev/null || true)
 
     if [ "$dry_run" -eq 1 ] && command -v pi >/dev/null 2>&1; then
@@ -313,7 +655,7 @@ ensure_pi() {
             printf "The existing 'pi' command at %s is not Pi Coding Agent; installing Pi.\n" "$existing_pi_path"
         fi
         download_and_run "$PI_INSTALL_URL" sh "Pi"
-        add_pi_bin_directories
+        add_npm_bin_directories
 
         if [ "$dry_run" -eq 0 ]; then
             current_pi_path=$(command -v pi 2>/dev/null || true)
@@ -329,6 +671,505 @@ ensure_pi() {
 
     verify_pi_command
     pi_available=1
+}
+
+current_opencode_version() {
+    if output=$(opencode --version 2>/dev/null); then
+        :
+    else
+        return 1
+    fi
+
+    version=$(printf '%s\n' "$output" | awk '
+        /^[[:space:]]*((opencode( version)?[[:space:]]+)|v)?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?[[:space:]]*$/ &&
+        match($0, /[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?/) {
+            print substr($0, RSTART, RLENGTH)
+            exit
+        }
+    ')
+    [ -n "$version" ] || return 1
+    printf '%s\n' "$version"
+}
+
+verify_opencode_command() {
+    if [ "$dry_run" -eq 1 ]; then
+        print_command opencode --version
+        return 0
+    fi
+
+    command_path=$(command -v opencode 2>/dev/null) || fail "OpenCode was installed, but 'opencode' is not available on PATH."
+    version=$(current_opencode_version) || fail "OpenCode is present, but 'opencode --version' did not return a valid semantic version."
+    if ! stable_version_is_supported "$version" "$MIN_OPENCODE_VERSION"; then
+        fail "Stable OpenCode V1 $MIN_OPENCODE_VERSION or newer is required; found OpenCode $version after installation."
+    fi
+    printf 'Verified OpenCode %s.\n' "$version"
+}
+
+ensure_opencode() {
+    if [ "$dry_run" -eq 1 ]; then
+        if command -v opencode >/dev/null 2>&1; then
+            print_command opencode --version
+            printf 'A compatible OpenCode will be preserved; an older version will be upgraded with opencode upgrade.\n'
+        else
+            download_and_run "$OPENCODE_INSTALL_URL" bash "OpenCode"
+        fi
+        verify_opencode_command
+        return 0
+    fi
+
+    if command -v opencode >/dev/null 2>&1; then
+        version=$(current_opencode_version) || fail "OpenCode is present, but 'opencode --version' did not return a valid semantic version."
+        if stable_version_is_supported "$version" "$MIN_OPENCODE_VERSION"; then
+            printf 'OpenCode %s already satisfies >=%s; leaving it unchanged.\n' "$version" "$MIN_OPENCODE_VERSION"
+            return 0
+        fi
+        printf 'OpenCode %s does not satisfy stable V1 >=%s; upgrading it with OpenCode.\n' "$version" "$MIN_OPENCODE_VERSION"
+        run opencode upgrade
+        add_known_bin_directories
+    else
+        download_and_run "$OPENCODE_INSTALL_URL" bash "OpenCode"
+        add_known_bin_directories
+    fi
+
+    verify_opencode_command
+}
+
+current_cline_version() {
+    if output=$(cline --version 2>/dev/null); then
+        :
+    else
+        return 1
+    fi
+
+    version=$(printf '%s\n' "$output" | awk '
+        /^[[:space:]]*((cline( version)?[[:space:]]+)|v)?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?[[:space:]]*$/ &&
+        match($0, /[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?/) {
+            print substr($0, RSTART, RLENGTH)
+            exit
+        }
+    ')
+    [ -n "$version" ] || return 1
+    printf '%s\n' "$version"
+}
+
+verify_cline_command() {
+    if [ "$dry_run" -eq 1 ]; then
+        print_command cline --version
+        return 0
+    fi
+
+    command -v cline >/dev/null 2>&1 || fail "Cline was installed, but 'cline' is not available on PATH."
+    version=$(current_cline_version) || fail "Cline is present, but 'cline --version' did not return a valid semantic version."
+    if ! stable_version_is_supported "$version" "$MIN_CLINE_VERSION"; then
+        fail "Stable Cline $MIN_CLINE_VERSION or newer is required; found Cline $version after installation."
+    fi
+    printf 'Verified Cline %s.\n' "$version"
+}
+
+ensure_cline() {
+    add_npm_bin_directories
+
+    if [ "$dry_run" -eq 1 ]; then
+        if command -v cline >/dev/null 2>&1; then
+            print_command cline --version
+            printf 'A compatible Cline will be preserved; an older version will be upgraded with cline update.\n'
+        elif command -v npm >/dev/null 2>&1; then
+            print_command npm install -g cline
+        else
+            fail "Cline installation requires npm. Install Node.js from https://nodejs.org/en/download, then rerun the installer."
+        fi
+        verify_cline_command
+        return 0
+    fi
+
+    if command -v cline >/dev/null 2>&1; then
+        version=$(current_cline_version) || fail "Cline is present, but 'cline --version' did not return a valid semantic version."
+        if stable_version_is_supported "$version" "$MIN_CLINE_VERSION"; then
+            printf 'Cline %s already satisfies >=%s; leaving it unchanged.\n' "$version" "$MIN_CLINE_VERSION"
+            return 0
+        fi
+        printf 'Cline %s does not satisfy stable >=%s; upgrading it with Cline.\n' "$version" "$MIN_CLINE_VERSION"
+        run cline update
+    else
+        command -v npm >/dev/null 2>&1 || fail "Cline installation requires npm. Install Node.js from https://nodejs.org/en/download, then rerun the installer."
+        run npm install -g cline
+    fi
+
+    add_npm_bin_directories
+    verify_cline_command
+}
+
+current_hermes_version() {
+    if output=$(hermes --version 2>/dev/null); then
+        :
+    else
+        return 1
+    fi
+
+    version=$(printf '%s\n' "$output" | awk '
+        match($0, /[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?/) {
+            print substr($0, RSTART, RLENGTH)
+            exit
+        }
+    ')
+    [ -n "$version" ] || return 1
+    printf '%s\n' "$version"
+}
+
+verify_hermes_command() {
+    if [ "$dry_run" -eq 1 ]; then
+        print_command hermes --version
+        return 0
+    fi
+
+    command -v hermes >/dev/null 2>&1 || fail "Hermes Agent was installed, but 'hermes' is not available on PATH."
+    version=$(current_hermes_version) || fail "Hermes Agent is present, but 'hermes --version' did not return a valid semantic version."
+    if ! stable_version_is_supported "$version" "$MIN_HERMES_VERSION"; then
+        fail "Hermes Agent $MIN_HERMES_VERSION or newer is required; found Hermes $version after installation."
+    fi
+    printf 'Verified Hermes Agent %s.\n' "$version"
+}
+
+hermes_platform_is_supported() {
+    hermes_platform=$(uname -s)
+    hermes_architecture=$(uname -m)
+    case "$hermes_platform:$hermes_architecture" in
+        Linux:x86_64|Linux:amd64|Linux:aarch64|Linux:arm64|Darwin:aarch64|Darwin:arm64)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+confirm_hermes_platform() {
+    if hermes_platform_is_supported; then
+        return 0
+    fi
+    fail "Hermes Agent does not provide a supported release for $hermes_platform $hermes_architecture."
+}
+
+install_hermes() {
+    confirm_hermes_platform
+    download_and_run "$HERMES_INSTALL_URL" bash "Hermes Agent" 0 --non-interactive --skip-setup
+    add_known_bin_directories
+}
+
+ensure_hermes() {
+    if [ "$dry_run" -eq 1 ]; then
+        if command -v hermes >/dev/null 2>&1; then
+            print_command hermes --version
+            printf 'A compatible Hermes Agent will be preserved; an older version will be upgraded with the official installer.\n'
+        else
+            install_hermes
+        fi
+        verify_hermes_command
+        return 0
+    fi
+
+    if command -v hermes >/dev/null 2>&1; then
+        version=$(current_hermes_version) || fail "Hermes Agent is present, but 'hermes --version' did not return a valid semantic version."
+        if stable_version_is_supported "$version" "$MIN_HERMES_VERSION"; then
+            printf 'Hermes Agent %s already satisfies >=%s; leaving it unchanged.\n' "$version" "$MIN_HERMES_VERSION"
+            return 0
+        fi
+        printf 'Hermes Agent %s does not satisfy >=%s; upgrading it with the official installer.\n' "$version" "$MIN_HERMES_VERSION"
+    fi
+
+    install_hermes
+    verify_hermes_command
+}
+
+current_dsh_version() {
+    if output=$(dsh --version 2>/dev/null); then
+        :
+    else
+        return 1
+    fi
+
+    version=$(printf '%s\n' "$output" | awk '
+        match($0, /[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z][0-9A-Za-z.-]*/) {
+            print substr($0, RSTART, RLENGTH)
+            exit
+        }
+    ')
+    [ -n "$version" ] || return 1
+    printf '%s\n' "$version"
+}
+
+current_node_version() {
+    if output=$(node --version 2>/dev/null); then
+        :
+    else
+        return 1
+    fi
+
+    version=$(printf '%s\n' "$output" | awk '
+        match($0, /[0-9]+\.[0-9]+\.[0-9]+/) {
+            print substr($0, RSTART, RLENGTH)
+            exit
+        }
+    ')
+    [ -n "$version" ] || return 1
+    printf '%s\n' "$version"
+}
+
+dsh_node_version_is_supported() {
+    version=$1
+    major=${version%%.*}
+    rest=${version#*.}
+    [ "$rest" != "$version" ] || return 1
+    minor=${rest%%.*}
+    case "$major:$minor" in
+        *[!0-9:]*|:*) return 1 ;;
+    esac
+    if [ "$major" -eq 22 ]; then
+        [ "$minor" -ge 19 ]
+        return
+    fi
+    [ "$major" -ge 24 ]
+}
+
+dsh_toolchain_is_supported() {
+    command -v node >/dev/null 2>&1 || return 1
+    command -v npm >/dev/null 2>&1 || return 1
+    version=$(current_node_version) || return 1
+    dsh_node_version_is_supported "$version"
+}
+
+require_dsh_toolchain() {
+    command -v node >/dev/null 2>&1 || fail "DeepSeek Harness requires Node.js ^22.19.0 or >=24.0.0 and npm. Install Node.js, then rerun the installer."
+    command -v npm >/dev/null 2>&1 || fail "DeepSeek Harness requires npm. Install npm, then rerun the installer."
+    version=$(current_node_version) || fail "DeepSeek Harness requires a readable Node.js version."
+    dsh_node_version_is_supported "$version" || fail "DeepSeek Harness requires Node.js ^22.19.0 or >=24.0.0; found Node.js $version."
+}
+
+verify_dsh_command() {
+    if [ "$dry_run" -eq 1 ]; then
+        print_command dsh --version
+        return 0
+    fi
+
+    command -v dsh >/dev/null 2>&1 || fail "DeepSeek Harness was installed, but 'dsh' is not available on PATH."
+    version=$(current_dsh_version) || fail "DeepSeek Harness is present, but 'dsh --version' did not return its preview semantic version."
+    [ "$version" = "$DSH_VERSION" ] || fail "DeepSeek Harness $DSH_VERSION is required; found $version after installation."
+    printf 'Verified DeepSeek Harness %s.\n' "$version"
+}
+
+install_dsh_package() {
+    require_dsh_toolchain
+    run npm install -g "$DSH_PACKAGE"
+    add_npm_bin_directories
+}
+
+ensure_dsh() {
+    add_npm_bin_directories
+
+    if [ "$dry_run" -eq 1 ]; then
+        if command -v dsh >/dev/null 2>&1; then
+            print_command dsh --version
+            printf 'The exact supported DeepSeek Harness preview will be preserved; another version will be replaced.\n'
+        else
+            command -v node >/dev/null 2>&1 || fail "DeepSeek Harness requires Node.js ^22.19.0 or >=24.0.0 and npm. Install Node.js, then rerun the installer."
+            command -v npm >/dev/null 2>&1 || fail "DeepSeek Harness requires npm. Install npm, then rerun the installer."
+            print_command npm install -g "$DSH_PACKAGE"
+        fi
+        verify_dsh_command
+        return 0
+    fi
+
+    require_dsh_toolchain
+    if command -v dsh >/dev/null 2>&1; then
+        version=$(current_dsh_version) || fail "DeepSeek Harness is present, but 'dsh --version' did not return its preview semantic version."
+        if [ "$version" = "$DSH_VERSION" ]; then
+            printf 'DeepSeek Harness %s already matches the supported preview; leaving it unchanged.\n' "$version"
+            return 0
+        fi
+        printf 'DeepSeek Harness %s does not match %s; replacing it with the supported preview.\n' "$version" "$DSH_VERSION"
+    fi
+
+    install_dsh_package
+    verify_dsh_command
+}
+
+current_grok_version() {
+    if output=$(grok --version 2>/dev/null); then
+        :
+    else
+        return 1
+    fi
+
+    version=$(printf '%s\n' "$output" | awk '
+        /^[[:space:]]*(grok[[:space:]]+|v)?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?([[:space:]]+\([^\r\n]*\))?[[:space:]]*$/ &&
+        match($0, /[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?/) {
+            print substr($0, RSTART, RLENGTH)
+            exit
+        }
+    ')
+    [ -n "$version" ] || return 1
+    printf '%s\n' "$version"
+}
+
+verify_grok_command() {
+    if [ "$dry_run" -eq 1 ]; then
+        print_command grok --version
+        return 0
+    fi
+
+    command -v grok >/dev/null 2>&1 || fail "Grok Build was installed, but 'grok' is not available on PATH."
+    version=$(current_grok_version) || fail "Grok Build is present, but 'grok --version' did not return a valid semantic version."
+    if ! stable_version_is_supported "$version" "$MIN_GROK_VERSION"; then
+        fail "Stable Grok Build $MIN_GROK_VERSION or newer is required; found Grok Build $version after installation."
+    fi
+    printf 'Verified Grok Build %s.\n' "$version"
+}
+
+install_grok_build() {
+    download_and_run "$GROK_INSTALL_URL" bash "Grok Build"
+    add_known_bin_directories
+}
+
+ensure_grok() {
+    if [ "$dry_run" -eq 1 ]; then
+        if command -v grok >/dev/null 2>&1; then
+            print_command grok --version
+            printf 'A compatible Grok Build will be preserved; an older version will be upgraded with the official installer.\n'
+        else
+            install_grok_build
+        fi
+        verify_grok_command
+        return 0
+    fi
+
+    if command -v grok >/dev/null 2>&1; then
+        version=$(current_grok_version) || fail "Grok Build is present, but 'grok --version' did not return a valid semantic version."
+        if stable_version_is_supported "$version" "$MIN_GROK_VERSION"; then
+            printf 'Grok Build %s already satisfies >=%s; leaving it unchanged.\n' "$version" "$MIN_GROK_VERSION"
+            return 0
+        fi
+        printf 'Grok Build %s does not satisfy stable >=%s; upgrading it with the official installer.\n' "$version" "$MIN_GROK_VERSION"
+    fi
+
+    install_grok_build
+    verify_grok_command
+}
+
+current_muse_version() {
+    if output=$(muse --version 2>/dev/null); then
+        :
+    else
+        return 1
+    fi
+
+    version=$(printf '%s\n' "$output" | awk '
+        /^[[:space:]]*Muse Code[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+([[:space:]]+\([^\r\n]+\))?[[:space:]]*$/ &&
+        match($0, /[0-9]+\.[0-9]+\.[0-9]+/) {
+            print substr($0, RSTART, RLENGTH)
+            exit
+        }
+    ')
+    [ -n "$version" ] || return 1
+    printf '%s\n' "$version"
+}
+
+verify_muse_command() {
+    if [ "$dry_run" -eq 1 ]; then
+        print_command muse --version
+        return 0
+    fi
+
+    command -v muse >/dev/null 2>&1 || fail "Muse Code was installed, but 'muse' is not available on PATH."
+    version=$(current_muse_version) || fail "Muse Code is present, but 'muse --version' did not return the expected 'Muse Code x.y.z' version."
+    if ! stable_version_is_supported "$version" "$MIN_MUSE_VERSION"; then
+        fail "Muse Code $MIN_MUSE_VERSION or newer is required; found Muse Code $version after installation."
+    fi
+    printf 'Verified Muse Code %s.\n' "$version"
+}
+
+install_muse_code() {
+    case "$(uname -s)" in
+        Darwin|Linux) ;;
+        *) fail "Meta's official Muse Code installer supports macOS, Linux, and WSL only." ;;
+    esac
+    download_and_run "$MUSE_INSTALL_URL" bash "Muse Code"
+    add_known_bin_directories
+}
+
+ensure_muse() {
+    if [ "$dry_run" -eq 1 ]; then
+        if command -v muse >/dev/null 2>&1; then
+            print_command muse --version
+            printf 'A compatible Muse Code will be preserved; an older version will be upgraded with the official installer.\n'
+        else
+            install_muse_code
+        fi
+        verify_muse_command
+        return 0
+    fi
+
+    if command -v muse >/dev/null 2>&1; then
+        version=$(current_muse_version) || fail "Muse Code is present, but 'muse --version' did not return the expected 'Muse Code x.y.z' version."
+        if stable_version_is_supported "$version" "$MIN_MUSE_VERSION"; then
+            printf 'Muse Code %s already satisfies >=%s; leaving it unchanged.\n' "$version" "$MIN_MUSE_VERSION"
+            return 0
+        fi
+        printf 'Muse Code %s does not satisfy >=%s; upgrading it with the official installer.\n' "$version" "$MIN_MUSE_VERSION"
+    fi
+
+    install_muse_code
+    verify_muse_command
+}
+
+ensure_selected_coding_agents() {
+    if [ "$install_claude" -eq 1 ]; then
+        step "Ensuring Claude Code is installed"
+        ensure_claude
+    fi
+
+    if [ "$install_codex" -eq 1 ]; then
+        step "Ensuring Codex is installed"
+        ensure_codex
+    fi
+
+    if [ "$install_pi" -eq 1 ]; then
+        step "Checking or installing Pi"
+        ensure_pi
+    fi
+
+    if [ "$install_opencode" -eq 1 ]; then
+        step "Ensuring OpenCode is installed"
+        ensure_opencode
+    fi
+
+    if [ "$install_cline" -eq 1 ]; then
+        step "Ensuring Cline CLI is installed"
+        ensure_cline
+    fi
+
+    if [ "$install_hermes" -eq 1 ]; then
+        step "Ensuring Hermes Agent is installed"
+        ensure_hermes
+    fi
+
+    if [ "$install_dsh" -eq 1 ]; then
+        step "Ensuring DeepSeek Harness is installed"
+        ensure_dsh
+    fi
+
+    if [ "$install_grok" -eq 1 ]; then
+        step "Ensuring Grok Build is installed"
+        ensure_grok
+    fi
+
+    if [ "$install_muse" -eq 1 ]; then
+        step "Ensuring Muse Code is installed"
+        ensure_muse
+    fi
+
+    if [ "$install_claude" -eq 0 ] && [ "$install_codex" -eq 0 ] && [ "$pi_available" -eq 0 ] && [ "$install_opencode" -eq 0 ] && [ "$install_cline" -eq 0 ] && [ "$install_hermes" -eq 0 ] && [ "$install_dsh" -eq 0 ] && [ "$install_grok" -eq 0 ] && [ "$install_muse" -eq 0 ]; then
+        fail "No selected coding agent was installed. Re-run the installer and choose at least one."
+    fi
 }
 
 current_uv_version() {
@@ -350,7 +1191,7 @@ current_uv_version() {
     esac
 }
 
-uv_version_is_supported() {
+stable_version_is_supported() {
     case "$1" in
         *-*) return 1 ;;
     esac
@@ -389,7 +1230,7 @@ verify_uv() {
 
     command -v uv >/dev/null 2>&1 || fail "uv was installed, but it is not available on PATH."
     version=$(current_uv_version) || fail "uv is present, but 'uv --version' did not return a valid version."
-    if ! uv_version_is_supported "$version" "$MIN_UV_VERSION"; then
+    if ! stable_version_is_supported "$version" "$MIN_UV_VERSION"; then
         fail "Stable uv $MIN_UV_VERSION or newer is required; found uv $version after installation."
     fi
 
@@ -411,7 +1252,7 @@ ensure_uv() {
 
     if command -v uv >/dev/null 2>&1; then
         version=$(current_uv_version) || fail "uv is present, but 'uv --version' did not return a valid version."
-        if uv_version_is_supported "$version" "$MIN_UV_VERSION"; then
+        if stable_version_is_supported "$version" "$MIN_UV_VERSION"; then
             printf 'uv %s already satisfies >=%s; leaving it unchanged.\n' "$version" "$MIN_UV_VERSION"
             return 0
         fi
@@ -446,6 +1287,9 @@ parse_args() {
             --torch-backend=*)
                 torch_backend=${1#*=}
                 [ -n "$torch_backend" ] || fail "--torch-backend requires a non-empty value."
+                ;;
+            --rtk)
+                enable_rtk=1
                 ;;
             --dry-run)
                 dry_run=1
@@ -510,7 +1354,7 @@ configure_and_verify_free_claude_code() {
 
     if [ "$dry_run" -eq 1 ]; then
         print_command uv tool dir --bin
-        printf '+ verify fcc-desktop, fcc-server, fcc-claude, fcc-codex, and fcc-pi in the uv tool bin directory\n'
+        printf '+ verify fcc-desktop, fcc-server, fcc-claude, fcc-codex, fcc-pi, fcc-opencode, fcc-cline, fcc-hermes, fcc-dsh, fcc-grok, and fcc-muse in the uv tool bin directory\n'
         print_command fcc-server --version
         return 0
     fi
@@ -528,7 +1372,7 @@ configure_and_verify_free_claude_code() {
     export PATH
     hash -r 2>/dev/null || true
 
-    for command_name in fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi; do
+    for command_name in fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi fcc-opencode fcc-cline fcc-hermes fcc-dsh fcc-grok fcc-muse; do
         [ -x "$tool_bin/$command_name" ] || fail "Free Claude Code installation did not create $tool_bin/$command_name."
     done
 
@@ -627,24 +1471,46 @@ PLIST
 parse_args "$@"
 validate_args
 add_known_bin_directories
-
+if command -v cline >/dev/null 2>&1 || command -v npm >/dev/null 2>&1; then
+    install_cline=1
+fi
+if ! command -v hermes >/dev/null 2>&1 && ! hermes_platform_is_supported; then
+    install_hermes=0
+fi
 step "Checking for running Free Claude Code processes"
 assert_no_fcc_processes_running
 
+if ! installer_is_interactive && ! command -v dsh >/dev/null 2>&1; then
+    if [ "$dry_run" -eq 1 ] && command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+        install_dsh=1
+    elif ! dsh_toolchain_is_supported; then
+        install_dsh=0
+    fi
+fi
+
+if installer_is_interactive; then
+    step "Choosing coding agents"
+    choose_coding_agents /dev/tty /dev/tty
+fi
+
 step "Checking installation prerequisites"
 require_command curl
-require_command bash
+if [ "$install_claude" -eq 1 ] || [ "$install_opencode" -eq 1 ] || [ "$install_hermes" -eq 1 ] || [ "$install_grok" -eq 1 ] || [ "$install_muse" -eq 1 ]; then
+    require_command bash
+fi
 require_command sh
 require_command mktemp
+if [ "$enable_rtk" -eq 1 ] && ! command -v rtk >/dev/null 2>&1; then
+    require_command tar
+    if [ "$dry_run" -eq 0 ] &&
+        ! command -v sha256sum >/dev/null 2>&1 &&
+        ! command -v shasum >/dev/null 2>&1; then
+        fail "RTK installation requires sha256sum or shasum for checksum verification."
+    fi
+fi
 
-step "Ensuring Claude Code is installed"
-ensure_claude
-
-step "Ensuring Codex is installed"
-ensure_codex
-
-step "Checking or installing Pi"
-ensure_pi
+ensure_selected_coding_agents
+configure_rtk_for_selected_agents
 
 step "Ensuring uv $MIN_UV_VERSION or newer is installed"
 ensure_uv
@@ -669,9 +1535,41 @@ else
     else
         printf '\nFree Claude Code is installed and verified. Start the proxy with: fcc-server\n'
     fi
-    printf 'Run Claude Code with: fcc-claude\n'
-    printf 'Run Codex with: fcc-codex\n'
+    if [ "$install_claude" -eq 1 ]; then
+        printf 'Run Claude Code with: fcc-claude\n'
+    fi
+    if [ "$install_codex" -eq 1 ]; then
+        printf 'Run Codex with: fcc-codex\n'
+    fi
     if [ "$pi_available" -eq 1 ]; then
         printf 'Run Pi with: fcc-pi\n'
+    fi
+    if [ "$install_opencode" -eq 1 ]; then
+        printf 'Run OpenCode with: fcc-opencode\n'
+    fi
+    if [ "$install_cline" -eq 1 ]; then
+        printf 'Run Cline with: fcc-cline\n'
+    else
+        printf 'The fcc-cline wrapper is ready after you install Cline CLI.\n'
+    fi
+    if [ "$install_hermes" -eq 1 ]; then
+        printf 'Run Hermes Agent with: fcc-hermes\n'
+    else
+        printf 'The fcc-hermes wrapper is ready after you install Hermes Agent.\n'
+    fi
+    if [ "$install_dsh" -eq 1 ]; then
+        printf 'Run DeepSeek Harness with: fcc-dsh\n'
+    else
+        printf 'The fcc-dsh wrapper is ready after you install DeepSeek Harness %s.\n' "$DSH_VERSION"
+    fi
+    if [ "$install_grok" -eq 1 ]; then
+        printf 'Run Grok Build with: fcc-grok\n'
+    else
+        printf 'The fcc-grok wrapper is ready after you install Grok Build %s or newer.\n' "$MIN_GROK_VERSION"
+    fi
+    if [ "$install_muse" -eq 1 ]; then
+        printf 'Run Muse Code with: fcc-muse\n'
+    else
+        printf 'The fcc-muse wrapper is ready after you install Muse Code %s or newer.\n' "$MIN_MUSE_VERSION"
     fi
 fi

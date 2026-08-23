@@ -1,37 +1,36 @@
 """Tests for DeepSeek OpenAI-compatible Chat Completions provider."""
 
-import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import httpx
 import pytest
-from openai import AsyncOpenAI
 
 from free_claude_code.application.errors import InvalidRequestError
 from free_claude_code.config.constants import ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS
 from free_claude_code.config.provider_catalog import DEEPSEEK_DEFAULT_BASE
 from free_claude_code.core.anthropic.models import (
+    ContentBlockDocument,
     ContentBlockImage,
     Message,
     MessagesRequest,
     Tool,
 )
 from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
-from free_claude_code.providers.base import ProviderConfig
 from free_claude_code.providers.deepseek import DeepSeekProvider
 from tests.providers.support import (
     REASONING_OFF,
     REASONING_ON,
+    capture_openai_chat_wire_body,
     immediate_admission,
+    make_provider_config,
     reasoning_for,
 )
 
 
 @pytest.fixture
 def deepseek_config():
-    return ProviderConfig(
+    return make_provider_config(
         api_key="test_deepseek_key",
         base_url=DEEPSEEK_DEFAULT_BASE,
         rate_limit=10,
@@ -42,36 +41,6 @@ def deepseek_config():
 @pytest.fixture
 def deepseek_provider(deepseek_config):
     return DeepSeekProvider(deepseek_config, admission=immediate_admission())
-
-
-async def _capture_openai_wire_body(body: dict) -> dict:
-    captured: list[dict] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        payload = json.loads(request.content)
-        assert isinstance(payload, dict)
-        captured.append(payload)
-        return httpx.Response(
-            200,
-            headers={"content-type": "text/event-stream"},
-            text="data: [DONE]\n\n",
-        )
-
-    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    client = AsyncOpenAI(
-        api_key="test",
-        base_url="https://deepseek.invalid",
-        http_client=http_client,
-        max_retries=0,
-    )
-    try:
-        stream = await client.chat.completions.create(**body, stream=True)
-        await stream.close()
-    finally:
-        await client.close()
-
-    assert len(captured) == 1
-    return captured[0]
 
 
 def test_default_base_url_alias():
@@ -86,6 +55,93 @@ def test_init(deepseek_config):
     assert provider._api_key == "test_deepseek_key"
     assert provider._base_url == "https://api.deepseek.com"
     assert mock_client.called
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        (
+            {
+                "prompt_tokens": 30,
+                "prompt_cache_hit_tokens": 10,
+                "prompt_cache_miss_tokens": 20,
+            },
+            {"input_tokens": 20, "cache_read_input_tokens": 10},
+        ),
+        (
+            {
+                "prompt_tokens": 30,
+                "prompt_cache_hit_tokens": 0,
+                "prompt_cache_miss_tokens": 30,
+            },
+            {"input_tokens": 30, "cache_read_input_tokens": 0},
+        ),
+        (
+            {
+                "prompt_tokens": 30,
+                "prompt_cache_hit_tokens": 30,
+                "prompt_cache_miss_tokens": 0,
+            },
+            {"input_tokens": 0, "cache_read_input_tokens": 30},
+        ),
+        (
+            {"prompt_cache_hit_tokens": 10, "prompt_cache_miss_tokens": 20},
+            {"input_tokens": 20, "cache_read_input_tokens": 10},
+        ),
+        (
+            {"prompt_tokens": 30, "prompt_cache_miss_tokens": 20},
+            {},
+        ),
+        (
+            {"prompt_tokens": 30, "prompt_cache_hit_tokens": 10},
+            {},
+        ),
+        (
+            {
+                "prompt_tokens": 30,
+                "prompt_cache_hit_tokens": True,
+                "prompt_cache_miss_tokens": 20,
+            },
+            {},
+        ),
+        (
+            {
+                "prompt_tokens": 30,
+                "prompt_cache_hit_tokens": 10,
+                "prompt_cache_miss_tokens": 20.0,
+            },
+            {},
+        ),
+        (
+            {
+                "prompt_tokens": 30,
+                "prompt_cache_hit_tokens": -1,
+                "prompt_cache_miss_tokens": 31,
+            },
+            {},
+        ),
+        (
+            {
+                "prompt_tokens": 30,
+                "prompt_cache_hit_tokens": 10,
+                "prompt_cache_miss_tokens": -1,
+            },
+            {},
+        ),
+        (
+            {
+                "prompt_tokens": 30,
+                "prompt_cache_hit_tokens": 10,
+                "prompt_cache_miss_tokens": 19,
+            },
+            {},
+        ),
+    ],
+)
+def test_maps_only_complete_consistent_cache_usage(
+    deepseek_provider, usage, expected
+) -> None:
+    assert deepseek_provider._anthropic_usage_fields(usage) == expected
 
 
 def test_build_request_body_openai_chat_shape(deepseek_provider):
@@ -203,7 +259,7 @@ def test_build_request_body_forced_tool_choice_downgrades_to_auto(
 
 def test_build_request_body_encodes_reasoning_off():
     provider = DeepSeekProvider(
-        ProviderConfig(
+        make_provider_config(
             api_key="k",
             base_url=DEEPSEEK_DEFAULT_BASE,
             rate_limit=1,
@@ -515,7 +571,7 @@ def test_tool_history_with_empty_top_level_reasoning_preserves_reasoning_state(
 
 def test_thinking_off_strips_thinking_history():
     provider = DeepSeekProvider(
-        ProviderConfig(
+        make_provider_config(
             api_key="k",
             base_url=DEEPSEEK_DEFAULT_BASE,
             rate_limit=1,
@@ -544,7 +600,7 @@ def test_thinking_off_strips_thinking_history():
 
 def test_thinking_off_still_replays_required_tool_reasoning():
     provider = DeepSeekProvider(
-        ProviderConfig(
+        make_provider_config(
             api_key="k",
             base_url=DEEPSEEK_DEFAULT_BASE,
             rate_limit=1,
@@ -645,7 +701,7 @@ def test_preflight_strips_user_image():
         ],
     )
     provider = DeepSeekProvider(
-        ProviderConfig(
+        make_provider_config(
             api_key="k",
             base_url=DEEPSEEK_DEFAULT_BASE,
             rate_limit=1,
@@ -661,6 +717,106 @@ def test_preflight_strips_user_image():
     assert "image or document inputs" in content.lower()
 
 
+def test_vision_model_forwards_user_image():
+    """Vision-capable DeepSeek models receive image blocks as OpenAI image_url parts."""
+    request = MessagesRequest(
+        model="deepseek-v4-flash-vision-exp",
+        messages=[
+            Message(
+                role="user",
+                content=[
+                    ContentBlockImage(
+                        type="image",
+                        source={
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "YQ==",
+                        },
+                    ),
+                    {"type": "text", "text": "Describe this image"},
+                ],
+            )
+        ],
+    )
+    provider = DeepSeekProvider(
+        make_provider_config(
+            api_key="k",
+            base_url=DEEPSEEK_DEFAULT_BASE,
+            rate_limit=1,
+            rate_window=1,
+        ),
+        admission=immediate_admission(),
+    )
+    # Must not raise on preflight (no InvalidRequestError for image blocks).
+    provider.preflight_stream(request, reasoning=REASONING_ON)
+    body = provider._build_request_body(request, reasoning=reasoning_for(request))
+    content = body["messages"][0]["content"]
+    assert isinstance(content, list)
+    image_parts = [
+        part
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "image_url"
+    ]
+    assert len(image_parts) == 1
+    assert image_parts[0]["image_url"]["url"] == "data:image/png;base64,YQ=="
+    text_parts = [
+        part
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text"
+    ]
+    assert text_parts[0]["text"] == "Describe this image"
+
+
+def test_vision_model_strips_user_document():
+    """Vision models still omit documents; conversion has no document parts."""
+    request = MessagesRequest(
+        model="deepseek-v4-flash-vision-exp",
+        messages=[
+            Message(
+                role="user",
+                content=[
+                    ContentBlockDocument(
+                        type="document",
+                        source={
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": "YQ==",
+                        },
+                    )
+                ],
+            )
+        ],
+    )
+    provider = DeepSeekProvider(
+        make_provider_config(
+            api_key="k",
+            base_url=DEEPSEEK_DEFAULT_BASE,
+            rate_limit=1,
+            rate_window=1,
+        ),
+        admission=immediate_admission(),
+    )
+    provider.preflight_stream(request, reasoning=REASONING_ON)
+    body = provider._build_request_body(request, reasoning=reasoning_for(request))
+    content = body["messages"][0]["content"]
+    assert content
+    if isinstance(content, str):
+        lowered = content.lower()
+    else:
+        texts = [
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        lowered = "\n".join(texts).lower()
+        assert not any(
+            isinstance(part, dict) and part.get("type") == "image_url"
+            for part in content
+        )
+    assert "attachment omitted" in lowered
+    assert "image or document inputs" in lowered
+
+
 def test_preflight_rejects_mcp_servers():
     request = MessagesRequest(
         model="m",
@@ -668,7 +824,7 @@ def test_preflight_rejects_mcp_servers():
         mcp_servers=[{"type": "url", "url": "https://x"}],
     )
     provider = DeepSeekProvider(
-        ProviderConfig(
+        make_provider_config(
             api_key="k",
             base_url=DEEPSEEK_DEFAULT_BASE,
             rate_limit=1,
@@ -687,7 +843,7 @@ def test_preflight_rejects_listed_server_tools_in_tools_list():
         tools=[Tool(name="web_search", type="web_search_20250305", input_schema={})],
     )
     provider = DeepSeekProvider(
-        ProviderConfig(
+        make_provider_config(
             api_key="k",
             base_url=DEEPSEEK_DEFAULT_BASE,
             rate_limit=1,
@@ -724,7 +880,7 @@ def test_preflight_rejects_server_tool_result_blocks():
         }
     )
     provider = DeepSeekProvider(
-        ProviderConfig(
+        make_provider_config(
             api_key="k",
             base_url=DEEPSEEK_DEFAULT_BASE,
             rate_limit=1,
@@ -866,8 +1022,8 @@ async def test_wire_messages_keep_prefix_across_tool_thinking_fallback(
             request, reasoning=reasoning_for(request)
         )
 
-    first_wire = await _capture_openai_wire_body(build(prefix_messages))
-    continued_wire = await _capture_openai_wire_body(build(continued_messages))
+    first_wire = await capture_openai_chat_wire_body(build(prefix_messages))
+    continued_wire = await capture_openai_chat_wire_body(build(continued_messages))
     first_messages = first_wire["messages"]
     continued = continued_wire["messages"]
 
@@ -940,11 +1096,11 @@ async def test_stream_uses_chat_completions_and_maps_cache_usage(deepseek_provid
     usage = next(
         event.data["usage"] for event in parsed if event.event == "message_delta"
     )
+    assert "cache_creation_input_tokens" not in usage
     assert usage == {
-        "input_tokens": 30,
+        "input_tokens": 20,
         "output_tokens": 3,
         "cache_read_input_tokens": 10,
-        "cache_creation_input_tokens": 20,
     }
 
 

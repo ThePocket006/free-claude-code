@@ -6,13 +6,18 @@ import logging
 import os
 import traceback
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any
+from dataclasses import replace
 
 from loguru import logger
 
 import free_claude_code.cli.managed as cli_managed
 import free_claude_code.messaging.session as messaging_session
 import free_claude_code.messaging.workflow as messaging_workflow_module
+from free_claude_code.application.connected_accounts import (
+    ConnectedAccountLoginMode,
+    ConnectedAccountPort,
+    ConnectedAccountStatus,
+)
 from free_claude_code.application.errors import ApplicationUnavailableError
 from free_claude_code.application.model_metadata import ProviderModelRefreshResult
 from free_claude_code.application.ports import StopResult
@@ -21,16 +26,15 @@ from free_claude_code.config.admin.persistence import (
     commit_prepared_admin_update,
     prepare_admin_update,
 )
+from free_claude_code.config.admin.state import ConfigInputValue
 from free_claude_code.config.admin.status import provider_config_status
 from free_claude_code.config.admin.values import load_value_state
-from free_claude_code.config.env_files import (
-    ANTHROPIC_AUTH_TOKEN_ENV,
-    process_env_key_is_effective,
-)
+from free_claude_code.config.loader import clear_settings_cache
 from free_claude_code.config.model_refs import parse_provider_type
 from free_claude_code.config.paths import messaging_state_dir_path
 from free_claude_code.config.server_urls import local_admin_url, local_proxy_root_url
-from free_claude_code.config.settings import Settings, get_settings
+from free_claude_code.config.settings import Settings
+from free_claude_code.core.json_types import JsonObject
 from free_claude_code.messaging.platforms import factory as messaging_platform_factory
 from free_claude_code.messaging.platforms.factory import MessagingPlatformOptions
 from free_claude_code.messaging.platforms.ports import (
@@ -43,10 +47,14 @@ from .provider_manager import ProviderRuntimeManager
 
 RestartCallback = Callable[[], Awaitable[None] | None]
 
+_PROVIDER_CHECK_FAILURE_MESSAGE = (
+    "Could not refresh this provider's models. Verify its configuration and access."
+)
+
 
 async def best_effort(
     name: str,
-    awaitable: Awaitable[Any],
+    awaitable: Awaitable[object],
     *,
     log_verbose_errors: bool = False,
 ) -> bool:
@@ -77,18 +85,6 @@ async def best_effort(
     return True
 
 
-def warn_if_process_auth_token(settings: Settings) -> None:
-    """Warn when server auth was implicitly inherited from the shell."""
-    model_config = getattr(settings, "model_config", Settings.model_config)
-    if process_env_key_is_effective(model_config, ANTHROPIC_AUTH_TOKEN_ENV):
-        logger.warning(
-            "ANTHROPIC_AUTH_TOKEN is set in the process environment but not in "
-            "a configured .env file. The proxy will require that token. Add "
-            "ANTHROPIC_AUTH_TOKEN= to .env to disable proxy auth, or set the "
-            "same token in .env to make server auth explicit."
-        )
-
-
 def startup_failure_message(settings: Settings, exc: Exception) -> str:
     """Return the existing concise ASGI startup failure message."""
     if isinstance(exc, ApplicationUnavailableError):
@@ -107,10 +103,16 @@ class ApplicationRuntime:
         *,
         transcriber: Transcriber | None,
         restart_callback: RestartCallback | None = None,
+        connected_accounts: Mapping[str, ConnectedAccountPort] | None = None,
     ) -> None:
         self.provider_manager = provider_manager
         self._transcriber = transcriber
         self._restart_callback = restart_callback
+        self._connected_accounts = dict(connected_accounts or {})
+        self._connected_account_revisions = {
+            provider_id: manager.status().revision
+            for provider_id, manager in self._connected_accounts.items()
+        }
         self._config_lock = asyncio.Lock()
         self._pending_fields: list[str] = []
         self._messaging_runtime: MessagingRuntime | None = None
@@ -121,6 +123,7 @@ class ApplicationRuntime:
         self._started = False
         self._closed = False
         self._provider_manager_closed = False
+        self._connected_accounts_closed = False
         self._close_lock = asyncio.Lock()
 
     @property
@@ -137,7 +140,6 @@ class ApplicationRuntime:
             return
         logger.info("Starting Claude Code Proxy...")
         try:
-            warn_if_process_auth_token(self.settings)
             await self.provider_manager.warm_referenced_model_cache()
             self.provider_manager.start_model_list_refresh()
             await self._start_messaging_if_configured()
@@ -174,8 +176,8 @@ class ApplicationRuntime:
 
     async def apply_admin_config(
         self,
-        updates: Mapping[str, Any],
-    ) -> dict[str, Any]:
+        updates: Mapping[str, ConfigInputValue],
+    ) -> JsonObject:
         """Apply one validated config update without splitting runtime ownership."""
         async with self._config_lock:
             prepared = prepare_admin_update(updates)
@@ -195,7 +197,7 @@ class ApplicationRuntime:
                 )
                 return result
 
-            result: dict[str, Any] = {}
+            result: JsonObject = {}
 
             def commit() -> None:
                 result.update(self._commit_admin_update(prepared))
@@ -209,7 +211,7 @@ class ApplicationRuntime:
             result["restart"] = self._restart_metadata((), prepared.settings)
             return result
 
-    def admin_status(self) -> dict[str, Any]:
+    def admin_status(self) -> JsonObject:
         settings = self.settings
         return {
             "status": "running",
@@ -225,16 +227,21 @@ class ApplicationRuntime:
             },
         }
 
-    async def test_provider(self, provider_id: str) -> dict[str, Any]:
+    async def test_provider(self, provider_id: str) -> JsonObject:
         lease = await self.provider_manager.acquire()
         try:
             provider = lease.resolve_provider(provider_id)
             infos = await provider.list_model_infos()
         except Exception as exc:
+            logger.warning(
+                "Admin provider check failed: provider={} exc_type={}",
+                provider_id,
+                type(exc).__name__,
+            )
             return {
                 "provider_id": provider_id,
                 "ok": False,
-                "error_type": type(exc).__name__,
+                "message": _PROVIDER_CHECK_FAILURE_MESSAGE,
             }
         finally:
             await lease.release()
@@ -247,6 +254,50 @@ class ApplicationRuntime:
 
     async def refresh_models(self) -> ProviderModelRefreshResult:
         return await self.provider_manager.refresh_model_list_cache()
+
+    async def connected_account_status(
+        self, provider_id: str
+    ) -> ConnectedAccountStatus:
+        """Return safe account state and synchronize model availability."""
+
+        manager = self._connected_account(provider_id)
+        status = manager.status()
+        previous_revision = self._connected_account_revisions.get(provider_id)
+        if status.revision != previous_revision:
+            await self.provider_manager.connected_provider_changed(
+                provider_id, connected=status.connected
+            )
+            self._connected_account_revisions[provider_id] = status.revision
+        model_count = len(self.provider_manager.cached_model_ids().get(provider_id, ()))
+        return replace(status, model_count=model_count)
+
+    async def start_connected_account_login(
+        self,
+        provider_id: str,
+        mode: ConnectedAccountLoginMode,
+    ) -> ConnectedAccountStatus:
+        """Start one provider-owned interactive login."""
+
+        return await self._connected_account(provider_id).start_login(mode)
+
+    async def cancel_connected_account_login(
+        self, provider_id: str
+    ) -> ConnectedAccountStatus:
+        """Cancel one pending provider login."""
+
+        return await self._connected_account(provider_id).cancel_login()
+
+    async def disconnect_connected_account(
+        self, provider_id: str
+    ) -> ConnectedAccountStatus:
+        """Disconnect an account and evict only that provider's models."""
+
+        status = await self._connected_account(provider_id).disconnect()
+        await self.provider_manager.connected_provider_changed(
+            provider_id, connected=False
+        )
+        self._connected_account_revisions[provider_id] = status.revision
+        return status
 
     async def request_restart(self) -> None:
         callback = self._restart_callback
@@ -268,16 +319,16 @@ class ApplicationRuntime:
     def _commit_admin_update(
         self,
         prepared: PreparedAdminUpdate,
-    ) -> dict[str, Any]:
+    ) -> JsonObject:
         result = commit_prepared_admin_update(prepared)
-        get_settings.cache_clear()
+        clear_settings_cache()
         return result
 
     def _restart_metadata(
         self,
         fields: tuple[str, ...],
         settings: Settings,
-    ) -> dict[str, Any]:
+    ) -> JsonObject:
         automatic = bool(fields and self._restart_callback is not None)
         return {
             "required": bool(fields),
@@ -354,7 +405,7 @@ class ApplicationRuntime:
             workspace_path=workspace,
             proxy_root_url=local_proxy_root_url(settings),
             allowed_dirs=allowed_dirs,
-            auth_token=settings.anthropic_auth_token,
+            auth_token=settings.proxy_auth_token,
             log_raw_cli_diagnostics=settings.log_raw_cli_diagnostics,
             log_messaging_error_details=settings.log_messaging_error_details,
         )
@@ -387,15 +438,37 @@ class ApplicationRuntime:
             return False
         if not await self._cleanup_transcriber():
             return False
-        if self._provider_manager_closed:
-            return True
         verbose = self.settings.log_api_error_tracebacks
-        self._provider_manager_closed = await best_effort(
-            "provider_manager.close",
-            self.provider_manager.close(),
-            log_verbose_errors=verbose,
+        if not self._provider_manager_closed:
+            self._provider_manager_closed = await best_effort(
+                "provider_manager.close",
+                self.provider_manager.close(),
+                log_verbose_errors=verbose,
+            )
+            if not self._provider_manager_closed:
+                return False
+        if self._connected_accounts_closed:
+            return True
+        results = await asyncio.gather(
+            *(
+                best_effort(
+                    f"connected_account.{provider_id}.close",
+                    manager.close(),
+                    log_verbose_errors=verbose,
+                )
+                for provider_id, manager in self._connected_accounts.items()
+            )
         )
-        return self._provider_manager_closed
+        self._connected_accounts_closed = all(results)
+        return self._connected_accounts_closed
+
+    def _connected_account(self, provider_id: str) -> ConnectedAccountPort:
+        manager = self._connected_accounts.get(provider_id)
+        if manager is None:
+            raise ApplicationUnavailableError(
+                f"Provider {provider_id!r} does not support connected-account login."
+            )
+        return manager
 
     async def _cleanup_messaging(self) -> bool:
         verbose = self.settings.log_api_error_tracebacks

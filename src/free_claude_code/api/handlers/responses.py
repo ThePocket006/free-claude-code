@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 from free_claude_code.api.request_errors import (
     http_status_for_unexpected_api_exception,
     log_unexpected_api_exception,
+    ordinary_application_error_response,
     require_non_empty_messages,
 )
 from free_claude_code.api.request_ids import new_request_id
@@ -19,6 +20,7 @@ from free_claude_code.application.ports import ProviderResolver
 from free_claude_code.application.routing import ModelRouter
 from free_claude_code.config.settings import Settings
 from free_claude_code.core.anthropic import MessagesRequest
+from free_claude_code.core.circuit_breaker import CircuitBreakerRegistry
 from free_claude_code.core.diagnostics import safe_exception_message
 from free_claude_code.core.failures import ExecutionFailure, find_execution_failure
 from free_claude_code.core.openai_responses import (
@@ -27,7 +29,6 @@ from free_claude_code.core.openai_responses import (
     openai_error_type_for_failure,
     openai_failure_payload,
 )
-from free_claude_code.core.circuit_breaker import CircuitBreakerRegistry
 
 
 class ResponsesHandler:
@@ -49,6 +50,7 @@ class ResponsesHandler:
         self._responses_adapter = responses_adapter or OpenAIResponsesAdapter()
         self._provider_executor = provider_executor or ProviderExecutor(
             provider_resolver,
+            progress_timeout_seconds=settings.provider_progress_timeout,
             generation_id=generation_id,
             log_raw_payloads=settings.log_raw_api_payloads,
             circuit_breakers=circuit_breakers,
@@ -122,6 +124,12 @@ class ResponsesHandler:
     def _pre_start_error_response(
         self, exc: BaseException, *, request_id: str
     ) -> JSONResponse:
+        if isinstance(exc, ApplicationError):
+            return ordinary_application_error_response(
+                exc,
+                wire_api="responses",
+                request_id=request_id,
+            )
         failure = find_execution_failure(exc)
         if failure is not None:
             return self._execution_failure_response(failure, request_id=request_id)

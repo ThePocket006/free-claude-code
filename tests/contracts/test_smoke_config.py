@@ -15,6 +15,7 @@ from smoke.lib.config import (
     OPT_IN_TARGETS,
     PROVIDER_SMOKE_DEFAULT_MODELS,
     TARGET_REQUIRED_ENV,
+    ProviderModel,
     SmokeConfig,
     nvidia_nim_cli_model_refs,
     openrouter_free_cli_model_refs,
@@ -28,6 +29,8 @@ def _settings(**overrides):
         "model_opus": None,
         "model_sonnet": None,
         "model_haiku": None,
+        "azure_openai_api_key": "",
+        "azure_openai_base_url": "",
         "nvidia_nim_api_key": "",
         "open_router_api_key": "",
         "mistral_api_key": "",
@@ -45,14 +48,28 @@ def _settings(**overrides):
         "cohere_api_key": "",
         "github_models_token": "",
         "zai_api_key": "",
+        "kilo_api_key": "",
         "gemini_api_key": "",
         "vertex_project_id": "",
         "vertex_location": "global",
         "groq_api_key": "",
+        "cline_api_key": "",
+        "xai_api_key": "",
+        "qwencloud_api_key": "",
+        "qwencloud_coding_api_key": "",
+        "together_api_key": "",
+        "deepinfra_api_key": "",
+        "siliconflow_api_key": "",
+        "nebius_api_key": "",
+        "chutes_api_key": "",
+        "featherless_api_key": "",
+        "wandb_api_key": "",
         "sambanova_api_key": "",
         "cerebras_api_key": "",
         "ollama_api_key": "",
+        "poolside_api_key": "",
         "fireworks_api_key": "",
+        "novita_api_key": "",
         "cloudflare_api_token": "",
         "cloudflare_account_id": "",
         "lm_studio_base_url": "",
@@ -146,6 +163,376 @@ def test_provider_smoke_models_cover_configured_providers_independent_of_model_m
     assert models[0].source == "provider_default"
 
 
+def test_poolside_provider_configuration_uses_documented_default_model(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_POOLSIDE", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            poolside_api_key="poolside-key",
+        )
+    )
+
+    assert config.has_provider_configuration("poolside")
+    models = config.provider_smoke_models()
+    assert [model.provider for model in models] == ["poolside"]
+    assert models[0].full_model == "poolside/poolside/laguna-s-2.1"
+    assert models[0].source == "provider_default"
+
+
+def test_xai_provider_smoke_uses_current_grok_model(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_XAI", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            xai_api_key="xai-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["xai"]
+    assert models[0].full_model == "xai/grok-4.5"
+    assert models[0].source == "provider_default"
+
+
+def test_cline_pass_provider_smoke_uses_low_cost_subscription_model(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_CLINE_PASS", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            cline_api_key="cline-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["cline_pass"]
+    assert models[0].full_model == "cline_pass/cline-pass/deepseek-v4-flash"
+    assert models[0].source == "provider_default"
+
+
+def test_cline_pass_smoke_override_accepts_full_or_upstream_model_ref(
+    monkeypatch,
+) -> None:
+    settings = _settings(
+        model="ollama/llama3.1",
+        ollama_base_url="",
+        cline_api_key="cline-key",
+    )
+    for override in (
+        "cline_pass/cline-pass/kimi-k3",
+        "cline-pass/kimi-k3",
+    ):
+        monkeypatch.setenv("FCC_SMOKE_MODEL_CLINE_PASS", override)
+        models = _smoke_config(settings=settings).provider_smoke_models()
+
+        assert [model.provider for model in models] == ["cline_pass"]
+        assert models[0].full_model == "cline_pass/cline-pass/kimi-k3"
+        assert models[0].source == "FCC_SMOKE_MODEL_CLINE_PASS"
+
+
+def test_zai_shared_key_enables_both_provider_smoke_surfaces(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_ZAI", raising=False)
+    monkeypatch.delenv("FCC_SMOKE_MODEL_ZAI_API", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            zai_api_key="shared-zai-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [(model.provider, model.full_model, model.source) for model in models] == [
+        ("zai", "zai/glm-5.2", "provider_default"),
+        ("zai_api", "zai_api/glm-4.7-flash", "provider_default"),
+    ]
+
+
+def test_zai_api_smoke_override_is_independent_from_coding_plan(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_ZAI", raising=False)
+    monkeypatch.setenv("FCC_SMOKE_MODEL_ZAI_API", "zai_api/glm-5.2")
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            zai_api_key="shared-zai-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [(model.provider, model.full_model, model.source) for model in models] == [
+        ("zai", "zai/glm-5.2", "provider_default"),
+        ("zai_api", "zai_api/glm-5.2", "FCC_SMOKE_MODEL_ZAI_API"),
+    ]
+
+
+def test_qwencloud_provider_smoke_uses_current_coding_model(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_QWENCLOUD", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            qwencloud_api_key="qwencloud-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["qwencloud"]
+    assert models[0].full_model == "qwencloud/qwen3.7-plus"
+    assert models[0].source == "provider_default"
+
+
+def test_qwencloud_coding_provider_smoke_uses_recommended_model(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_QWENCLOUD_CODING", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            qwencloud_coding_api_key="qwencloud-coding-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["qwencloud_coding"]
+    assert models[0].full_model == "qwencloud_coding/qwen3.7-plus"
+    assert models[0].source == "provider_default"
+
+
+def test_qwencloud_coding_smoke_override_is_independent_from_token_plan(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_QWENCLOUD", raising=False)
+    monkeypatch.setenv(
+        "FCC_SMOKE_MODEL_QWENCLOUD_CODING",
+        "qwencloud_coding/kimi-k2.5",
+    )
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            qwencloud_api_key="qwencloud-key",
+            qwencloud_coding_api_key="qwencloud-coding-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [(model.provider, model.full_model, model.source) for model in models] == [
+        ("qwencloud", "qwencloud/qwen3.7-plus", "provider_default"),
+        (
+            "qwencloud_coding",
+            "qwencloud_coding/kimi-k2.5",
+            "FCC_SMOKE_MODEL_QWENCLOUD_CODING",
+        ),
+    ]
+
+
+def test_together_provider_smoke_uses_current_coding_model(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_TOGETHER", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            together_api_key="together-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["together"]
+    assert models[0].full_model == "together/zai-org/GLM-5.2"
+    assert models[0].source == "provider_default"
+
+
+def test_deepinfra_provider_smoke_uses_current_coding_model(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_DEEPINFRA", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            deepinfra_api_key="deepinfra-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["deepinfra"]
+    assert models[0].full_model == "deepinfra/deepseek-ai/DeepSeek-V4-Flash"
+    assert models[0].source == "provider_default"
+
+
+def test_siliconflow_provider_smoke_uses_documented_chat_model(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_SILICONFLOW", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            siliconflow_api_key="siliconflow-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["siliconflow"]
+    assert models[0].full_model == "siliconflow/Qwen/Qwen3-32B"
+    assert models[0].source == "provider_default"
+
+
+def test_nebius_provider_smoke_uses_documented_agent_model(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_NEBIUS", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            nebius_api_key="nebius-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["nebius"]
+    assert models[0].full_model == "nebius/Qwen/Qwen3-30B-A3B"
+    assert models[0].source == "provider_default"
+
+
+def test_chutes_provider_smoke_uses_documented_agent_model(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_CHUTES", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            chutes_api_key="chutes-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["chutes"]
+    assert models[0].full_model == "chutes/Qwen/Qwen3-32B-TEE"
+    assert models[0].source == "provider_default"
+
+
+def test_featherless_provider_smoke_uses_documented_agent_model(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_FEATHERLESS", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            featherless_api_key="featherless-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["featherless"]
+    assert models[0].full_model == "featherless/Qwen/Qwen3-32B"
+    assert models[0].source == "provider_default"
+
+
+def test_agnes_provider_smoke_uses_documented_model(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_AGNES", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            agnes_api_key="agnes-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["agnes"]
+    assert models[0].full_model == "agnes/agnes-2.0-flash"
+    assert models[0].source == "provider_default"
+
+
+def test_zenmux_provider_smoke_uses_current_free_model(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_ZENMUX", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            zenmux_api_key="zenmux-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["zenmux"]
+    assert models[0].full_model == "zenmux/deepseek/deepseek-v4-flash-free"
+    assert models[0].source == "provider_default"
+
+
+def test_wandb_provider_smoke_uses_documented_tool_model(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_WANDB", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            wandb_api_key="wandb-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["wandb"]
+    assert models[0].full_model == "wandb/openai/gpt-oss-20b"
+    assert models[0].source == "provider_default"
+
+
+def test_wandb_provider_smoke_honors_model_override(monkeypatch) -> None:
+    monkeypatch.setenv("FCC_SMOKE_MODEL_WANDB", "deepseek-ai/DeepSeek-V4-Flash")
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            wandb_api_key="wandb-key",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["wandb"]
+    assert models[0].full_model == "wandb/deepseek-ai/DeepSeek-V4-Flash"
+    assert models[0].source == "FCC_SMOKE_MODEL_WANDB"
+
+
+def test_connected_account_provider_smoke_requires_explicit_model(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_OPENAI", raising=False)
+    config = _smoke_config(
+        provider_matrix=frozenset({"openai"}),
+        settings=_settings(ollama_base_url=""),
+    )
+
+    assert not config.has_provider_configuration("openai")
+    assert config.provider_smoke_models() == []
+
+    monkeypatch.setenv("FCC_SMOKE_MODEL_OPENAI", "gpt-5.3-codex")
+
+    assert config.has_provider_configuration("openai")
+    assert config.provider_smoke_models() == [
+        ProviderModel(
+            provider="openai",
+            full_model="openai/gpt-5.3-codex",
+            source="FCC_SMOKE_MODEL_OPENAI",
+        )
+    ]
+
+
 def test_openrouter_provider_smoke_uses_concrete_free_model(monkeypatch) -> None:
     monkeypatch.delenv("FCC_SMOKE_MODEL_OPEN_ROUTER", raising=False)
     config = _smoke_config(
@@ -155,7 +542,20 @@ def test_openrouter_provider_smoke_uses_concrete_free_model(monkeypatch) -> None
     models = config.provider_smoke_models()
 
     assert [model.provider for model in models] == ["open_router"]
-    assert models[0].full_model == "open_router/moonshotai/kimi-k2.6:free"
+    assert models[0].full_model == "open_router/nvidia/nemotron-3-super-120b-a12b:free"
+    assert models[0].source == "provider_default"
+
+
+def test_kilo_provider_smoke_uses_concrete_free_model(monkeypatch) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_KILO", raising=False)
+    config = _smoke_config(
+        settings=_settings(kilo_api_key="anonymous", ollama_base_url="")
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["kilo"]
+    assert models[0].full_model == "kilo/kilo-auto/free"
     assert models[0].source == "provider_default"
 
 
@@ -174,6 +574,29 @@ def test_bedrock_provider_configuration_uses_official_api_key(monkeypatch) -> No
     assert [model.provider for model in models] == ["bedrock"]
     assert models[0].full_model == "bedrock/openai.gpt-oss-120b"
     assert models[0].source == "provider_default"
+
+
+def test_azure_openai_provider_configuration_requires_key_and_resource_url(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("FCC_SMOKE_MODEL_AZURE_OPENAI", raising=False)
+    config = _smoke_config(
+        settings=_settings(
+            model="ollama/llama3.1",
+            ollama_base_url="",
+            azure_openai_api_key="azure-key",
+            azure_openai_base_url=("https://resource.openai.azure.com/openai/v1/"),
+        )
+    )
+
+    assert config.has_provider_configuration("azure_openai")
+    models = config.provider_smoke_models()
+    assert [model.provider for model in models] == ["azure_openai"]
+    assert models[0].full_model == "azure_openai/gpt-5.1"
+    assert models[0].source == "provider_default"
+
+    config.settings.azure_openai_base_url = ""
+    assert not config.has_provider_configuration("azure_openai")
 
 
 def test_vertex_provider_configuration_uses_project_id(monkeypatch) -> None:
@@ -393,7 +816,7 @@ def test_provider_smoke_model_override_accepts_owner_model_name(
     assert models[0].source == "FCC_SMOKE_MODEL_NVIDIA_NIM"
 
 
-def test_provider_smoke_model_override_rejects_wrong_provider_prefix(
+def test_provider_smoke_model_override_preserves_namespaced_upstream_model(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("FCC_SMOKE_MODEL_DEEPSEEK", "ollama/llama3.1")
@@ -405,12 +828,9 @@ def test_provider_smoke_model_override_rejects_wrong_provider_prefix(
         provider_matrix=frozenset({"deepseek"}),
     )
 
-    try:
-        config.provider_smoke_models()
-    except ValueError as exc:
-        assert "FCC_SMOKE_MODEL_DEEPSEEK" in str(exc)
-    else:
-        raise AssertionError("expected wrong provider prefix to fail")
+    models = config.provider_smoke_models()
+
+    assert models[0].full_model == "deepseek/ollama/llama3.1"
 
 
 def test_mistral_reasoning_smoke_uses_reasoning_default(monkeypatch) -> None:
@@ -556,13 +976,12 @@ def test_nvidia_nim_cli_models_reject_empty_override() -> None:
         raise AssertionError("expected empty NVIDIA NIM CLI model override to fail")
 
 
-def test_nvidia_nim_cli_models_reject_wrong_provider_prefix() -> None:
-    try:
-        nvidia_nim_cli_model_refs({"FCC_SMOKE_NIM_MODELS": "open_router/model"})
-    except ValueError as exc:
-        assert "nvidia_nim" in str(exc)
-    else:
-        raise AssertionError("expected wrong provider prefix to fail")
+def test_nvidia_nim_cli_models_preserve_namespaced_upstream_model() -> None:
+    refs = nvidia_nim_cli_model_refs({"FCC_SMOKE_NIM_MODELS": "open_router/model"})
+
+    assert refs == {
+        "nvidia_nim/open_router/model": "FCC_SMOKE_NIM_MODELS",
+    }
 
 
 def test_smoke_config_returns_nvidia_nim_cli_provider_models(monkeypatch) -> None:
@@ -579,7 +998,7 @@ def test_smoke_config_returns_nvidia_nim_cli_provider_models(monkeypatch) -> Non
     models = config.nvidia_nim_cli_models()
 
     assert models[0].provider == "nvidia_nim"
-    assert models[0].full_model == "nvidia_nim/z-ai/glm-5.2"
+    assert models[0].full_model == f"nvidia_nim/{NVIDIA_NIM_CLI_DEFAULT_MODELS[0]}"
     assert models[0].source == "nvidia_nim_cli_default"
 
 
@@ -628,15 +1047,14 @@ def test_openrouter_free_cli_models_reject_empty_override() -> None:
         raise AssertionError("expected empty OpenRouter free CLI override to fail")
 
 
-def test_openrouter_free_cli_models_reject_wrong_provider_prefix() -> None:
-    try:
-        openrouter_free_cli_model_refs(
-            {"FCC_SMOKE_OPENROUTER_FREE_MODELS": "nvidia_nim/model"}
-        )
-    except ValueError as exc:
-        assert "open_router" in str(exc)
-    else:
-        raise AssertionError("expected wrong provider prefix to fail")
+def test_openrouter_free_cli_models_preserve_namespaced_upstream_model() -> None:
+    refs = openrouter_free_cli_model_refs(
+        {"FCC_SMOKE_OPENROUTER_FREE_MODELS": "nvidia_nim/model"}
+    )
+
+    assert refs == {
+        "open_router/nvidia_nim/model": "FCC_SMOKE_OPENROUTER_FREE_MODELS",
+    }
 
 
 def test_smoke_config_returns_openrouter_free_cli_provider_models(monkeypatch) -> None:

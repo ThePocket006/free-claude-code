@@ -1,13 +1,13 @@
 """Provider execution shared by inbound API adapters."""
 
+import asyncio
+import math
 import sys
 from collections.abc import AsyncIterator, Callable
-from dataclasses import replace
 from typing import Literal
 
 from loguru import logger
 
-from free_claude_code.config.model_refs import parse_model_name, parse_provider_type
 from free_claude_code.core.anthropic import (
     Message,
     SystemContent,
@@ -15,16 +15,16 @@ from free_claude_code.core.anthropic import (
     anthropic_request_snapshot,
     get_token_count,
 )
+from free_claude_code.core.circuit_breaker import CircuitBreakerRegistry
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from free_claude_code.core.trace import (
     close_stream_input,
     trace_event,
     traced_async_stream,
 )
-from free_claude_code.core.circuit_breaker import CircuitBreakerRegistry
 
 from .ports import ProviderResolver
-from .routing import RoutedMessagesRequest
+from .routing import ProviderModelTarget, RoutedMessagesRequest
 
 TokenCounter = Callable[
     [list[Message], str | list[SystemContent] | None, list[Tool] | None],
@@ -57,16 +57,108 @@ class ProviderExecutor:
         self,
         provider_resolver: ProviderResolver,
         *,
+        progress_timeout_seconds: float,
         token_counter: TokenCounter = get_token_count,
         generation_id: int | None = None,
         log_raw_payloads: bool = False,
         circuit_breakers: CircuitBreakerRegistry | None = None,
     ) -> None:
+        if not math.isfinite(progress_timeout_seconds) or progress_timeout_seconds <= 0:
+            raise ValueError("progress_timeout_seconds must be finite and positive")
         self._provider_resolver = provider_resolver
         self._token_counter = token_counter
         self._generation_id = generation_id
         self._log_raw_payloads = log_raw_payloads
+        self._progress_timeout_seconds = float(progress_timeout_seconds)
         self._circuit_breakers = circuit_breakers
+
+    def _progress_timeout_failure(
+        self,
+        *,
+        request_id: str,
+        provider_id: str,
+    ) -> ExecutionFailure:
+        trace_event(
+            stage="execution",
+            event="free_claude_code.provider.progress_timeout",
+            source="application",
+            request_id=request_id,
+            provider_id=provider_id,
+            timeout_seconds=self._progress_timeout_seconds,
+        )
+        timeout_text = f"{self._progress_timeout_seconds:g}"
+        return ExecutionFailure(
+            kind=FailureKind.TIMEOUT,
+            status_code=504,
+            message=(
+                f"Provider execution made no progress for {timeout_text} seconds.\n\n"
+                f"Request ID: {request_id}"
+            ),
+            retryable=False,
+        )
+
+    def _trace_fallback_started(
+        self,
+        *,
+        request_id: str,
+        wire_api: WireApi,
+        failed: ProviderModelTarget,
+        selected: ProviderModelTarget,
+        failure: ExecutionFailure,
+        candidate_index: int,
+        candidate_count: int,
+    ) -> None:
+        fields: dict[str, object] = {
+            "stage": "execution",
+            "event": "free_claude_code.model_fallback.started",
+            "source": "application",
+            "request_id": request_id,
+            "wire_api": wire_api,
+            "from_provider_model_ref": failed.provider_model_ref,
+            "to_provider_model_ref": selected.provider_model_ref,
+            "candidate_index": candidate_index,
+            "candidate_count": candidate_count,
+            "failure_kind": failure.kind.value,
+            "status_code": failure.status_code,
+            "provider_retryable": True,
+        }
+        if self._generation_id is not None:
+            fields["generation_id"] = self._generation_id
+        trace_event(**fields)
+        logger.info(
+            "Model fallback: request_id={} from={} to={} candidate={}/{} "
+            "failure_kind={} status_code={}",
+            request_id,
+            failed.provider_model_ref,
+            selected.provider_model_ref,
+            candidate_index,
+            candidate_count,
+            failure.kind.value,
+            failure.status_code,
+        )
+
+    def _trace_fallback_selected(
+        self,
+        *,
+        request_id: str,
+        wire_api: WireApi,
+        selected: ProviderModelTarget,
+        candidate_index: int,
+        candidate_count: int,
+    ) -> None:
+        fields: dict[str, object] = {
+            "stage": "execution",
+            "event": "free_claude_code.model_fallback.selected",
+            "source": "application",
+            "request_id": request_id,
+            "wire_api": wire_api,
+            "selected_provider_model_ref": selected.provider_model_ref,
+            "candidate_index": candidate_index,
+            "candidate_count": candidate_count,
+        }
+        if self._generation_id is not None:
+            fields["generation_id"] = self._generation_id
+        trace_event(**fields)
 
     def stream(
         self,
@@ -78,11 +170,14 @@ class ProviderExecutor:
         request_id: str,
     ) -> AsyncIterator[str]:
         """Preflight synchronously, then return the traced provider stream."""
-        provider = self._provider_resolver(routed.resolved.provider_id)
-        provider.preflight_stream(
-            routed.request,
+        primary = routed.resolved.primary
+        primary_provider = self._provider_resolver(primary.provider_id)
+        primary_request = routed.request.model_copy(deep=True)
+        primary_provider.preflight_stream(
+            primary_request,
             reasoning=routed.reasoning,
         )
+        candidates = (primary, *routed.resolved.fallbacks)
 
         gateway_model = routed.resolved.original_model
         route_trace: dict[str, object] = {
@@ -90,9 +185,10 @@ class ProviderExecutor:
             "event": "free_claude_code.api.route.resolved",
             "source": "api",
             "request_id": request_id,
-            "provider_id": routed.resolved.provider_id,
-            "provider_model": routed.resolved.provider_model,
-            "provider_model_ref": routed.resolved.provider_model_ref,
+            "provider_id": primary.provider_id,
+            "provider_model": primary.provider_model,
+            "provider_model_ref": primary.provider_model_ref,
+            "fallback_count": len(routed.resolved.fallbacks),
             "gateway_model": gateway_model,
             "reasoning_control": routed.reasoning.control.value,
             "reasoning_effort": (
@@ -133,145 +229,146 @@ class ProviderExecutor:
         )
 
         async def provider_body() -> AsyncIterator[str]:
-            fallback_refs = list(routed.resolved.fallbacks)
-            current_request = routed.request
-            current_resolved = routed.resolved
-            provider_stream: AsyncIterator[str] | None = None
-            first_attempt = True
-            try:
-                while True:
-                    # Circuit breaker: skip known-unhealthy providers.
-                    if self._circuit_breakers is not None and not first_attempt:
-                        breaker = self._circuit_breakers.get(
-                            current_resolved.provider_id
-                        )
-                        if not breaker.is_healthy:
-                            if not fallback_refs:
-                                raise ExecutionFailure(
-                                    kind=FailureKind.UNAVAILABLE,
-                                    status_code=503,
-                                    message=(
-                                        f"Provider '{current_resolved.provider_id}' "
-                                        "is circuit-broken (open). No fallbacks."
-                                    ),
-                                    retryable=False,
-                                )
-                            next_ref = fallback_refs.pop(0)
-                            next_provider_id = parse_provider_type(next_ref)
-                            next_model = parse_model_name(next_ref)
-                            logger.warning(
-                                "CIRCUIT_BREAKER: provider='{}' is OPEN, "
-                                "skipping to '{}'",
-                                current_resolved.provider_id,
-                                next_ref,
-                            )
-                            trace_event(
-                                stage="routing",
-                                event=(
-                                    "free_claude_code.api.route.circuit_breaker_skip"
-                                ),
-                                source="api",
-                                request_id=request_id,
-                                skipped_provider=current_resolved.provider_id,
-                                to_provider=next_provider_id,
-                                to_model=next_model,
-                            )
-                            current_resolved = replace(
-                                current_resolved,
-                                provider_id=next_provider_id,
-                                provider_model=next_model,
-                                provider_model_ref=next_ref,
-                            )
-                            current_request = current_request.model_copy(
-                                update={"model": next_model}, deep=True
-                            )
-                            continue
+            loop = asyncio.get_running_loop()
+            progress_deadline = loop.time() + self._progress_timeout_seconds
 
-                    active_provider = self._provider_resolver(
-                        current_resolved.provider_id
-                    )
-                    if not first_attempt:
-                        active_provider.preflight_stream(
-                            current_request,
-                            reasoning=routed.reasoning,
+            for index, target in enumerate(candidates):
+                # Circuit breaker: skip known-unhealthy providers before attempting.
+                if self._circuit_breakers is not None and index > 0:
+                    breaker = self._circuit_breakers.get(target.provider_id)
+                    if not breaker.is_healthy:
+                        if index + 1 >= len(candidates):
+                            raise ExecutionFailure(
+                                kind=FailureKind.UNAVAILABLE,
+                                status_code=503,
+                                message=(
+                                    f"Provider '{target.provider_id}' "
+                                    "is circuit-broken (open). No fallbacks."
+                                ),
+                                retryable=False,
+                            )
+                        logger.warning(
+                            "CIRCUIT_BREAKER: provider='{}' is OPEN, skipping to next",
+                            target.provider_id,
                         )
-                    first_attempt = False
-                    provider_stream = active_provider.stream_response(
-                        current_request,
+                        trace_event(
+                            stage="routing",
+                            event="free_claude_code.api.route.circuit_breaker_skip",
+                            source="api",
+                            request_id=request_id,
+                            skipped_provider=target.provider_id,
+                            to_provider=candidates[index + 1].provider_id,
+                            to_model=candidates[index + 1].provider_model,
+                        )
+                        continue
+
+                provider = (
+                    primary_provider
+                    if index == 0
+                    else self._provider_resolver(target.provider_id)
+                )
+                candidate_request = (
+                    primary_request
+                    if index == 0
+                    else routed.request.model_copy(
+                        update={"model": target.provider_model},
+                        deep=True,
+                    )
+                )
+                if index > 0:
+                    provider.preflight_stream(
+                        candidate_request,
+                        reasoning=routed.reasoning,
+                    )
+
+                provider_stream: AsyncIterator[str] | None = None
+                candidate_committed = False
+                advance_failure: ExecutionFailure | None = None
+                try:
+                    provider_stream = provider.stream_response(
+                        candidate_request,
                         input_tokens=input_tokens,
                         request_id=request_id,
                         response_model=gateway_model,
                         reasoning=routed.reasoning,
                     )
-                    emitted = False
-                    try:
-                        async for chunk in provider_stream:
-                            emitted = True
-                            yield chunk
-                        # Stream succeeded — record success in circuit breaker.
-                        if self._circuit_breakers is not None:
-                            self._circuit_breakers.get(
-                                current_resolved.provider_id
-                            ).record_success()
-                        return
-                    except ExecutionFailure as error:
-                        # Record failure in the circuit breaker for this provider.
-                        if self._circuit_breakers is not None:
-                            self._circuit_breakers.get(
-                                current_resolved.provider_id
-                            ).record_failure(error)
-                        if emitted or not is_failover_eligible(error):
-                            raise
-                        if not fallback_refs:
-                            raise
+                    while True:
+                        if loop.time() >= progress_deadline:
+                            raise self._progress_timeout_failure(
+                                request_id=request_id,
+                                provider_id=target.provider_id,
+                            )
+                        progress_timeout = asyncio.timeout_at(progress_deadline)
+                        try:
+                            async with progress_timeout:
+                                chunk = await anext(provider_stream)
+                        except StopAsyncIteration:
+                            break
+                        except TimeoutError as exc:
+                            if not progress_timeout.expired():
+                                raise
+                            raise self._progress_timeout_failure(
+                                request_id=request_id,
+                                provider_id=target.provider_id,
+                            ) from exc
+                        if not chunk:
+                            await asyncio.sleep(0)
+                            continue
+                        if not candidate_committed:
+                            candidate_committed = True
+                            if index > 0:
+                                self._trace_fallback_selected(
+                                    request_id=request_id,
+                                    wire_api=wire_api,
+                                    selected=target,
+                                    candidate_index=index + 1,
+                                    candidate_count=len(candidates),
+                                )
+                        yield chunk
+                        progress_deadline = loop.time() + self._progress_timeout_seconds
+                except ExecutionFailure as error:
+                    # Record failure in the circuit breaker for this provider.
+                    if self._circuit_breakers is not None:
+                        self._circuit_breakers.get(target.provider_id).record_failure(
+                            error
+                        )
+
+                    if (
+                        candidate_committed
+                        or not error.retryable
+                        or index + 1 >= len(candidates)
+                    ):
+                        raise
+                    advance_failure = error
+                finally:
+                    if provider_stream is not None:
                         await close_stream_input(
                             provider_stream,
                             owner="provider_executor",
                             source="api",
-                            preserved_error=error,
+                            preserved_error=sys.exception(),
                         )
-                        provider_stream = None
-                        next_ref = fallback_refs.pop(0)
-                        next_provider_id = parse_provider_type(next_ref)
-                        next_model = parse_model_name(next_ref)
-                        logger.warning(
-                            "FAILOVER: provider='{}' failed ({}), retrying via '{}'",
-                            current_resolved.provider_id,
-                            error.kind.value,
-                            next_ref,
-                        )
-                        trace_event(
-                            stage="routing",
-                            event="free_claude_code.api.route.failover",
-                            source="api",
-                            request_id=request_id,
-                            from_provider=current_resolved.provider_id,
-                            to_provider=next_provider_id,
-                            to_model=next_model,
-                            reason=error.kind.value,
-                        )
-                        current_resolved = replace(
-                            current_resolved,
-                            provider_id=next_provider_id,
-                            provider_model=next_model,
-                            provider_model_ref=next_ref,
-                        )
-                        current_request = current_request.model_copy(
-                            update={"model": next_model}, deep=True
-                        )
-                        continue
-            finally:
-                if provider_stream is not None:
-                    await close_stream_input(
-                        provider_stream,
-                        owner="provider_executor",
-                        source="api",
-                        preserved_error=sys.exception(),
-                    )
+
+                if advance_failure is None:
+                    # Stream succeeded — record success in circuit breaker.
+                    if self._circuit_breakers is not None:
+                        self._circuit_breakers.get(target.provider_id).record_success()
+                    return
+
+                next_target = candidates[index + 1]
+                self._trace_fallback_started(
+                    request_id=request_id,
+                    wire_api=wire_api,
+                    failed=target,
+                    selected=next_target,
+                    failure=advance_failure,
+                    candidate_index=index + 2,
+                    candidate_count=len(candidates),
+                )
 
         stream_trace: dict[str, object] = {
             "request_id": request_id,
-            "provider_id": routed.resolved.provider_id,
+            "initial_provider_id": primary.provider_id,
             "gateway_model": gateway_model,
         }
         if self._generation_id is not None:

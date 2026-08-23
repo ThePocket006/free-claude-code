@@ -11,8 +11,7 @@ app = create_test_app()
 
 def test_proxy_auth_requires_canonical_bearer_header():
     client = TestClient(app)
-    settings = Settings()
-    settings.anthropic_auth_token = "s3cr3t"
+    settings = Settings(proxy_auth_enabled=True, proxy_auth_token="s3cr3t")
     app.dependency_overrides[get_settings] = lambda: settings
 
     payload = {
@@ -52,8 +51,7 @@ def test_proxy_auth_requires_canonical_bearer_header():
 
 def test_proxy_auth_ignores_conflicting_legacy_headers():
     client = TestClient(app)
-    settings = Settings()
-    settings.anthropic_auth_token = "b3artoken"
+    settings = Settings(proxy_auth_enabled=True, proxy_auth_token="b3artoken")
     app.dependency_overrides[get_settings] = lambda: settings
 
     payload = {
@@ -88,10 +86,12 @@ def test_proxy_auth_ignores_conflicting_legacy_headers():
     app.dependency_overrides.clear()
 
 
-def test_anthropic_auth_token_normalizes_configured_whitespace():
+def test_proxy_auth_token_normalizes_configured_whitespace():
     client = TestClient(app)
-    settings = Settings()
-    settings.anthropic_auth_token = "  spaced-token  \n"
+    settings = Settings(
+        proxy_auth_enabled=True,
+        proxy_auth_token="  spaced-token  \n",
+    )
     app.dependency_overrides[get_settings] = lambda: settings
 
     payload = {
@@ -111,28 +111,27 @@ def test_anthropic_auth_token_normalizes_configured_whitespace():
     app.dependency_overrides.clear()
 
 
-def test_anthropic_auth_token_applies_to_models_endpoint():
+def test_proxy_auth_token_applies_to_model_catalog_endpoints():
     client = TestClient(app)
-    settings = Settings()
-    settings.anthropic_auth_token = "models-token"
+    settings = Settings(proxy_auth_enabled=True, proxy_auth_token="models-token")
     app.dependency_overrides[get_settings] = lambda: settings
 
-    r = client.get("/v1/models")
-    assert r.status_code == 401
-    assert r.headers["x-request-id"] == r.headers["request-id"]
-    assert "x-should-retry" not in r.headers
+    for path in ("/v1/models", "/muse-code/models"):
+        r = client.get(path)
+        assert r.status_code == 401
+        assert r.headers["x-request-id"] == r.headers["request-id"]
+        assert "x-should-retry" not in r.headers
 
-    r = client.get("/v1/models", headers={"Authorization": "Bearer models-token"})
-    assert r.status_code == 200
-    assert "data" in r.json()
+        r = client.get(path, headers={"Authorization": "Bearer models-token"})
+        assert r.status_code == 200
+        assert "data" in r.json()
 
     app.dependency_overrides.clear()
 
 
 def test_root_get_requires_auth_but_root_probes_are_public():
     client = TestClient(app)
-    settings = Settings()
-    settings.anthropic_auth_token = "root-token"
+    settings = Settings(proxy_auth_enabled=True, proxy_auth_token="root-token")
     app.dependency_overrides[get_settings] = lambda: settings
 
     response = client.get("/")

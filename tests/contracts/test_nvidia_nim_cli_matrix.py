@@ -29,7 +29,10 @@ def _smoke_config(tmp_path: Path) -> SmokeConfig:
         prompt="Reply with exactly: FCC_SMOKE_PONG",
         claude_bin="claude",
         worker_id="test-worker",
-        settings=Settings.model_construct(anthropic_auth_token=""),
+        settings=Settings.model_construct(
+            proxy_auth_enabled=False,
+            proxy_auth_token="freecc",
+        ),
     )
 
 
@@ -386,7 +389,7 @@ def test_cli_matrix_agent_prompt_text_without_tool_evidence_does_not_pass(
     assert outcome.token_evidence["agent_tool_count"] == 0
 
 
-def test_cli_matrix_structured_provider_error_is_upstream_unavailable(
+def test_cli_matrix_unclassified_provider_error_is_model_feature_failure(
     tmp_path: Path,
 ) -> None:
     run = ClaudeCliRun(
@@ -412,7 +415,7 @@ def test_cli_matrix_structured_provider_error_is_upstream_unavailable(
         requires_tool_result=True,
     )
 
-    assert outcome.classification == "upstream_unavailable"
+    assert outcome.classification == "model_feature_failure"
     assert outcome.request_count == 1
 
 
@@ -522,6 +525,33 @@ def test_cli_matrix_real_http_429_counts_as_upstream_unavailable(
     assert outcome.classification == "upstream_unavailable"
 
 
+def test_cli_matrix_deterministic_provider_400_is_not_upstream_unavailable(
+    tmp_path: Path,
+) -> None:
+    run = ClaudeCliRun(
+        command=("claude", "-p", "x"),
+        returncode=1,
+        stdout="",
+        stderr=(
+            "Upstream provider GROQ returned HTTP 400: "
+            "property reasoning_content is unsupported"
+        ),
+        duration_s=0.1,
+    )
+    outcome = make_outcome(
+        model="openai/gpt-oss-120b",
+        full_model="groq/openai/gpt-oss-120b",
+        source="groq_cli_default",
+        feature="thinking",
+        marker="FCC_GROQ_THINK",
+        run=run,
+        log_delta="API_REQUEST: request_id=req_1 model=openai/gpt-oss-120b messages=2",
+        log_path=tmp_path / "server.log",
+    )
+
+    assert outcome.classification == "model_feature_failure"
+
+
 def test_cli_matrix_default_command_uses_bare_mode() -> None:
     command = _build_claude_cli_command(
         claude_bin="claude",
@@ -532,6 +562,20 @@ def test_cli_matrix_default_command_uses_bare_mode() -> None:
     assert command[:2] == ("claude", "--bare")
     assert "--tools" in command
     assert "Read" in command
+
+
+def test_cli_matrix_auto_mode_exposes_tool_without_preapproval() -> None:
+    command = _build_claude_cli_command(
+        claude_bin="claude",
+        prompt="read the marker",
+        tools="Bash",
+        auto_mode=True,
+    )
+
+    assert command[command.index("--permission-mode") + 1] == "auto"
+    assert command[command.index("--tools") + 1] == "Bash"
+    assert "--dangerously-skip-permissions" not in command
+    assert "--allowedTools" not in command
 
 
 def test_cli_matrix_subagent_command_uses_agent_without_bare_or_task() -> None:

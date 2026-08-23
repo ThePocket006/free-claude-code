@@ -1,5 +1,6 @@
 """Public commit-boundary behavior for canonical execution failures."""
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -7,9 +8,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from free_claude_code.config.settings import Settings
+from free_claude_code.core.anthropic import MessagesRequest
 from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
 from free_claude_code.core.anthropic.streaming import format_sse_event
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
+from free_claude_code.core.reasoning import ReasoningPolicy
 from tests.api.support import create_test_app
 
 _PARTIAL_CONTENT = "PARTIAL_ASSISTANT_CONTENT"
@@ -63,6 +67,37 @@ class CanonicalFailureProvider:
         raise failure
 
 
+class StalledProvider:
+    """Provider double that makes no protocol-visible progress."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def preflight_stream(
+        self,
+        _request: MessagesRequest,
+        *,
+        reasoning: ReasoningPolicy,
+    ) -> None:
+        del reasoning
+
+    async def stream_response(
+        self,
+        _request: MessagesRequest,
+        *,
+        input_tokens: int,
+        request_id: str,
+        response_model: str,
+        reasoning: ReasoningPolicy,
+    ) -> AsyncIterator[str]:
+        del input_tokens, request_id, response_model, reasoning
+        try:
+            await asyncio.Event().wait()
+            yield ""
+        finally:
+            self.close_calls += 1
+
+
 def _messages_payload(*, stream: bool) -> dict[str, object]:
     return {
         "model": "nvidia_nim/test-model",
@@ -110,8 +145,12 @@ def _partial_anthropic_stream(*, close_block: bool) -> list[str]:
     return chunks
 
 
-def _client_for(provider: CanonicalFailureProvider):
-    app = create_test_app()
+def _client_for(
+    provider: CanonicalFailureProvider | StalledProvider,
+    *,
+    settings: Settings | None = None,
+):
+    app = create_test_app(settings)
     return (
         patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
         TestClient(app),
@@ -138,6 +177,42 @@ def _grouped_rate_limit_provider(chunks: list[str]) -> CanonicalFailureProvider:
         retryable=True,
         grouped=True,
     )
+
+
+def _timeout_provider(chunks: list[str]) -> CanonicalFailureProvider:
+    return CanonicalFailureProvider(
+        chunks,
+        kind=FailureKind.TIMEOUT,
+        status_code=504,
+        message="Provider execution made no progress for 600 seconds.",
+        retryable=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/v1/messages", _messages_payload(stream=True)),
+        ("/v1/responses", _responses_payload()),
+    ],
+)
+def test_configured_progress_timeout_reaches_default_handler_executor(
+    path: str,
+    payload: dict[str, object],
+) -> None:
+    provider = StalledProvider()
+    resolver_patch, client = _client_for(
+        provider,
+        settings=Settings(provider_progress_timeout=0.02),
+    )
+
+    with resolver_patch, client:
+        response = client.post(path, json=payload)
+
+    assert response.status_code == 504
+    assert response.headers["x-should-retry"] == "false"
+    assert "made no progress for 0.02 seconds" in response.json()["error"]["message"]
+    assert provider.close_calls == 1
 
 
 @pytest.mark.parametrize(
@@ -501,5 +576,112 @@ def test_messages_stream_false_discards_partial_content_on_execution_failure() -
     assert response.json()["error"] == {
         "type": "rate_limit_error",
         "message": f"upstream is busy\n\nRequest ID: {request_id}",
+    }
+    assert _PARTIAL_CONTENT not in response.text
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/v1/messages", _messages_payload(stream=True)),
+        ("/v1/responses", _responses_payload()),
+    ],
+)
+def test_pre_start_progress_timeout_is_terminal_504(
+    path: str,
+    payload: dict[str, object],
+) -> None:
+    provider = _timeout_provider([])
+    resolver_patch, client = _client_for(provider)
+
+    with (
+        resolver_patch,
+        patch("free_claude_code.api.response_streams.trace_event") as trace_mock,
+        client,
+    ):
+        response = client.post(path, json=payload)
+
+    request_id = response.headers["request-id"]
+    assert response.status_code == 504
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.headers["x-should-retry"] == "false"
+    assert response.json()["error"] == {
+        "type": "timeout_error",
+        "message": (
+            "Provider execution made no progress for 600 seconds.\n\n"
+            f"Request ID: {request_id}"
+        ),
+        **({} if path == "/v1/messages" else {"param": None, "code": None}),
+    }
+    if path == "/v1/messages":
+        assert response.json()["request_id"] == request_id
+        assert "x-request-id" not in response.headers
+    else:
+        assert response.headers["x-request-id"] == request_id
+    trace = _terminal_trace(trace_mock)
+    assert trace["status_code"] == 504
+    assert trace["error_type"] == "timeout_error"
+    assert trace["failure_kind"] == "timeout"
+    assert trace["provider_retryable"] is False
+    assert trace["client_should_retry"] is False
+
+
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/responses"])
+def test_post_start_progress_timeout_is_terminal_protocol_event(path: str) -> None:
+    provider = _timeout_provider(_partial_anthropic_stream(close_block=True))
+    payload = (
+        _messages_payload(stream=True)
+        if path == "/v1/messages"
+        else _responses_payload()
+    )
+    resolver_patch, client = _client_for(provider)
+
+    with (
+        resolver_patch,
+        patch("free_claude_code.api.response_streams.trace_event") as trace_mock,
+        client,
+    ):
+        response = client.post(path, json=payload)
+
+    request_id = response.headers["request-id"]
+    events = parse_sse_text(response.text)
+    assert response.status_code == 200
+    assert "x-should-retry" not in response.headers
+    if path == "/v1/messages":
+        assert events[-1].event == "error"
+        error = events[-1].data["error"]
+        assert "message_stop" not in response.text
+    else:
+        assert events[0].event == "response.created"
+        assert events[-1].event == "response.failed"
+        assert events[-1].data["response"]["id"] == events[0].data["response"]["id"]
+        error = events[-1].data["response"]["error"]
+    assert error["type"] == "timeout_error"
+    assert error["message"] == (
+        "Provider execution made no progress for 600 seconds.\n\n"
+        f"Request ID: {request_id}"
+    )
+    trace = _terminal_trace(trace_mock)
+    assert trace["failure_kind"] == "timeout"
+    assert trace["provider_retryable"] is False
+    assert trace["client_should_retry"] is False
+
+
+def test_stream_false_progress_timeout_discards_partial_content() -> None:
+    provider = _timeout_provider(_partial_anthropic_stream(close_block=False))
+    resolver_patch, client = _client_for(provider)
+
+    with resolver_patch, client:
+        response = client.post("/v1/messages", json=_messages_payload(stream=False))
+
+    request_id = response.headers["request-id"]
+    assert response.status_code == 504
+    assert response.headers["x-should-retry"] == "false"
+    assert response.json()["error"] == {
+        "type": "timeout_error",
+        "message": (
+            "Provider execution made no progress for 600 seconds.\n\n"
+            f"Request ID: {request_id}"
+        ),
     }
     assert _PARTIAL_CONTENT not in response.text

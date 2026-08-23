@@ -33,6 +33,9 @@ _AUTHENTICATION_MESSAGE = "Provider authentication failed. Check API key."
 _PERMISSION_MESSAGE = (
     "Provider denied access. Check credential permissions and model access."
 )
+_BILLING_MESSAGE = (
+    "Provider requires payment or additional credits. Add credits or resolve billing."
+)
 _RATE_LIMIT_MESSAGE = "Provider rate limit reached. Please retry shortly."
 _INVALID_REQUEST_MESSAGE = "Invalid request sent to provider."
 _CONTEXT_WINDOW_EXCEEDED_MESSAGE = "Provider input exceeds the model context window."
@@ -189,6 +192,31 @@ def is_retryable_provider_error(exc: BaseException) -> bool:
     )
 
 
+def is_retryable_stream_error(exc: BaseException) -> bool:
+    """Return whether an opened stream failure permits replay or recovery."""
+    if isinstance(exc, RetryableProviderProtocolError):
+        return True
+    if isinstance(exc, ExecutionFailure):
+        return exc.retryable
+    if isinstance(exc, openai.AuthenticationError | openai.BadRequestError):
+        return False
+    if retryable_transient_status(exc) is not None:
+        return True
+    return isinstance(
+        exc,
+        (
+            TimeoutError,
+            httpx.ReadTimeout,
+            httpx.ReadError,
+            httpx.RemoteProtocolError,
+            httpx.ConnectError,
+            httpx.NetworkError,
+            openai.APITimeoutError,
+            openai.APIConnectionError,
+        ),
+    )
+
+
 def retryable_upstream_status(exc: BaseException) -> int | None:
     """Return a status eligible for provider-opening backoff."""
     status = retryable_transient_status(exc)
@@ -275,6 +303,8 @@ def _classify_provider_failure(
             return _failure(
                 FailureKind.AUTHENTICATION, 401, _AUTHENTICATION_MESSAGE, False
             )
+        if effective_status == 402:
+            return _failure(FailureKind.PERMISSION, 402, _BILLING_MESSAGE, False)
         if effective_status == 403:
             return _failure(FailureKind.PERMISSION, 403, _PERMISSION_MESSAGE, False)
         return _failure(
@@ -290,6 +320,8 @@ def _classify_provider_failure(
             return _failure(
                 FailureKind.AUTHENTICATION, 401, _AUTHENTICATION_MESSAGE, False
             )
+        if status == 402:
+            return _failure(FailureKind.PERMISSION, 402, _BILLING_MESSAGE, False)
         if status == 403:
             return _failure(FailureKind.PERMISSION, 403, _PERMISSION_MESSAGE, False)
         if status == 429:

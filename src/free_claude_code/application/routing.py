@@ -27,28 +27,38 @@ _ROUTE_SETTINGS = (
 
 
 @dataclass(frozen=True, slots=True)
-class ResolvedModel:
-    original_model: str
+class ProviderModelTarget:
+    """One canonical provider/model execution target."""
+
     provider_id: str
     provider_model: str
     provider_model_ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedModelRoute:
+    """One public model resolved to a primary and ordered fallbacks."""
+
+    original_model: str
+    primary: ProviderModelTarget
+    fallbacks: tuple[ProviderModelTarget, ...]
     reasoning_preference: ReasoningPreference
-    # Fallback model refs (provider/model/name) tried in order when the
+    # Raw fallback model refs (provider/model/name) tried in order when the
     # primary provider fails with a quota/availability error.
-    fallbacks: tuple[str, ...] = ()
+    fallback_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class RoutedMessagesRequest:
     request: MessagesRequest
-    resolved: ResolvedModel
+    resolved: ResolvedModelRoute
     reasoning: ReasoningPolicy
 
 
 @dataclass(frozen=True, slots=True)
 class RoutedTokenCountRequest:
     request: TokenCountRequest
-    resolved: ResolvedModel
+    resolved: ResolvedModelRoute
 
 
 class ModelRouter:
@@ -57,9 +67,10 @@ class ModelRouter:
     def __init__(self, settings: Settings):
         self._settings = settings
 
-    def resolve(self, claude_model_name: str) -> ResolvedModel:
+    def resolve(self, claude_model_name: str) -> ResolvedModelRoute:
         tier = self._detect_tier(claude_model_name)
-        fallbacks = self._fallbacks(tier)
+        fallback_refs = self._fallback_refs(tier)
+
         (
             direct_provider_id,
             direct_provider_model,
@@ -78,34 +89,33 @@ class ModelRouter:
                 direct_provider_model,
                 reasoning_preference.value,
             )
-            return ResolvedModel(
+            primary = self._target(direct_provider_id, direct_provider_model)
+            return ResolvedModelRoute(
                 original_model=claude_model_name,
-                provider_id=direct_provider_id,
-                provider_model=direct_provider_model,
-                provider_model_ref=claude_model_name,
+                primary=primary,
+                fallbacks=self._fallback_targets(primary, tier),
                 reasoning_preference=reasoning_preference,
-                fallbacks=fallbacks,
+                fallback_refs=fallback_refs,
             )
 
         provider_model_ref = self._resolve_model_ref(claude_model_name)
         reasoning_preference = self._resolve_reasoning_preference(claude_model_name)
-        provider_id = parse_provider_type(provider_model_ref)
-        self._validate_provider_id(provider_id)
-        provider_model = parse_model_name(provider_model_ref)
-        if provider_model != claude_model_name:
+        primary = self._target_from_ref(provider_model_ref)
+        if primary.provider_model != claude_model_name:
             logger.debug(
-                "MODEL MAPPING: '{}' -> '{}'", claude_model_name, provider_model
+                "MODEL MAPPING: '{}' -> '{}'",
+                claude_model_name,
+                primary.provider_model,
             )
-        return ResolvedModel(
+        return ResolvedModelRoute(
             original_model=claude_model_name,
-            provider_id=provider_id,
-            provider_model=provider_model,
-            provider_model_ref=provider_model_ref,
+            primary=primary,
+            fallbacks=self._fallback_targets(primary, tier),
             reasoning_preference=reasoning_preference,
-            fallbacks=fallbacks,
+            fallback_refs=fallback_refs,
         )
 
-    def _fallbacks(self, tier: str | None = None) -> tuple[str, ...]:
+    def _fallback_refs(self, tier: str | None = None) -> tuple[str, ...]:
         """Return fallback model refs, preferring per-tier over global."""
         # Check per-tier fallback first.
         if tier is not None:
@@ -116,13 +126,23 @@ class ModelRouter:
                     part.strip() for part in tier_value.split(",") if part.strip()
                 )
                 return refs
-        # Fall back to global fallbacks.
-        refs = tuple(
-            part.strip()
-            for part in self._settings.model_fallbacks.split(",")
-            if part.strip()
+        # Fall back to global fallbacks - handle both tuple and comma-separated string.
+        global_fallbacks = self._settings.model_fallbacks
+        if not global_fallbacks:
+            return ()
+        if isinstance(global_fallbacks, str):
+            return tuple(
+                part.strip() for part in global_fallbacks.split(",") if part.strip()
+            )
+        return tuple(global_fallbacks)
+
+    def _fallback_targets(
+        self, primary: ProviderModelTarget, tier: str | None = None
+    ) -> tuple[ProviderModelTarget, ...]:
+        configured = tuple(
+            self._target_from_ref(model_ref) for model_ref in self._fallback_refs(tier)
         )
-        return refs
+        return tuple(target for target in configured if target != primary)
 
     @staticmethod
     def _detect_tier(model_name: str) -> str | None:
@@ -132,6 +152,20 @@ class ModelRouter:
             if tier in normalized:
                 return tier
         return None
+
+    def _target_from_ref(self, provider_model_ref: str) -> ProviderModelTarget:
+        return self._target(
+            parse_provider_type(provider_model_ref),
+            parse_model_name(provider_model_ref),
+        )
+
+    def _target(self, provider_id: str, provider_model: str) -> ProviderModelTarget:
+        self._validate_provider_id(provider_id)
+        return ProviderModelTarget(
+            provider_id=provider_id,
+            provider_model=provider_model,
+            provider_model_ref=f"{provider_id}/{provider_model}",
+        )
 
     @staticmethod
     def _validate_provider_id(provider_id: str) -> None:
@@ -196,7 +230,7 @@ class ModelRouter:
         """Return an internal routed request context."""
         resolved = self.resolve(request.model)
         routed = request.model_copy(deep=True)
-        routed.model = resolved.provider_model
+        routed.model = resolved.primary.provider_model
         return RoutedMessagesRequest(
             request=routed,
             resolved=resolved,
@@ -212,6 +246,6 @@ class ModelRouter:
         """Return an internal token-count request context."""
         resolved = self.resolve(request.model)
         routed = request.model_copy(
-            update={"model": resolved.provider_model}, deep=True
+            update={"model": resolved.primary.provider_model}, deep=True
         )
         return RoutedTokenCountRequest(request=routed, resolved=resolved)

@@ -25,6 +25,18 @@ class ReasoningReplayMode(StrEnum):
     REASONING = "reasoning"
 
 
+def resolve_anthropic_tool_choice(
+    tools: list[Any] | None,
+    tool_choice: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Materialize Anthropic's automatic choice when tools are available."""
+    if tool_choice is not None:
+        return tool_choice
+    if tools:
+        return {"type": "auto"}
+    return None
+
+
 def _reasoning_replay_field(mode: ReasoningReplayMode) -> str | None:
     if mode in (
         ReasoningReplayMode.REASONING_CONTENT,
@@ -574,6 +586,8 @@ class AnthropicToOpenAIConverter:
                 reasoning_replay=reasoning_replay,
             )[0]
         pre_msg["tool_calls"] = tool_calls
+        if reasoning_replay is ReasoningReplayMode.REASONING_CONTENT:
+            pre_msg.setdefault("reasoning_content", "")
         if tool_calls and pre_msg.get("content") == " ":
             pre_msg["content"] = ""
         return _ToolTurnSegment(
@@ -771,7 +785,7 @@ def build_base_request_body(
     tools = request_data.tools
     if tools:
         body["tools"] = AnthropicToOpenAIConverter.convert_tools(tools)
-    tool_choice = request_data.tool_choice
+    tool_choice = resolve_anthropic_tool_choice(tools, request_data.tool_choice)
     if tool_choice:
         body["tool_choice"] = AnthropicToOpenAIConverter.convert_tool_choice(
             tool_choice

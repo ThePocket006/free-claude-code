@@ -1,7 +1,11 @@
+import hashlib
+import io
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +17,12 @@ FCC_COMMANDS = (
     "fcc-claude",
     "fcc-codex",
     "fcc-pi",
+    "fcc-opencode",
+    "fcc-cline",
+    "fcc-hermes",
+    "fcc-dsh",
+    "fcc-grok",
+    "fcc-muse",
     "fcc-init",
     "free-claude-code",
 )
@@ -43,6 +53,21 @@ def _braced_body(text: str, declaration: str) -> str:
 
 
 def _posix_command(name: str) -> str:
+    version = {
+        "opencode": "1.18.18",
+        "cline": "3.0.55",
+        "hermes": "0.20.4",
+        "dsh": "0.1.0-rc.8",
+        "grok": "1.0.5",
+        "muse": "0.2.1",
+        "node": "22.19.0",
+    }.get(name, "1.0.0")
+    if name == "hermes":
+        version_output = f"Hermes Agent v{version} (test build)"
+    elif name == "muse":
+        version_output = f"Muse Code {version} ({version}-R1215.1)"
+    else:
+        version_output = f"{name} {version}"
     help_output = (
         '    echo "  --extension, -e <path>  Load an extension"\n'
         '    echo "  --models <patterns>     Scope models"'
@@ -55,7 +80,7 @@ if [ "$FAIL_STEP" = "{name}-verify" ]; then
     exit 31
 fi
 if [ "${{1:-}}" = "--version" ]; then
-    echo "{name} 1.0.0"
+    echo "{version_output}"
 fi
 if [ "${{1:-}}" = "--help" ]; then
 {help_output}
@@ -66,6 +91,20 @@ fi
 def _posix_npm_command() -> str:
     return """#!/bin/sh
 echo "npm:$*" >> "$CALL_LOG"
+if [ "${1:-}" = "install" ] && [ "${2:-}" = "-g" ] && [ "${3:-}" = "cline" ]; then
+    [ "$FAIL_STEP" = "cline-install" ] && exit 72
+    mkdir -p "$FAKE_NPM_PREFIX/bin"
+    cp "$FAKE_FIXTURES/cline-command.sh" "$FAKE_NPM_PREFIX/bin/cline"
+    chmod +x "$FAKE_NPM_PREFIX/bin/cline"
+    exit 0
+fi
+if [ "${1:-}" = "install" ] && [ "${2:-}" = "-g" ] && [ "${3:-}" = "@deepseek-ai/dsh@0.1.0-rc.8" ]; then
+    [ "$FAIL_STEP" = "dsh-install" ] && exit 73
+    mkdir -p "$FAKE_NPM_PREFIX/bin"
+    cp "$FAKE_FIXTURES/dsh-command.sh" "$FAKE_NPM_PREFIX/bin/dsh"
+    chmod +x "$FAKE_NPM_PREFIX/bin/dsh"
+    exit 0
+fi
 if [ "${1:-}" = "prefix" ] && [ "${2:-}" = "-g" ]; then
     printf '%s\n' "$FAKE_NPM_PREFIX"
     exit 0
@@ -100,6 +139,12 @@ if [ "${{1:-}}" = "tool" ] && [ "${{2:-}}" = "install" ]; then
     cp "$FAKE_FIXTURES/fcc-command.sh" "$FAKE_TOOL_BIN/fcc-desktop"
     cp "$FAKE_FIXTURES/fcc-command.sh" "$FAKE_TOOL_BIN/fcc-claude"
     cp "$FAKE_FIXTURES/fcc-command.sh" "$FAKE_TOOL_BIN/fcc-pi"
+    cp "$FAKE_FIXTURES/fcc-command.sh" "$FAKE_TOOL_BIN/fcc-opencode"
+    cp "$FAKE_FIXTURES/fcc-command.sh" "$FAKE_TOOL_BIN/fcc-cline"
+    cp "$FAKE_FIXTURES/fcc-command.sh" "$FAKE_TOOL_BIN/fcc-hermes"
+    cp "$FAKE_FIXTURES/fcc-command.sh" "$FAKE_TOOL_BIN/fcc-dsh"
+    cp "$FAKE_FIXTURES/fcc-command.sh" "$FAKE_TOOL_BIN/fcc-grok"
+    cp "$FAKE_FIXTURES/fcc-command.sh" "$FAKE_TOOL_BIN/fcc-muse"
     if [ "$FAIL_STEP" != "fcc-missing" ]; then
         cp "$FAKE_FIXTURES/fcc-command.sh" "$FAKE_TOOL_BIN/fcc-codex"
     fi
@@ -117,6 +162,29 @@ if [ "${{1:-}}" = "tool" ] && [ "${{2:-}}" = "dir" ] && [ "${{3:-}}" = "--bin" ]
     exit 0
 fi
 exit 35
+"""
+
+
+def _posix_rtk_command() -> str:
+    return """#!/bin/sh
+echo "rtk:$*:telemetry=${RTK_TELEMETRY_DISABLED:-}" >> "$CALL_LOG"
+if [ "$*" = "init --global --auto-patch" ]; then
+    claude_config_directory=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+    [ -d "$claude_config_directory" ] || exit 77
+fi
+case "${1:-}:$FAIL_STEP" in
+    --version:rtk-verify|gain:rtk-verify) exit 72 ;;
+esac
+case "$*:$FAIL_STEP" in
+    "init --global --auto-patch:rtk-init-claude") exit 73 ;;
+    "init --global --codex:rtk-init-codex") exit 74 ;;
+    "init --global --agent pi:rtk-init-pi") exit 75 ;;
+    "init --global --opencode:rtk-init-opencode") exit 76 ;;
+esac
+if [ "${1:-}" = "--version" ]; then
+    echo "rtk 0.44.2"
+fi
+exit 0
 """
 
 
@@ -143,6 +211,19 @@ class PosixHarness:
     def add_uv(self, version: str) -> None:
         _write_executable(self.bin_dir / "uv", _posix_uv_command(version))
 
+    def add_rtk(self) -> None:
+        _write_executable(self.bin_dir / "rtk", _posix_rtk_command())
+
+    def add_unrelated_rtk(self) -> None:
+        _write_executable(
+            self.bin_dir / "rtk",
+            """#!/bin/sh
+echo "unrelated-rtk:$*" >> "$CALL_LOG"
+[ "${1:-}" = "--version" ] && echo "rtk 1.0.0" && exit 0
+exit 76
+""",
+        )
+
     def use_process_list_fallback(self, process_line: str) -> None:
         fallback_bin = self.root / "fallback-bin"
         fallback_bin.mkdir()
@@ -167,6 +248,39 @@ printf '%s\n' "$FCC_PS_OUTPUT"
             capture_output=True,
             text=True,
             env=env,
+        )
+
+    def run_interactive(
+        self,
+        answers: str,
+        *args: str,
+        fail_step: str = "",
+    ) -> subprocess.CompletedProcess[str]:
+        env = self.env | {
+            "FAIL_STEP": fail_step,
+            "FCC_INSTALLER": str(_repo_root() / "scripts" / "install.sh"),
+        }
+        command = [
+            "/bin/sh",
+            "-c",
+            'cat "$FCC_INSTALLER" | /bin/sh -s -- "$@"',
+            "fcc-installer",
+            *args,
+        ]
+        return subprocess.run(
+            [
+                sys.executable,
+                "-W",
+                "error",
+                str(Path(__file__).with_name("_pty_runner.py")),
+                *command,
+            ],
+            input=answers,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
         )
 
     def calls(self) -> list[str]:
@@ -220,7 +334,7 @@ while [ "$#" -gt 0 ]; do
 done
 echo "download:$url" >> "$CALL_LOG"
 case "$url:$FAIL_STEP" in
-    *claude.ai*:claude-download|*chatgpt.com*:codex-download|*pi.dev*:pi-download|*astral.sh*:uv-download)
+    *claude.ai*:claude-download|*chatgpt.com*:codex-download|*pi.dev*:pi-download|*opencode.ai*:opencode-download|*hermes-agent.nousresearch.com*:hermes-download|*x.ai*:grok-download|*dev.meta.ai*:muse-download|*rtk-ai*:rtk-download|*astral.sh*:uv-download)
         exit 41
         ;;
 esac
@@ -228,6 +342,17 @@ case "$url" in
     *claude.ai*) source="$FAKE_FIXTURES/claude-installer.sh" ;;
     *chatgpt.com*) source="$FAKE_FIXTURES/codex-installer.sh" ;;
     *pi.dev*) source="$FAKE_FIXTURES/pi-installer.sh" ;;
+    *opencode.ai*) source="$FAKE_FIXTURES/opencode-installer.sh" ;;
+    *hermes-agent.nousresearch.com*) source="$FAKE_FIXTURES/hermes-installer.sh" ;;
+    *x.ai*) source="$FAKE_FIXTURES/grok-installer.sh" ;;
+    *dev.meta.ai*) source="$FAKE_FIXTURES/muse-installer.sh" ;;
+    *rtk-ai*)
+        if [ "$FAIL_STEP" = "rtk-install" ]; then
+            printf 'invalid archive\n' > "$output"
+            exit 0
+        fi
+        source="$FAKE_FIXTURES/rtk-x86_64-unknown-linux-musl.tar.gz"
+        ;;
     *astral.sh*) source="$FAKE_FIXTURES/uv-installer.sh" ;;
     *) exit 42 ;;
 esac
@@ -271,6 +396,47 @@ chmod +x "$pi_bin/pi"
 """,
     )
     _write_executable(
+        fixtures / "opencode-installer.sh",
+        """#!/bin/sh
+echo "opencode-install" >> "$CALL_LOG"
+[ "$FAIL_STEP" = "opencode-install" ] && exit 25
+mkdir -p "$HOME/.opencode/bin"
+cp "$FAKE_FIXTURES/opencode-command.sh" "$HOME/.opencode/bin/opencode"
+chmod +x "$HOME/.opencode/bin/opencode"
+""",
+    )
+    _write_executable(
+        fixtures / "hermes-installer.sh",
+        """#!/bin/sh
+echo "hermes-install:$*" >> "$CALL_LOG"
+[ "$FAIL_STEP" = "hermes-install" ] && exit 26
+mkdir -p "$HOME/.local/bin"
+cp "$FAKE_FIXTURES/hermes-command.sh" "$HOME/.local/bin/hermes"
+chmod +x "$HOME/.local/bin/hermes"
+""",
+    )
+    _write_executable(
+        fixtures / "grok-installer.sh",
+        """#!/bin/sh
+echo "grok-install" >> "$CALL_LOG"
+[ "$FAIL_STEP" = "grok-install" ] && exit 27
+grok_bin="${GROK_BIN_DIR:-$HOME/.grok/bin}"
+mkdir -p "$grok_bin"
+cp "$FAKE_FIXTURES/grok-command.sh" "$grok_bin/grok"
+chmod +x "$grok_bin/grok"
+""",
+    )
+    _write_executable(
+        fixtures / "muse-installer.sh",
+        """#!/bin/sh
+echo "muse-install" >> "$CALL_LOG"
+[ "$FAIL_STEP" = "muse-install" ] && exit 28
+mkdir -p "$HOME/.local/bin"
+cp "$FAKE_FIXTURES/muse-command.sh" "$HOME/.local/bin/muse"
+chmod +x "$HOME/.local/bin/muse"
+""",
+    )
+    _write_executable(
         fixtures / "uv-installer.sh",
         """#!/bin/sh
 echo "uv-install" >> "$CALL_LOG"
@@ -283,6 +449,20 @@ chmod +x "$HOME/.local/bin/uv"
     _write_executable(fixtures / "claude-command.sh", _posix_command("claude"))
     _write_executable(fixtures / "codex-command.sh", _posix_command("codex"))
     _write_executable(fixtures / "pi-command.sh", _posix_command("pi"))
+    _write_executable(fixtures / "opencode-command.sh", _posix_command("opencode"))
+    _write_executable(fixtures / "cline-command.sh", _posix_command("cline"))
+    _write_executable(fixtures / "hermes-command.sh", _posix_command("hermes"))
+    _write_executable(fixtures / "dsh-command.sh", _posix_command("dsh"))
+    _write_executable(fixtures / "grok-command.sh", _posix_command("grok"))
+    _write_executable(fixtures / "muse-command.sh", _posix_command("muse"))
+    rtk_command = _posix_rtk_command().encode()
+    with tarfile.open(
+        fixtures / "rtk-x86_64-unknown-linux-musl.tar.gz", "w:gz"
+    ) as archive:
+        metadata = tarfile.TarInfo("rtk")
+        metadata.mode = 0o755
+        metadata.size = len(rtk_command)
+        archive.addfile(metadata, io.BytesIO(rtk_command))
     _write_executable(fixtures / "uv-command.sh", _posix_uv_command("0.11.28"))
     _write_executable(
         fixtures / "fcc-command.sh",
@@ -305,7 +485,27 @@ fi
     _write_executable(
         bin_dir / "uname",
         """#!/bin/sh
-printf '%s\n' "${FAKE_UNAME:-Linux}"
+case "${1:-}" in
+    -m) printf '%s\n' "${FAKE_UNAME_MACHINE:-x86_64}" ;;
+    *) printf '%s\n' "${FAKE_UNAME:-Linux}" ;;
+esac
+""",
+    )
+    _write_executable(bin_dir / "opencode", _posix_command("opencode"))
+    _write_executable(bin_dir / "node", _posix_command("node"))
+    npm_prefix = tmp_path / "npm-prefix"
+    npm_prefix.mkdir()
+    _write_executable(bin_dir / "npm", _posix_npm_command())
+    _write_executable(
+        bin_dir / "sha256sum",
+        """#!/bin/sh
+echo "sha256sum:$*" >> "$CALL_LOG"
+if [ "$FAIL_STEP" = "rtk-checksum" ]; then
+    checksum="0000000000000000000000000000000000000000000000000000000000000000"
+else
+    checksum="d94cc2a3e57fa534892b5235a726e7eeb7523f205a5f8f48f853bfcae7be7e33"
+fi
+printf '%s  %s\n' "$checksum" "$1"
 """,
     )
 
@@ -321,14 +521,18 @@ printf '%s\n' "${FAKE_UNAME:-Linux}"
             "FCC_RUNNING_COMMAND": "",
             "FCC_RUNNING_PHASE": "early",
             "FAKE_UNAME": "Linux",
+            "FAKE_NPM_PREFIX": str(npm_prefix),
+            "CLAUDE_CONFIG_DIR": "",
             "FAIL_STEP": "",
         }
     )
     env.pop("XDG_BIN_HOME", None)
+    env.pop("GROK_BIN_DIR", None)
     return PosixHarness(tmp_path, bin_dir, fixtures, tool_bin, log, env)
 
 
 def test_install_sh_fresh_install_is_verified(posix_harness: PosixHarness) -> None:
+    (posix_harness.bin_dir / "opencode").unlink()
     result = posix_harness.run()
 
     assert result.returncode == 0, result.stderr
@@ -337,6 +541,16 @@ def test_install_sh_fresh_install_is_verified(posix_harness: PosixHarness) -> No
     assert calls.index("claude-install") < calls.index("claude:--version")
     assert calls.index("codex-install:1") < calls.index("codex:--version")
     assert calls.index("pi-install") < calls.index("pi:--version")
+    assert calls.index("opencode-install") < calls.index("opencode:--version")
+    assert calls.index("npm:install -g cline") < calls.index("cline:--version")
+    assert calls.index("hermes-install:--non-interactive --skip-setup") < calls.index(
+        "hermes:--version"
+    )
+    assert calls.index("npm:install -g @deepseek-ai/dsh@0.1.0-rc.8") < calls.index(
+        "dsh:--version"
+    )
+    assert calls.index("grok-install") < calls.index("grok:--version")
+    assert calls.index("muse-install") < calls.index("muse:--version")
     assert calls.index("uv-install") < calls.index("uv:--version")
     assert any(
         call.startswith(
@@ -352,6 +566,426 @@ def test_install_sh_fresh_install_is_verified(posix_harness: PosixHarness) -> No
         "uv:tool dir --bin",
         "fcc-server:--version",
     ]
+    assert not any("hermes:setup" in call for call in calls)
+    home = Path(posix_harness.env["HOME"])
+    assert (home / ".grok" / "bin" / "grok").is_file()
+    assert not (home / ".local" / "bin" / "grok").exists()
+
+
+def test_install_sh_discovers_grok_in_custom_bin_directory(
+    posix_harness: PosixHarness,
+) -> None:
+    custom_grok_bin = posix_harness.root / "custom-grok-bin"
+    posix_harness.env["GROK_BIN_DIR"] = str(custom_grok_bin)
+
+    result = posix_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert (custom_grok_bin / "grok").is_file()
+    assert not (Path(posix_harness.env["HOME"]) / ".grok" / "bin" / "grok").exists()
+    calls = posix_harness.calls()
+    assert calls.index("grok-install") < calls.index("grok:--version")
+
+
+def test_install_sh_installs_selected_hermes_without_setup(
+    posix_harness: PosixHarness,
+) -> None:
+    result = posix_harness.run_interactive("n\nn\nn\nn\nn\ny\nn\nn\nn\nn\n")
+
+    assert result.returncode == 0, result.stdout
+    calls = posix_harness.calls()
+    assert "download:https://hermes-agent.nousresearch.com/install.sh" in calls
+    assert "hermes-install:--non-interactive --skip-setup" in calls
+    assert calls.index("hermes-install:--non-interactive --skip-setup") < calls.index(
+        "hermes:--version"
+    )
+    assert "Run Hermes Agent with: fcc-hermes" in result.stdout
+    assert not any("hermes:setup" in call for call in calls)
+    assert not any(call.startswith("rtk:init") for call in calls)
+
+
+@pytest.mark.parametrize("failure", ["hermes-download", "hermes-install"])
+def test_install_sh_stops_when_selected_hermes_install_fails(
+    posix_harness: PosixHarness,
+    failure: str,
+) -> None:
+    result = posix_harness.run_interactive(
+        "n\nn\nn\nn\nn\ny\nn\nn\nn\nn\n", fail_step=failure
+    )
+
+    assert result.returncode != 0
+    assert "Free Claude Code is installed and verified." not in result.stdout
+    assert not any("astral.sh" in call for call in posix_harness.calls())
+
+
+def test_install_sh_rejects_unsupported_hermes_platform_before_download(
+    posix_harness: PosixHarness,
+) -> None:
+    posix_harness.env["FAKE_UNAME"] = "Darwin"
+    posix_harness.env["FAKE_UNAME_MACHINE"] = "x86_64"
+
+    result = posix_harness.run_interactive("n\nn\nn\nn\nn\ny\nn\nn\nn\nn\n")
+
+    assert result.returncode != 0
+    assert "does not provide a supported release for Darwin x86_64" in result.stdout
+    assert not any(
+        "hermes-agent.nousresearch.com" in call for call in posix_harness.calls()
+    )
+
+
+def test_install_sh_preserves_compatible_existing_hermes(
+    posix_harness: PosixHarness,
+) -> None:
+    posix_harness.add_client("hermes")
+
+    result = posix_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert "Hermes Agent 0.20.4 already satisfies >=0.20.4" in result.stdout
+    assert not any(
+        "hermes-agent.nousresearch.com" in call for call in posix_harness.calls()
+    )
+
+
+def test_install_sh_preserves_compatible_existing_grok(
+    posix_harness: PosixHarness,
+) -> None:
+    posix_harness.add_client("grok")
+
+    result = posix_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert "Grok Build 1.0.5 already satisfies >=1.0.5" in result.stdout
+    assert not any("x.ai/cli" in call for call in posix_harness.calls())
+
+
+def test_install_sh_upgrades_old_grok_with_official_installer(
+    posix_harness: PosixHarness,
+) -> None:
+    _write_executable(
+        posix_harness.bin_dir / "grok",
+        _posix_command("grok").replace("grok 1.0.5", "grok 1.0.4"),
+    )
+
+    result = posix_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert "does not satisfy stable >=1.0.5" in result.stdout
+    assert "download:https://x.ai/cli/install.sh" in posix_harness.calls()
+    assert "grok-install" in posix_harness.calls()
+
+
+@pytest.mark.parametrize("failure", ["grok-download", "grok-install"])
+def test_install_sh_stops_when_grok_install_fails(
+    posix_harness: PosixHarness,
+    failure: str,
+) -> None:
+    result = posix_harness.run_interactive(
+        "n\nn\nn\nn\nn\nn\nn\ny\nn\nn\n", fail_step=failure
+    )
+
+    assert result.returncode != 0
+    assert "Free Claude Code is installed and verified." not in result.stdout
+    assert not any(call.startswith("uv:") for call in posix_harness.calls())
+
+
+def test_install_sh_preserves_compatible_existing_muse(
+    posix_harness: PosixHarness,
+) -> None:
+    posix_harness.add_client("muse")
+
+    result = posix_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert "Muse Code 0.2.1 already satisfies >=0.2.1" in result.stdout
+    assert not any("dev.meta.ai" in call for call in posix_harness.calls())
+
+
+def test_install_sh_upgrades_old_muse_with_official_installer(
+    posix_harness: PosixHarness,
+) -> None:
+    _write_executable(
+        posix_harness.bin_dir / "muse",
+        _posix_command("muse").replace(
+            "Muse Code 0.2.1 (0.2.1-R1215.1)",
+            "Muse Code 0.2.0 (0.2.0-R1200.1)",
+        ),
+    )
+
+    result = posix_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert "Muse Code 0.2.0 does not satisfy >=0.2.1" in result.stdout
+    assert "download:https://dev.meta.ai/install.sh" in posix_harness.calls()
+    assert "muse-install" in posix_harness.calls()
+
+
+@pytest.mark.parametrize("failure", ["muse-download", "muse-install"])
+def test_install_sh_stops_when_muse_install_fails(
+    posix_harness: PosixHarness,
+    failure: str,
+) -> None:
+    result = posix_harness.run_interactive(
+        "n\nn\nn\nn\nn\nn\nn\nn\ny\nn\n", fail_step=failure
+    )
+
+    assert result.returncode != 0
+    assert "Free Claude Code is installed and verified." not in result.stdout
+    assert not any(call.startswith("uv:") for call in posix_harness.calls())
+
+
+def test_install_sh_installs_selected_dsh_at_exact_preview(
+    posix_harness: PosixHarness,
+) -> None:
+    result = posix_harness.run_interactive("n\nn\nn\nn\nn\nn\ny\nn\nn\nn\n")
+
+    assert result.returncode == 0, result.stdout
+    calls = posix_harness.calls()
+    assert "npm:install -g @deepseek-ai/dsh@0.1.0-rc.8" in calls
+    assert calls.index("npm:install -g @deepseek-ai/dsh@0.1.0-rc.8") < calls.index(
+        "dsh:--version"
+    )
+    assert "Run DeepSeek Harness with: fcc-dsh" in result.stdout
+    assert not any(call.startswith("rtk:init") for call in calls)
+
+
+def test_install_sh_replaces_mismatched_dsh_preview(
+    posix_harness: PosixHarness,
+) -> None:
+    _write_executable(
+        posix_harness.bin_dir / "dsh",
+        _posix_command("dsh").replace("0.1.0-rc.8", "0.1.0-rc.7"),
+    )
+
+    result = posix_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert "does not match 0.1.0-rc.8" in result.stdout
+    assert "npm:install -g @deepseek-ai/dsh@0.1.0-rc.8" in posix_harness.calls()
+
+
+def test_install_sh_rejects_exact_dsh_on_unsupported_node(
+    posix_harness: PosixHarness,
+) -> None:
+    posix_harness.add_client("dsh")
+    _write_executable(
+        posix_harness.bin_dir / "node",
+        _posix_command("node").replace("node 22.19.0", "node 23.9.0"),
+    )
+
+    result = posix_harness.run()
+
+    assert result.returncode != 0
+    assert "requires Node.js ^22.19.0 or >=24.0.0" in result.stderr
+    assert not any(call.startswith("uv:") for call in posix_harness.calls())
+
+
+@pytest.mark.parametrize("node_version", ["22.18.0", "23.9.0", "not-a-version"])
+def test_install_sh_rejects_incompatible_node_for_selected_dsh(
+    posix_harness: PosixHarness,
+    node_version: str,
+) -> None:
+    _write_executable(
+        posix_harness.bin_dir / "node",
+        _posix_command("node").replace("node 22.19.0", f"node {node_version}"),
+    )
+
+    result = posix_harness.run_interactive("n\nn\nn\nn\nn\nn\ny\nn\nn\nn\n")
+
+    assert result.returncode != 0
+    assert "Free Claude Code is installed and verified." not in result.stdout
+    assert not any(call.startswith("uv:") for call in posix_harness.calls())
+
+
+def test_install_sh_noninteractive_skips_dsh_without_node(
+    posix_harness: PosixHarness,
+) -> None:
+    (posix_harness.bin_dir / "node").unlink()
+    (posix_harness.bin_dir / "npm").unlink()
+
+    result = posix_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        "fcc-dsh wrapper is ready after you install DeepSeek Harness" in result.stdout
+    )
+    assert not any("@deepseek-ai/dsh" in call for call in posix_harness.calls())
+
+
+def test_install_sh_stops_when_selected_dsh_install_fails(
+    posix_harness: PosixHarness,
+) -> None:
+    result = posix_harness.run_interactive(
+        "n\nn\nn\nn\nn\nn\ny\nn\nn\nn\n", fail_step="dsh-install"
+    )
+
+    assert result.returncode != 0
+    assert "Free Claude Code is installed and verified." not in result.stdout
+    assert not any(call.startswith("uv:") for call in posix_harness.calls())
+
+
+def test_install_sh_installs_and_configures_rtk_for_selected_agents(
+    posix_harness: PosixHarness,
+) -> None:
+    result = posix_harness.run("--rtk")
+
+    assert result.returncode == 0, result.stderr
+    calls = posix_harness.calls()
+    assert (
+        "download:https://github.com/rtk-ai/rtk/releases/download/v0.44.2/rtk-x86_64-unknown-linux-musl.tar.gz"
+        in calls
+    )
+    assert any(call.startswith("sha256sum:") for call in calls)
+    assert calls.index("rtk:--version:telemetry=1") > next(
+        index for index, call in enumerate(calls) if call.startswith("sha256sum:")
+    )
+    assert calls.index("rtk:--version:telemetry=1") < calls.index(
+        "rtk:gain:telemetry=1"
+    )
+    assert [call for call in calls if call.startswith("rtk:init")] == [
+        "rtk:init --global --auto-patch:telemetry=1",
+        "rtk:init --global --codex:telemetry=1",
+        "rtk:init --global --agent pi:telemetry=1",
+        "rtk:init --global --opencode:telemetry=1",
+    ]
+    assert calls.index("rtk:init --global --opencode:telemetry=1") < calls.index(
+        "uv-install"
+    )
+    assert (Path(posix_harness.env["HOME"]) / ".claude").is_dir()
+
+
+def test_install_sh_prepares_custom_claude_config_directory_for_rtk(
+    posix_harness: PosixHarness,
+) -> None:
+    posix_harness.add_rtk()
+    custom_config = posix_harness.root / "custom-claude"
+    posix_harness.env["CLAUDE_CONFIG_DIR"] = str(custom_config)
+
+    result = posix_harness.run("--rtk")
+
+    assert result.returncode == 0, result.stderr
+    assert custom_config.is_dir()
+    assert not (Path(posix_harness.env["HOME"]) / ".claude").exists()
+
+
+@pytest.mark.parametrize(
+    ("system", "machine", "asset"),
+    [
+        ("Linux", "x86_64", "rtk-x86_64-unknown-linux-musl.tar.gz"),
+        ("Linux", "aarch64", "rtk-aarch64-unknown-linux-gnu.tar.gz"),
+        ("Darwin", "x86_64", "rtk-x86_64-apple-darwin.tar.gz"),
+        ("Darwin", "arm64", "rtk-aarch64-apple-darwin.tar.gz"),
+    ],
+)
+def test_install_sh_selects_pinned_rtk_release_for_platform(
+    posix_harness: PosixHarness,
+    system: str,
+    machine: str,
+    asset: str,
+) -> None:
+    posix_harness.env["FAKE_UNAME"] = system
+    posix_harness.env["FAKE_UNAME_MACHINE"] = machine
+
+    result = posix_harness.run("--rtk", "--dry-run")
+
+    assert result.returncode == 0, result.stderr
+    assert f"rtk-ai/rtk/releases/download/v0.44.2/{asset}" in result.stdout
+    assert "raw.githubusercontent.com/rtk-ai/rtk" not in result.stdout
+
+
+def test_install_sh_rejects_unsupported_rtk_platform(
+    posix_harness: PosixHarness,
+) -> None:
+    posix_harness.add_client("muse")
+    posix_harness.env["FAKE_UNAME"] = "FreeBSD"
+    posix_harness.env["FAKE_UNAME_MACHINE"] = "riscv64"
+
+    result = posix_harness.run("--rtk", "--dry-run")
+
+    assert result.returncode != 0
+    assert "does not provide a release for FreeBSD riscv64" in result.stderr
+
+
+def test_install_sh_preserves_existing_rtk_and_configures_only_selected_agent(
+    posix_harness: PosixHarness,
+) -> None:
+    posix_harness.add_rtk()
+
+    result = posix_harness.run_interactive("n\ny\nn\nn\nn\nn\nn\nn\nn\ny\n")
+
+    assert result.returncode == 0, result.stdout
+    assert "verifying it without updating it" in result.stdout
+    assert not any("rtk-ai/rtk" in call for call in posix_harness.calls())
+    assert [call for call in posix_harness.calls() if call.startswith("rtk:init")] == [
+        "rtk:init --global --codex:telemetry=1"
+    ]
+
+
+def test_install_sh_rejects_conflicting_rtk_command(
+    posix_harness: PosixHarness,
+) -> None:
+    posix_harness.add_unrelated_rtk()
+
+    result = posix_harness.run("--rtk")
+
+    assert result.returncode != 0
+    assert "not a compatible Rust Token Killer installation" in result.stderr
+    assert not any("rtk-ai/rtk" in call for call in posix_harness.calls())
+    assert not any("astral.sh" in call for call in posix_harness.calls())
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "rtk-download",
+        "rtk-checksum",
+        "rtk-install",
+        "rtk-verify",
+        "rtk-init-claude",
+    ],
+)
+def test_install_sh_stops_when_rtk_setup_fails(
+    posix_harness: PosixHarness,
+    failure: str,
+) -> None:
+    result = posix_harness.run("--rtk", fail_step=failure)
+
+    assert result.returncode != 0
+    assert "Free Claude Code is installed and verified." not in result.stdout
+    assert not any("astral.sh" in call for call in posix_harness.calls())
+
+
+def test_install_sh_reprompts_then_installs_only_selected_agent(
+    posix_harness: PosixHarness,
+) -> None:
+    result = posix_harness.run_interactive(
+        "n\nn\nn\nn\nn\nn\nn\nn\nn\nn\ny\nn\nn\nn\nn\nn\nn\nn\nn\n"
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert "Select at least one coding agent." in result.stdout
+    assert "Run Codex with: fcc-codex" in result.stdout
+    assert "Run Claude Code with: fcc-claude" not in result.stdout
+    assert "Run Pi with: fcc-pi" not in result.stdout
+    assert "Run OpenCode with: fcc-opencode" not in result.stdout
+    assert "Run Cline with: fcc-cline" not in result.stdout
+    calls = posix_harness.calls()
+    assert "codex-install:1" in calls
+    assert not any("claude.ai" in call for call in calls)
+    assert not any("pi.dev" in call for call in calls)
+    assert not any("rtk-ai/rtk" in call for call in calls)
+
+
+def test_install_sh_rejects_uninstalled_only_selection(
+    posix_harness: PosixHarness,
+) -> None:
+    result = posix_harness.run_interactive(
+        "n\nn\ny\nn\nn\nn\nn\nn\nn\nn\n", fail_step="pi-skip"
+    )
+
+    assert result.returncode != 0
+    assert "No selected coding agent was installed." in result.stdout
+    assert not any("astral.sh" in call for call in posix_harness.calls())
 
 
 def test_install_sh_creates_native_macos_app_and_desktop_link(
@@ -447,6 +1081,10 @@ def test_install_sh_preserves_valid_existing_tools(
     posix_harness.add_client("claude")
     posix_harness.add_client("codex")
     posix_harness.add_client("pi")
+    posix_harness.add_client("cline")
+    posix_harness.add_client("hermes")
+    posix_harness.add_client("grok")
+    posix_harness.add_client("muse")
     posix_harness.add_uv(uv_version)
 
     result = posix_harness.run()
@@ -583,6 +1221,11 @@ def test_install_sh_replaces_prerelease_uv(
         "pi-download",
         "pi-install",
         "pi-verify",
+        "opencode-download",
+        "opencode-install",
+        "opencode-verify",
+        "cline-install",
+        "cline-verify",
         "uv-download",
         "uv-install",
         "uv-verify",
@@ -596,6 +1239,8 @@ def test_install_sh_stops_without_success_on_each_failure(
     posix_harness: PosixHarness,
     failure: str,
 ) -> None:
+    if failure.startswith("opencode-"):
+        (posix_harness.bin_dir / "opencode").unlink()
     result = posix_harness.run(fail_step=failure)
 
     assert result.returncode != 0
@@ -610,6 +1255,11 @@ def test_install_sh_stops_without_success_on_each_failure(
         "pi-download": "pi-install",
         "pi-install": "pi:--version",
         "pi-verify": "astral.sh",
+        "opencode-download": "opencode-install",
+        "opencode-install": "opencode:--version",
+        "opencode-verify": "astral.sh",
+        "cline-install": "cline:--version",
+        "cline-verify": "astral.sh",
         "uv-download": "uv-install",
         "uv-install": "uv:--version",
         "uv-verify": "uv:tool install",
@@ -847,8 +1497,12 @@ def _create_windows_shortcut(
     )
 
 
-def _windows_shortcut_icon(powershell: str, shortcut_path: Path) -> str:
-    env = os.environ | {"FCC_TEST_SHORTCUT": str(shortcut_path)}
+def _windows_shortcut_icon(
+    powershell: str,
+    shortcut_path: Path,
+    env: dict[str, str],
+) -> str:
+    process_env = env | {"FCC_TEST_SHORTCUT": str(shortcut_path)}
     completed = subprocess.run(
         [
             powershell,
@@ -863,12 +1517,38 @@ def _windows_shortcut_icon(powershell: str, shortcut_path: Path) -> str:
         check=True,
         capture_output=True,
         text=True,
-        env=env,
+        env=process_env,
     )
     return completed.stdout
 
 
 def _batch_client(name: str) -> str:
+    version = {
+        "opencode": "1.18.18",
+        "cline": "3.0.55",
+        "hermes": "0.20.4",
+        "dsh": "0.1.0-rc.8",
+        "grok": "1.0.5",
+        "muse": "0.2.1",
+        "node": "22.19.0",
+    }.get(name, "1.0.0")
+    version_output = (
+        (
+            f'if "%1"=="--version" echo Hermes Agent v{version} '
+            "(2026.8.18) · upstream deadbeef\n"
+            'if "%1"=="--version" echo Install directory: C:\\fake-hermes\n'
+            'if "%1"=="--version" echo Install method: git\n'
+            'if "%1"=="--version" echo Python: 3.12.11\n'
+            'if "%1"=="--version" echo OpenAI SDK: 2.15.0\n'
+            'if "%1"=="--version" echo Up to date'
+        )
+        if name == "hermes"
+        else (
+            f'if "%1"=="--version" echo Muse Code {version} ({version}-R1215.1)'
+            if name == "muse"
+            else f'if "%1"=="--version" echo {name} {version}'
+        )
+    )
     help_output = (
         "echo   --extension, -e ^<path^>  Load an extension\n"
         "echo   --models ^<patterns^>     Scope models"
@@ -878,7 +1558,7 @@ def _batch_client(name: str) -> str:
     return f"""@echo off
 echo {name}:%*>>"%CALL_LOG%"
 if "%FAIL_STEP%"=="{name}-verify" exit /b 51
-if "%1"=="--version" echo {name} 1.0.0
+{version_output}
 if "%1"=="--help" (
 {help_output}
 )
@@ -889,9 +1569,21 @@ exit /b 0
 def _batch_npm() -> str:
     return r"""@echo off
 echo npm:%*>>"%CALL_LOG%"
+if "%1"=="install" if "%2"=="-g" if "%3"=="cline" goto install_cline
+if "%1"=="install" if "%2"=="-g" if "%3"=="@deepseek-ai/dsh@0.1.0-rc.8" goto install_dsh
 if "%1"=="prefix" if "%2"=="-g" echo %FAKE_NPM_PREFIX%& exit /b 0
 if "%1"=="config" if "%2"=="get" if "%3"=="prefix" echo %FAKE_NPM_PREFIX%& exit /b 0
 exit /b 71
+:install_cline
+if "%FAIL_STEP%"=="cline-install" exit /b 72
+if not exist "%FAKE_NPM_PREFIX%" mkdir "%FAKE_NPM_PREFIX%"
+copy /y "%FAKE_FIXTURES%\cline-command.cmd" "%FAKE_NPM_PREFIX%\cline.cmd" >nul
+exit /b 0
+:install_dsh
+if "%FAIL_STEP%"=="dsh-install" exit /b 73
+if not exist "%FAKE_NPM_PREFIX%" mkdir "%FAKE_NPM_PREFIX%"
+copy /y "%FAKE_FIXTURES%\dsh-command.cmd" "%FAKE_NPM_PREFIX%\dsh.cmd" >nul
+exit /b 0
 """
 
 
@@ -915,6 +1607,12 @@ copy /y "%FAKE_FIXTURES%\fcc-command.cmd" "%FAKE_TOOL_BIN%\fcc-server.cmd" >nul
 copy /y "%FAKE_FIXTURES%\fcc-command.cmd" "%FAKE_TOOL_BIN%\fcc-desktop.cmd" >nul
 copy /y "%FAKE_FIXTURES%\fcc-command.cmd" "%FAKE_TOOL_BIN%\fcc-claude.cmd" >nul
 copy /y "%FAKE_FIXTURES%\fcc-command.cmd" "%FAKE_TOOL_BIN%\fcc-pi.cmd" >nul
+copy /y "%FAKE_FIXTURES%\fcc-command.cmd" "%FAKE_TOOL_BIN%\fcc-opencode.cmd" >nul
+copy /y "%FAKE_FIXTURES%\fcc-command.cmd" "%FAKE_TOOL_BIN%\fcc-cline.cmd" >nul
+copy /y "%FAKE_FIXTURES%\fcc-command.cmd" "%FAKE_TOOL_BIN%\fcc-hermes.cmd" >nul
+copy /y "%FAKE_FIXTURES%\fcc-command.cmd" "%FAKE_TOOL_BIN%\fcc-dsh.cmd" >nul
+copy /y "%FAKE_FIXTURES%\fcc-command.cmd" "%FAKE_TOOL_BIN%\fcc-grok.cmd" >nul
+copy /y "%FAKE_FIXTURES%\fcc-command.cmd" "%FAKE_TOOL_BIN%\fcc-muse.cmd" >nul
 if not "%FAIL_STEP%"=="fcc-missing" copy /y "%FAKE_FIXTURES%\fcc-command.cmd" "%FAKE_TOOL_BIN%\fcc-codex.cmd" >nul
 exit /b 0
 :update_shell
@@ -922,6 +1620,22 @@ if "%FAIL_STEP%"=="path-update" exit /b 54
 exit /b 0
 :tool_bin
 echo %FAKE_TOOL_BIN%
+exit /b 0
+"""
+
+
+def _batch_rtk() -> str:
+    return r"""@echo off
+>>"%CALL_LOG%" echo rtk:%*:telemetry=%RTK_TELEMETRY_DISABLED%
+if "%*"=="init --global --auto-patch" if defined CLAUDE_CONFIG_DIR if not exist "%CLAUDE_CONFIG_DIR%" exit /b 77
+if "%*"=="init --global --auto-patch" if not defined CLAUDE_CONFIG_DIR if not exist "%USERPROFILE%\.claude" exit /b 77
+if "%FAIL_STEP%"=="rtk-verify" if "%1"=="--version" exit /b 72
+if "%FAIL_STEP%"=="rtk-verify" if "%1"=="gain" exit /b 72
+if "%FAIL_STEP%"=="rtk-init-claude" if "%*"=="init --global --auto-patch" exit /b 73
+if "%FAIL_STEP%"=="rtk-init-codex" if "%*"=="init --global --codex" exit /b 74
+if "%FAIL_STEP%"=="rtk-init-pi" if "%*"=="init --global --agent pi" exit /b 75
+if "%FAIL_STEP%"=="rtk-init-opencode" if "%*"=="init --global --opencode" exit /b 76
+if "%1"=="--version" echo rtk 0.44.2
 exit /b 0
 """
 
@@ -950,6 +1664,22 @@ class PowerShellHarness:
 
     def add_uv(self, version: str) -> None:
         _write_executable(self.bin_dir / "uv.cmd", _batch_uv(version))
+
+    def add_rtk(self) -> None:
+        _write_executable(self.bin_dir / "rtk.cmd", _batch_rtk())
+
+    def add_unrelated_rtk(self) -> None:
+        _write_executable(
+            self.bin_dir / "rtk.cmd",
+            r"""@echo off
+echo unrelated-rtk:%*>>"%CALL_LOG%"
+if "%1"=="--version" (
+    echo rtk 1.0.0
+    exit /b 0
+)
+exit /b 76
+""",
+        )
 
     def run(self, *args: str, fail_step: str = "") -> subprocess.CompletedProcess[str]:
         env = self.env | {"FAIL_STEP": fail_step}
@@ -1004,6 +1734,19 @@ def powershell_harness(
         _batch_client("codex"), encoding="utf-8"
     )
     (fixtures / "pi-command.cmd").write_text(_batch_client("pi"), encoding="utf-8")
+    (fixtures / "opencode-command.cmd").write_text(
+        _batch_client("opencode"), encoding="utf-8"
+    )
+    (fixtures / "cline-command.cmd").write_text(
+        _batch_client("cline"), encoding="utf-8"
+    )
+    (fixtures / "hermes-command.cmd").write_text(
+        _batch_client("hermes"), encoding="utf-8"
+    )
+    (fixtures / "dsh-command.cmd").write_text(_batch_client("dsh"), encoding="utf-8")
+    (fixtures / "grok-command.cmd").write_text(_batch_client("grok"), encoding="utf-8")
+    (fixtures / "muse-command.cmd").write_text(_batch_client("muse"), encoding="utf-8")
+    (fixtures / "rtk-command.cmd").write_text(_batch_rtk(), encoding="utf-8")
     (fixtures / "uv-command.cmd").write_text(_batch_uv("0.11.28"), encoding="utf-8")
     (fixtures / "fcc-command.cmd").write_text(
         """@echo off
@@ -1051,6 +1794,28 @@ Add-Content -LiteralPath $env:CALL_LOG -Value "pi-install"
 """,
         encoding="utf-8",
     )
+    (fixtures / "hermes-installer.ps1").write_text(
+        r"""param(
+    [switch] $NonInteractive,
+    [switch] $SkipSetup
+)
+if ($env:FAIL_STEP -eq "hermes-install") { exit 65 }
+$bin = Join-Path $env:LOCALAPPDATA "hermes\hermes-agent\bin"
+New-Item -ItemType Directory -Force -Path $bin | Out-Null
+Copy-Item (Join-Path $env:FAKE_FIXTURES "hermes-command.cmd") (Join-Path $bin "hermes.cmd") -Force
+Add-Content -LiteralPath $env:CALL_LOG -Value "hermes-install:${NonInteractive}:${SkipSetup}"
+""",
+        encoding="utf-8",
+    )
+    (fixtures / "grok-installer.ps1").write_text(
+        r"""if ($env:FAIL_STEP -eq "grok-install") { exit 66 }
+$bin = if ($env:GROK_BIN_DIR) { $env:GROK_BIN_DIR } else { Join-Path $env:USERPROFILE ".grok\bin" }
+New-Item -ItemType Directory -Force -Path $bin | Out-Null
+Copy-Item (Join-Path $env:FAKE_FIXTURES "grok-command.cmd") (Join-Path $bin "grok.cmd") -Force
+Add-Content -LiteralPath $env:CALL_LOG -Value "grok-install"
+""",
+        encoding="utf-8",
+    )
     (fixtures / "uv-installer.ps1").write_text(
         r"""if ($env:FAIL_STEP -eq "uv-install") { exit 63 }
 $bin = Join-Path $env:USERPROFILE ".local\bin"
@@ -1060,6 +1825,25 @@ Add-Content -LiteralPath $env:CALL_LOG -Value "uv-install"
 """,
         encoding="utf-8",
     )
+    rtk_archive = fixtures / "rtk-x86_64-pc-windows-msvc.zip"
+    with zipfile.ZipFile(rtk_archive, "w") as archive:
+        archive.writestr("rtk.exe", b"fake RTK executable")
+    for asset_name in (
+        "opencode-windows-x64-baseline.zip",
+        "opencode-windows-arm64.zip",
+    ):
+        with zipfile.ZipFile(
+            fixtures / asset_name, "w", zipfile.ZIP_DEFLATED
+        ) as archive:
+            archive.write(
+                Path(sys.executable).with_name("fcc-server.exe"),
+                arcname="opencode.exe",
+            )
+    (bin_dir / "opencode.cmd").write_text(_batch_client("opencode"), encoding="utf-8")
+    (bin_dir / "node.cmd").write_text(_batch_client("node"), encoding="utf-8")
+    npm_prefix = tmp_path / "npm-prefix"
+    npm_prefix.mkdir()
+    (bin_dir / "npm.cmd").write_text(_batch_npm(), encoding="utf-8")
 
     wrapper = tmp_path / "run-installer.ps1"
     wrapper.write_text(
@@ -1074,6 +1858,10 @@ function Invoke-RestMethod {
         ($env:FAIL_STEP -eq "claude-download" -and $Uri.Contains("claude.ai")) -or
         ($env:FAIL_STEP -eq "codex-download" -and $Uri.Contains("chatgpt.com")) -or
         ($env:FAIL_STEP -eq "pi-download" -and $Uri.Contains("pi.dev")) -or
+        ($env:FAIL_STEP -eq "opencode-download" -and $Uri.Contains("anomalyco/opencode")) -or
+        ($env:FAIL_STEP -eq "hermes-download" -and $Uri.Contains("hermes-agent.nousresearch.com")) -or
+        ($env:FAIL_STEP -eq "grok-download" -and $Uri.Contains("x.ai/cli")) -or
+        ($env:FAIL_STEP -eq "rtk-download" -and $Uri.Contains("rtk-ai/rtk")) -or
         ($env:FAIL_STEP -eq "uv-download" -and $Uri.Contains("astral.sh"))
     ) {
         throw "simulated download failure"
@@ -1086,6 +1874,22 @@ function Invoke-RestMethod {
     }
     elseif ($Uri.Contains("pi.dev")) {
         $source = Join-Path $env:FAKE_FIXTURES "pi-installer.ps1"
+    }
+    elseif ($Uri.Contains("hermes-agent.nousresearch.com")) {
+        $source = Join-Path $env:FAKE_FIXTURES "hermes-installer.ps1"
+    }
+    elseif ($Uri.Contains("x.ai/cli")) {
+        $source = Join-Path $env:FAKE_FIXTURES "grok-installer.ps1"
+    }
+    elseif ($Uri.Contains("opencode-windows-")) {
+        if ($env:FAIL_STEP -eq "opencode-archive") {
+            Set-Content -LiteralPath $OutFile -Value "not a zip"
+            return
+        }
+        $source = Join-Path $env:FAKE_FIXTURES ([IO.Path]::GetFileName($Uri))
+    }
+    elseif ($Uri.EndsWith("rtk-x86_64-pc-windows-msvc.zip")) {
+        $source = Join-Path $env:FAKE_FIXTURES "rtk-x86_64-pc-windows-msvc.zip"
     }
     elseif ($Uri.Contains("astral.sh")) {
         $source = Join-Path $env:FAKE_FIXTURES "uv-installer.ps1"
@@ -1114,7 +1918,18 @@ function Get-Process {
         }
     }
 }
-$installer = [scriptblock]::Create([IO.File]::ReadAllText($env:FCC_INSTALLER))
+$installerSource = [IO.File]::ReadAllText($env:FCC_INSTALLER)
+$nativeVersionProbe = '    $output = Invoke-Utf8NativeCapture -FilePath $OpenCodePath -Arguments @("--version")'
+$fakeArchiveVersionProbe = @'
+    $output = if ([IO.Path]::GetFileName($OpenCodePath) -eq "opencode.exe") {
+        "opencode 1.18.18"
+    }
+    else {
+        Invoke-Utf8NativeCapture -FilePath $OpenCodePath -Arguments @("--version")
+    }
+'@
+$installerSource = $installerSource.Replace($nativeVersionProbe, $fakeArchiveVersionProbe.TrimEnd())
+$installer = [scriptblock]::Create($installerSource)
 & $installer @args
 """,
         encoding="utf-8",
@@ -1132,15 +1947,20 @@ $installer = [scriptblock]::Create([IO.File]::ReadAllText($env:FCC_INSTALLER))
             "LOCALAPPDATA": str(local_app_data),
             "APPDATA": str(app_data),
             "CALL_LOG": str(log),
+            "CLAUDE_CONFIG_DIR": "",
             "FAKE_FIXTURES": str(fixtures),
             "FAKE_TOOL_BIN": str(tool_bin),
+            "FAKE_NPM_PREFIX": str(npm_prefix),
             "FCC_INSTALLER": str(_repo_root() / "scripts" / "install.ps1"),
             "FCC_PROCESS_MARKER": str(tmp_path / "fcc-process-ready"),
             "FCC_RUNNING_COMMAND": "",
             "FCC_RUNNING_PHASE": "early",
+            "PROCESSOR_ARCHITECTURE": "AMD64",
+            "PROCESSOR_ARCHITEW6432": "",
             "FAIL_STEP": "",
         }
     )
+    env.pop("GROK_BIN_DIR", None)
     return PowerShellHarness(
         tmp_path, bin_dir, fixtures, tool_bin, log, env, powershell, wrapper
     )
@@ -1149,6 +1969,7 @@ $installer = [scriptblock]::Create([IO.File]::ReadAllText($env:FCC_INSTALLER))
 def test_install_ps1_fresh_install_is_verified(
     powershell_harness: PowerShellHarness,
 ) -> None:
+    (powershell_harness.bin_dir / "opencode.cmd").unlink()
     result = powershell_harness.run()
 
     assert result.returncode == 0, result.stderr
@@ -1157,11 +1978,23 @@ def test_install_ps1_fresh_install_is_verified(
     assert calls.index("claude-install") < calls.index("claude:--version")
     assert calls.index("codex-install:1") < calls.index("codex:--version")
     assert calls.index("pi-install") < calls.index("pi:--version")
+    assert any("anomalyco/opencode" in call for call in calls)
+    assert calls.index("npm:install -g cline") < calls.index("cline:--version")
+    assert any("hermes-agent.nousresearch.com/install.ps1" in call for call in calls)
+    assert "hermes-install:True:True" in calls
+    assert calls.index("npm:install -g @deepseek-ai/dsh@0.1.0-rc.8") < calls.index(
+        "dsh:--version"
+    )
+    assert calls.index("grok-install") < calls.index("grok:--version")
+    assert "Muse Code is not installed" in result.stdout
+    assert not any(call.startswith("muse:") for call in calls)
+    assert not any("hermes:setup" in call for call in calls)
     assert calls.index("uv-install") < calls.index("uv:--version")
     assert any(
         call.startswith(
             "uv:tool install --force --refresh-package free-claude-code "
-            '--python 3.14.0 "free-claude-code @ '
+            "--python cpython-3.14.0-windows-x86_64-none "
+            '"free-claude-code @ '
             'https://github.com/Alishahryar1/free-claude-code/archive/refs/heads/main.zip"'
         )
         for call in calls
@@ -1174,6 +2007,8 @@ def test_install_ps1_fresh_install_is_verified(
     ]
     home = Path(powershell_harness.env["USERPROFILE"])
     app_data = Path(powershell_harness.env["APPDATA"])
+    assert (home / ".grok" / "bin" / "grok.cmd").is_file()
+    assert not (home / ".local" / "bin" / "grok.cmd").exists()
     icon = home / ".fcc" / "app-icon.ico"
     assert icon.read_text(encoding="utf-8").strip() == "fake icon"
     assert calls[-1] == f'fcc-desktop:--export-icon "{icon}"'
@@ -1183,6 +2018,7 @@ def test_install_ps1_fresh_install_is_verified(
         _windows_shortcut_icon(
             powershell_harness.powershell,
             desktop_shortcut,
+            powershell_harness.env,
         )
         == f"{icon},0"
     )
@@ -1194,6 +2030,452 @@ def test_install_ps1_fresh_install_is_verified(
         / "Programs"
         / "Free Claude Code.lnk"
     ).is_file()
+
+
+def test_install_ps1_discovers_grok_in_custom_bin_directory(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    custom_grok_bin = powershell_harness.root / "custom-grok-bin"
+    powershell_harness.env["GROK_BIN_DIR"] = str(custom_grok_bin)
+
+    result = powershell_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert (custom_grok_bin / "grok.cmd").is_file()
+    assert not (
+        Path(powershell_harness.env["USERPROFILE"]) / ".grok" / "bin" / "grok.cmd"
+    ).exists()
+    calls = powershell_harness.calls()
+    assert calls.index("grok-install") < calls.index("grok:--version")
+
+
+def test_install_ps1_preserves_compatible_existing_hermes(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    powershell_harness.add_client("hermes")
+
+    result = powershell_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert "Hermes Agent 0.20.4 already satisfies >=0.20.4" in result.stdout
+    assert not any(
+        "hermes-agent.nousresearch.com" in call for call in powershell_harness.calls()
+    )
+
+
+@pytest.mark.parametrize("unrelated_version", ["3.12.11", "v3.12.11"])
+def test_install_ps1_rejects_unrelated_versions_in_hermes_output(
+    powershell_harness: PowerShellHarness,
+    unrelated_version: str,
+) -> None:
+    hermes_command = (
+        _batch_client("hermes")
+        .replace(
+            "echo Hermes Agent v0.20.4 (2026.8.18) · upstream deadbeef",
+            "echo Hermes Agent release unavailable",
+        )
+        .replace(
+            "echo Python: 3.12.11",
+            f"echo {unrelated_version}",
+        )
+    )
+    _write_executable(powershell_harness.bin_dir / "hermes.cmd", hermes_command)
+
+    result = powershell_harness.run()
+
+    assert result.returncode != 0
+    assert "did not return a valid semantic version" in result.stderr
+    assert not any(call.startswith("uv:") for call in powershell_harness.calls())
+
+
+def test_install_ps1_preserves_compatible_existing_grok(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    powershell_harness.add_client("grok")
+
+    result = powershell_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert "Grok Build 1.0.5 already satisfies >=1.0.5" in result.stdout
+    assert not any("x.ai/cli" in call for call in powershell_harness.calls())
+
+
+def test_install_ps1_preserves_compatible_existing_muse(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    powershell_harness.add_client("muse")
+
+    result = powershell_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert "Verified Muse Code 0.2.1" in result.stdout
+    assert "Run Muse Code with: fcc-muse" in result.stdout
+    assert not any("meta.ai" in call for call in powershell_harness.calls())
+
+
+@pytest.mark.parametrize(
+    "version_output",
+    [
+        "Muse Code 0.2.0 (0.2.0-R1200.1)",
+        "Meta launcher build 0.2.1",
+    ],
+)
+def test_install_ps1_rejects_incompatible_muse_without_inventing_an_updater(
+    powershell_harness: PowerShellHarness,
+    version_output: str,
+) -> None:
+    _write_executable(
+        powershell_harness.bin_dir / "muse.cmd",
+        _batch_client("muse").replace(
+            "Muse Code 0.2.1 (0.2.1-R1215.1)", version_output
+        ),
+    )
+
+    result = powershell_harness.run()
+
+    assert result.returncode != 0
+    assert "Muse Code" in result.stderr
+    assert not any(call.startswith("uv:") for call in powershell_harness.calls())
+    assert not any("meta.ai" in call for call in powershell_harness.calls())
+
+
+def test_install_ps1_upgrades_old_grok_with_official_installer(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    (powershell_harness.bin_dir / "grok.cmd").write_text(
+        _batch_client("grok").replace("grok 1.0.5", "grok 1.0.4"),
+        encoding="utf-8",
+    )
+
+    result = powershell_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert "does not satisfy stable >=1.0.5" in result.stdout
+    assert "download:https://x.ai/cli/install.ps1" in powershell_harness.calls()
+    assert "grok-install" in powershell_harness.calls()
+
+
+@pytest.mark.parametrize("failure", ["grok-download", "grok-install"])
+def test_install_ps1_stops_when_grok_install_fails(
+    powershell_harness: PowerShellHarness,
+    failure: str,
+) -> None:
+    result = powershell_harness.run(fail_step=failure)
+
+    assert result.returncode != 0
+    assert "Free Claude Code is installed and verified." not in result.stdout
+    assert not any(call.startswith("uv:") for call in powershell_harness.calls())
+
+
+def test_install_ps1_preserves_exact_dsh_preview(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    powershell_harness.add_client("dsh")
+
+    result = powershell_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert "already matches the supported preview" in result.stdout
+    assert "npm:install -g @deepseek-ai/dsh@0.1.0-rc.8" not in (
+        powershell_harness.calls()
+    )
+
+
+def test_install_ps1_replaces_mismatched_dsh_preview(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    (powershell_harness.bin_dir / "dsh.cmd").write_text(
+        _batch_client("dsh").replace("0.1.0-rc.8", "0.1.0-rc.7"),
+        encoding="utf-8",
+    )
+
+    result = powershell_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert "does not match 0.1.0-rc.8" in result.stdout
+    assert "npm:install -g @deepseek-ai/dsh@0.1.0-rc.8" in (powershell_harness.calls())
+
+
+def test_install_ps1_rejects_exact_dsh_on_unsupported_node(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    powershell_harness.add_client("dsh")
+    (powershell_harness.bin_dir / "node.cmd").write_text(
+        _batch_client("node").replace("node 22.19.0", "node 23.9.0"),
+        encoding="utf-8",
+    )
+
+    result = powershell_harness.run()
+
+    assert result.returncode != 0
+    assert "requires Node.js ^22.19.0 or >=24.0.0" in (
+        f"{result.stdout}\n{result.stderr}"
+    )
+    assert not any(call.startswith("uv:") for call in powershell_harness.calls())
+
+
+@pytest.mark.parametrize("node_version", ["22.18.0", "23.9.0", "not-a-version"])
+def test_install_ps1_rejects_incompatible_node_for_selected_dsh(
+    powershell_harness: PowerShellHarness,
+    node_version: str,
+) -> None:
+    (powershell_harness.bin_dir / "dsh.cmd").write_text(
+        _batch_client("dsh").replace("0.1.0-rc.8", "0.1.0-rc.7"),
+        encoding="utf-8",
+    )
+    (powershell_harness.bin_dir / "node.cmd").write_text(
+        _batch_client("node").replace("node 22.19.0", f"node {node_version}"),
+        encoding="utf-8",
+    )
+
+    result = powershell_harness.run()
+
+    assert result.returncode != 0
+    assert "Free Claude Code is installed and verified." not in result.stdout
+    assert not any(call.startswith("uv:") for call in powershell_harness.calls())
+
+
+def test_install_ps1_noninteractive_skips_dsh_without_node(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    (powershell_harness.bin_dir / "node.cmd").unlink()
+    (powershell_harness.bin_dir / "npm.cmd").unlink()
+
+    result = powershell_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        "fcc-dsh wrapper is ready after you install DeepSeek Harness" in result.stdout
+    )
+    assert not any("@deepseek-ai/dsh" in call for call in powershell_harness.calls())
+
+
+def test_install_ps1_stops_when_selected_dsh_install_fails(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    result = powershell_harness.run(fail_step="dsh-install")
+
+    assert result.returncode != 0
+    assert "Free Claude Code is installed and verified." not in result.stdout
+    assert not any(call.startswith("uv:") for call in powershell_harness.calls())
+
+
+def test_install_ps1_upgrades_old_hermes_with_noninteractive_setup_skipped(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    hermes_bin = (
+        Path(powershell_harness.env["LOCALAPPDATA"]) / "hermes" / "hermes-agent" / "bin"
+    )
+    hermes_bin.mkdir(parents=True)
+    (hermes_bin / "hermes.cmd").write_text(
+        _batch_client("hermes").replace("v0.20.4", "v0.19.9"),
+        encoding="utf-8",
+    )
+
+    result = powershell_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    calls = powershell_harness.calls()
+    assert any("hermes-agent.nousresearch.com/install.ps1" in call for call in calls)
+    assert "hermes-install:True:True" in calls
+    assert not any("hermes:setup" in call for call in calls)
+    assert not any(call.startswith("rtk:init") for call in calls)
+
+
+def test_install_ps1_stops_when_hermes_upgrade_fails(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    hermes_bin = (
+        Path(powershell_harness.env["LOCALAPPDATA"]) / "hermes" / "hermes-agent" / "bin"
+    )
+    hermes_bin.mkdir(parents=True)
+    (hermes_bin / "hermes.cmd").write_text(
+        _batch_client("hermes").replace("v0.20.4", "v0.19.9"),
+        encoding="utf-8",
+    )
+
+    result = powershell_harness.run(fail_step="hermes-install")
+
+    assert result.returncode != 0
+    assert "Free Claude Code is installed and verified." not in result.stdout
+    assert not any("astral.sh" in call for call in powershell_harness.calls())
+
+
+def test_install_ps1_rejects_unsupported_hermes_architecture_before_download(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    hermes_bin = (
+        Path(powershell_harness.env["LOCALAPPDATA"]) / "hermes" / "hermes-agent" / "bin"
+    )
+    hermes_bin.mkdir(parents=True)
+    (hermes_bin / "hermes.cmd").write_text(
+        _batch_client("hermes").replace("v0.20.4", "v0.19.9"),
+        encoding="utf-8",
+    )
+    powershell_harness.env["PROCESSOR_ARCHITECTURE"] = "MIPS"
+    powershell_harness.env["PROCESSOR_ARCHITEW6432"] = "MIPS"
+
+    result = powershell_harness.run()
+
+    assert result.returncode != 0
+    assert "does not provide a supported Windows release" in result.stderr
+    assert not any(
+        "hermes-agent.nousresearch.com" in call for call in powershell_harness.calls()
+    )
+
+
+def test_install_ps1_selects_official_opencode_arm64_archive(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    (powershell_harness.bin_dir / "opencode.cmd").unlink()
+    powershell_harness.env["PROCESSOR_ARCHITEW6432"] = "ARM64"
+
+    result = powershell_harness.run()
+
+    assert result.returncode == 0, result.stderr
+    assert any(
+        call.endswith("opencode-windows-arm64.zip")
+        for call in powershell_harness.calls()
+    )
+
+
+def test_install_ps1_rejects_unsupported_opencode_architecture(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    (powershell_harness.bin_dir / "opencode.cmd").unlink()
+    powershell_harness.env["PROCESSOR_ARCHITEW6432"] = "X86"
+
+    result = powershell_harness.run()
+
+    assert result.returncode != 0
+    assert "does not provide a supported Windows release" in result.stderr
+    assert not any("anomalyco/opencode" in call for call in powershell_harness.calls())
+
+
+def test_install_ps1_preserves_existing_rtk_and_configures_selected_agents(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    powershell_harness.add_rtk()
+
+    result = powershell_harness.run("-Rtk")
+
+    assert result.returncode == 0, result.stderr
+    assert "verifying it without updating it" in result.stdout
+    calls = powershell_harness.calls()
+    assert not any("rtk-ai/rtk" in call for call in calls)
+    assert "rtk:--version:telemetry=1" in calls
+    assert "rtk:gain:telemetry=1" in calls
+    assert [call for call in calls if call.startswith("rtk:init")] == [
+        "rtk:init --global --auto-patch:telemetry=1",
+        "rtk:init --global --codex:telemetry=1",
+        "rtk:init --global --agent pi:telemetry=1",
+        "rtk:init --global --opencode:telemetry=1",
+    ]
+    assert (Path(powershell_harness.env["USERPROFILE"]) / ".claude").is_dir()
+
+
+def test_install_ps1_prepares_custom_claude_config_directory_for_rtk(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    powershell_harness.add_rtk()
+    custom_config = powershell_harness.root / "custom-claude"
+    powershell_harness.env["CLAUDE_CONFIG_DIR"] = str(custom_config)
+
+    result = powershell_harness.run("-Rtk")
+
+    assert result.returncode == 0, result.stderr
+    assert custom_config.is_dir()
+    assert not (Path(powershell_harness.env["USERPROFILE"]) / ".claude").exists()
+
+
+def test_install_ps1_rejects_conflicting_rtk_command(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    powershell_harness.add_unrelated_rtk()
+
+    result = powershell_harness.run("-Rtk")
+
+    assert result.returncode != 0
+    assert "not a compatible Rust Token Killer installation" in result.stderr
+    assert not any("rtk-ai/rtk" in call for call in powershell_harness.calls())
+    assert not any("astral.sh" in call for call in powershell_harness.calls())
+
+
+def test_install_ps1_rtk_dry_run_prints_install_and_agent_setup(
+    powershell_harness: PowerShellHarness,
+) -> None:
+    result = powershell_harness.run("-Rtk", "-DryRun")
+
+    assert result.returncode == 0, result.stderr
+    assert powershell_harness.calls() == []
+    assert "releases/download/v0.44.2/rtk-x86_64-pc-windows-msvc.zip" in result.stdout
+    assert "RTK_TELEMETRY_DISABLED=1 rtk init --global --auto-patch" in result.stdout
+    assert "RTK_TELEMETRY_DISABLED=1 rtk init --global --codex" in result.stdout
+    assert "RTK_TELEMETRY_DISABLED=1 rtk init --global --agent pi" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "powershell",
+    _powershells() or (None,),
+    ids=lambda path: Path(path).name if path is not None else "unavailable",
+)
+@pytest.mark.parametrize("valid_checksum", [True, False])
+def test_install_ps1_installs_only_checksum_verified_rtk_archive(
+    powershell: str | None,
+    tmp_path: Path,
+    valid_checksum: bool,
+) -> None:
+    if powershell is None or os.name != "nt":
+        pytest.skip("PowerShell RTK archive installation runs on Windows hosts")
+
+    asset_name = "rtk-x86_64-pc-windows-msvc.zip"
+    archive_path = tmp_path / asset_name
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("rtk.exe", b"verified RTK executable")
+    checksum = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    if not valid_checksum:
+        checksum = "0" * 64
+
+    installer = (_repo_root() / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    format_argument = _braced_body(installer, "function Format-Argument")
+    install_rtk = _braced_body(installer, "function Install-Rtk")
+    script = f"""Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$DryRun = $false
+$RtkReleaseBaseUrl = "https://example.test/releases/download/v0.44.2"
+$RtkWindowsAssetName = "{asset_name}"
+$RtkWindowsAssetSha256 = "{checksum}"
+function Format-Argument {{{format_argument}}}
+function Invoke-RestMethod {{
+    [CmdletBinding()]
+    param([string] $Uri, [string] $OutFile)
+    Copy-Item -LiteralPath $env:RTK_TEST_ARCHIVE -Destination $OutFile
+}}
+function Install-Rtk {{{install_rtk}}}
+Install-Rtk
+"""
+    home = tmp_path / "home"
+    home.mkdir()
+    env = os.environ | {
+        "USERPROFILE": str(home),
+        "RTK_TEST_ARCHIVE": str(archive_path),
+    }
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-Command", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    installed = home / ".local" / "bin" / "rtk.exe"
+    if valid_checksum:
+        assert result.returncode == 0, result.stderr
+        assert installed.read_bytes() == b"verified RTK executable"
+    else:
+        assert result.returncode != 0
+        assert "checksum verification failed" in result.stderr
+        assert not installed.exists()
 
 
 def test_install_ps1_stops_if_windows_icon_export_fails(
@@ -1237,6 +2519,9 @@ def test_install_ps1_preserves_valid_existing_tools(
     powershell_harness.add_client("claude")
     powershell_harness.add_client("codex")
     powershell_harness.add_client("pi")
+    powershell_harness.add_client("cline")
+    powershell_harness.add_client("hermes")
+    powershell_harness.add_client("grok")
     powershell_harness.add_uv(uv_version)
 
     result = powershell_harness.run()
@@ -1375,6 +2660,11 @@ def test_install_ps1_replaces_prerelease_uv(
         "pi-download",
         "pi-install",
         "pi-verify",
+        "opencode-download",
+        "opencode-archive",
+        "opencode-verify",
+        "cline-install",
+        "cline-verify",
         "uv-download",
         "uv-install",
         "uv-verify",
@@ -1388,6 +2678,8 @@ def test_install_ps1_stops_without_success_on_each_failure(
     powershell_harness: PowerShellHarness,
     failure: str,
 ) -> None:
+    if failure in {"opencode-download", "opencode-archive"}:
+        (powershell_harness.bin_dir / "opencode.cmd").unlink()
     result = powershell_harness.run(fail_step=failure)
 
     assert result.returncode != 0
@@ -1402,6 +2694,11 @@ def test_install_ps1_stops_without_success_on_each_failure(
         "pi-download": "pi-install",
         "pi-install": "pi:--version",
         "pi-verify": "astral.sh",
+        "opencode-download": "uv-install",
+        "opencode-archive": "uv-install",
+        "opencode-verify": "astral.sh",
+        "cline-install": "cline:--version",
+        "cline-verify": "astral.sh",
         "uv-download": "uv-install",
         "uv-install": "uv:--version",
         "uv-verify": "uv:tool install",
@@ -1416,21 +2713,7 @@ def test_install_ps1_stops_without_success_on_each_failure(
 def test_install_ps1_dry_run_never_executes_commands(
     powershell_harness: PowerShellHarness,
 ) -> None:
-    result = subprocess.run(
-        [
-            powershell_harness.powershell,
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(_repo_root() / "scripts" / "install.ps1"),
-            "-DryRun",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=powershell_harness.env,
-    )
+    result = powershell_harness.run("-DryRun")
 
     assert result.returncode == 0, result.stderr
     assert powershell_harness.calls() == []
@@ -1543,16 +2826,270 @@ def test_installers_use_native_clients_and_single_python_selection() -> None:
 
     assert "https://pi.dev/install.sh" in shell
     assert "https://pi.dev/install.ps1" in powershell
+    assert "https://x.ai/cli/install.sh" in shell
+    assert "https://x.ai/cli/install.ps1" in powershell
+    assert "https://dev.meta.ai/install.sh" in shell
+    assert "dev.meta.ai" not in powershell
+    assert "muse-code/channels" not in powershell
 
 
-def test_readme_install_section_has_no_manual_git_prerequisite() -> None:
-    readme = (_repo_root() / "README.md").read_text(encoding="utf-8")
-    install_section = readme.split("### 1. Install Or Update", 1)[1].split(
-        "### 2. Start FCC", 1
-    )[0]
+def test_install_ps1_uses_x64_python_for_windows_arm_compatibility() -> None:
+    powershell = (_repo_root() / "scripts" / "install.ps1").read_text(encoding="utf-8")
 
-    assert "Install Git" not in install_section
-    assert "official native installers" not in install_section
+    assert '$PythonRequest = "cpython-3.14.0-windows-x86_64-none"' in powershell
+
+
+@pytest.mark.parametrize("powershell", _powershells())
+def test_install_ps1_rejects_invalid_download_before_execution(
+    powershell: str,
+) -> None:
+    text = (_repo_root() / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    body = _braced_body(text, "function Invoke-DownloadedPowerShellInstaller")
+    script = f"""Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$DryRun = $false
+function Format-Argument {{ param([string] $Value) return $Value }}
+function Invoke-RestMethod {{
+    [CmdletBinding()]
+    param([string] $Uri, [string] $OutFile)
+    [IO.File]::WriteAllText($OutFile, "<style>div#box {{")
+}}
+function Get-PowerShellExecutable {{ throw "invalid installer reached execution" }}
+function Invoke-DownloadedPowerShellInstaller {{{body}}}
+Invoke-DownloadedPowerShellInstaller `
+    -Url "https://example.test/install.ps1" `
+    -Name "Example"
+"""
+
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-Command", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert (
+        "Example installer from 'https://example.test/install.ps1' is not valid PowerShell"
+        in result.stderr
+    )
+    assert "network proxy or filter" in result.stderr
+    assert "invalid installer reached execution" not in result.stderr
+
+
+@pytest.mark.parametrize("powershell", _powershells())
+@pytest.mark.parametrize(
+    ("answers", "expected", "expected_messages"),
+    [
+        (
+            ("", "", "", "", "", "", "", "", "", ""),
+            "True,True,True,True,False,True,True,True,True,False",
+            (),
+        ),
+        (
+            (
+                "maybe",
+                "n",
+                "n",
+                "n",
+                "n",
+                "n",
+                "n",
+                "n",
+                "n",
+                "n",
+                "n",
+                "y",
+                "n",
+                "n",
+                "n",
+                "n",
+                "n",
+                "n",
+                "n",
+                "y",
+            ),
+            "False,True,False,False,False,False,False,False,False,True",
+            ("Please answer Y or N.", "Select at least one coding agent."),
+        ),
+    ],
+)
+def test_install_ps1_selects_at_least_one_coding_agent(
+    powershell: str,
+    answers: tuple[str, ...],
+    expected: str,
+    expected_messages: tuple[str, ...],
+) -> None:
+    text = (_repo_root() / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    read_yes_no = _braced_body(text, "function Read-YesNo")
+    select_agents = _braced_body(text, "function Select-CodingAgents")
+    answer_array = ", ".join(repr(answer) for answer in answers)
+    script = f"""Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$script:Answers = @({answer_array})
+$script:AnswerIndex = 0
+$script:InstallClaudeCode = $true
+$script:InstallCodex = $true
+$script:InstallPi = $true
+$script:InstallOpenCode = $true
+$script:InstallCline = $false
+$script:InstallHermes = $true
+$script:InstallDsh = $true
+$script:InstallGrok = $true
+$script:InstallMuse = $true
+$script:EnableRtk = $false
+function Read-Host {{
+    param([string] $Prompt)
+    $answer = $script:Answers[$script:AnswerIndex]
+    $script:AnswerIndex += 1
+    return $answer
+}}
+function Read-YesNo {{{read_yes_no}}}
+function Select-CodingAgents {{{select_agents}}}
+Select-CodingAgents
+Write-Output "selection:$($script:InstallClaudeCode),$($script:InstallCodex),$($script:InstallPi),$($script:InstallOpenCode),$($script:InstallCline),$($script:InstallHermes),$($script:InstallDsh),$($script:InstallGrok),$($script:InstallMuse),$($script:EnableRtk)"
+"""
+
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-Command", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"selection:{expected}" in result.stdout
+    for message in expected_messages:
+        assert message in result.stdout
+
+
+@pytest.mark.parametrize("powershell", _powershells())
+def test_install_ps1_runs_only_selected_coding_agents(powershell: str) -> None:
+    text = (_repo_root() / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    body = _braced_body(text, "function Ensure-SelectedCodingAgents")
+    script = f"""Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$script:InstallClaudeCode = $false
+$script:InstallCodex = $true
+$script:InstallPi = $false
+$script:InstallOpenCode = $false
+$script:InstallCline = $false
+$script:InstallHermes = $false
+$script:InstallDsh = $false
+$script:InstallGrok = $false
+$script:InstallMuse = $false
+$script:PiAvailable = $false
+$script:MuseAvailable = $false
+$script:Calls = @()
+function Write-Step {{ param([string] $Message) }}
+function Ensure-ClaudeCode {{ $script:Calls += "claude" }}
+function Ensure-Codex {{ $script:Calls += "codex" }}
+function Ensure-Pi {{ $script:Calls += "pi"; $script:PiAvailable = $true }}
+function Ensure-OpenCode {{ $script:Calls += "opencode" }}
+function Ensure-Cline {{ $script:Calls += "cline" }}
+function Ensure-Hermes {{ $script:Calls += "hermes" }}
+function Ensure-Dsh {{ $script:Calls += "dsh" }}
+function Ensure-Grok {{ $script:Calls += "grok" }}
+function Ensure-Muse {{ $script:Calls += "muse"; $script:MuseAvailable = $true }}
+function Ensure-SelectedCodingAgents {{{body}}}
+Ensure-SelectedCodingAgents
+Write-Output "calls:$($script:Calls -join ',')"
+"""
+
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-Command", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "calls:codex" in result.stdout
+
+
+@pytest.mark.parametrize("powershell", _powershells())
+def test_install_ps1_configures_rtk_only_for_available_selected_agents(
+    powershell: str,
+) -> None:
+    text = (_repo_root() / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    body = _braced_body(text, "function Configure-RtkForSelectedAgents")
+    script = f"""Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$script:EnableRtk = $true
+$script:InstallClaudeCode = $false
+$script:InstallCodex = $true
+$script:InstallPi = $true
+$script:InstallOpenCode = $false
+$script:InstallCline = $false
+$script:InstallHermes = $false
+$script:InstallDsh = $false
+$script:InstallGrok = $false
+$script:InstallMuse = $false
+$script:PiAvailable = $false
+$script:MuseAvailable = $false
+$script:Calls = @()
+function Write-Step {{ param([string] $Message) }}
+function Ensure-Rtk {{ $script:Calls += "ensure" }}
+function Invoke-RtkCommand {{
+    param([string[]] $Arguments)
+    $script:Calls += ($Arguments -join " ")
+}}
+function Configure-RtkForSelectedAgents {{{body}}}
+Configure-RtkForSelectedAgents
+Write-Output "calls:$($script:Calls -join ',')"
+"""
+
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-Command", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "calls:ensure,init --global --codex" in result.stdout
+
+
+@pytest.mark.parametrize("powershell", _powershells())
+def test_install_ps1_rejects_uninstalled_only_selection(powershell: str) -> None:
+    text = (_repo_root() / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    body = _braced_body(text, "function Ensure-SelectedCodingAgents")
+    script = f"""Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$script:InstallClaudeCode = $false
+$script:InstallCodex = $false
+$script:InstallPi = $true
+$script:InstallOpenCode = $false
+$script:InstallCline = $false
+$script:InstallHermes = $false
+$script:InstallDsh = $false
+$script:InstallGrok = $false
+$script:InstallMuse = $false
+$script:PiAvailable = $false
+$script:MuseAvailable = $false
+function Write-Step {{ param([string] $Message) }}
+function Ensure-ClaudeCode {{ }}
+function Ensure-Codex {{ }}
+function Ensure-Pi {{ }}
+function Ensure-OpenCode {{ }}
+function Ensure-Cline {{ }}
+function Ensure-Hermes {{ }}
+function Ensure-Dsh {{ }}
+function Ensure-Grok {{ }}
+function Ensure-Muse {{ }}
+function Ensure-SelectedCodingAgents {{{body}}}
+Ensure-SelectedCodingAgents
+"""
+
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-Command", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "No selected coding agent was installed." in result.stderr
 
 
 @pytest.mark.parametrize("powershell", _powershells())

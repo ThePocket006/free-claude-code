@@ -4,27 +4,27 @@ build-backend = "hatchling.build"
 
 [project]
 name = "free-claude-code"
-version = "4.13.1"
+version = "5.14.0"
 description = "Local proxy connecting coding agents to OpenAI-compatible AI providers"
 readme = "README.md"
 requires-python = ">=3.14.0"
 dependencies = [
-    "fastapi[standard]>=0.139.2",
-    "uvicorn>=0.51.0",
+    "fastapi[standard]>=0.141.1",
+    "uvicorn>=0.52.1",
     "httpx[socks]>=0.28.1",
+    "httpx2[socks]>=2.7.0,<3",
     "markdown-it-py>=4.2.0",
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
     "tiktoken>=0.13.0",
     "python-telegram-bot>=22.8",
     "discord.py>=2.7.1",
-    "pydantic-settings>=2.14.2",
-    "openai>=2.46.0",
+    "openai>=3.2.0",
     "loguru>=0.7.0",
-    "aiohttp>=3.14.1",
+    "aiohttp>=3.14.3",
     "jsonschema>=4.25.0",
-    "google-auth[requests]>=2.40.0",
-    "requests[socks]>=2.32.0",
+    "google-auth[requests]>=2.56.3",
+    "requests[socks]>=2.34.2",
     "pystray>=0.19.5; sys_platform == 'win32' or sys_platform == 'darwin'",
     "Pillow>=12.0.0; sys_platform == 'win32' or sys_platform == 'darwin'",
 ]
@@ -34,28 +34,31 @@ fcc-server = "free_claude_code.cli.entrypoints:serve"
 fcc-claude = "free_claude_code.cli.launchers.claude:launch"
 fcc-codex = "free_claude_code.cli.launchers.codex:launch"
 fcc-pi = "free_claude_code.cli.launchers.pi:launch"
+fcc-opencode = "free_claude_code.cli.launchers.opencode:launch"
+fcc-cline = "free_claude_code.cli.launchers.cline:launch"
+fcc-hermes = "free_claude_code.cli.launchers.hermes:launch"
+fcc-dsh = "free_claude_code.cli.launchers.dsh:launch"
+fcc-grok = "free_claude_code.cli.launchers.grok:launch"
+fcc-muse = "free_claude_code.cli.launchers.muse:launch"
 
 [project.gui-scripts]
 fcc-desktop = "free_claude_code.cli.desktop_entrypoint:launch"
 
 [project.optional-dependencies]
 voice = [
-    "grpcio>=1.82.1",
+    "grpcio>=1.83.0",
     "grpcio-tools>=1.81.1",
     "nvidia-riva-client>=2.26.0",
 ]
 voice_local = [
     "torch>=2.13.0",
-    "transformers>=5.14.1",
+    "transformers>=5.15.0",
     "accelerate>=1.14.0",
-    "librosa>=0.10.0",
+    "librosa>=1.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/free_claude_code"]
-
-[tool.hatch.build.targets.wheel.force-include]
-".env.example" = "free_claude_code/config/env.example"
 
 [tool.uv]
 required-version = ">=0.11.16"
@@ -73,9 +76,10 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
-    "ty>=0.0.60",
-    "ruff>=0.15.22",
+    "ty>=0.0.70",
+    "ruff>=0.16.2",
     "pytest-xdist>=3.8.0",
+    "pytest-playwright>=0.9.0",
 ]
 
 [tool.ruff]
@@ -113,6 +117,7 @@ skip-magic-trailing-comma = false
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 addopts = "-n auto"
+filterwarnings = ["error"]
 testpaths = ["tests"]
 markers = [
     "live: opt-in local smoke tests that can touch real services",

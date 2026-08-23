@@ -6,13 +6,13 @@ from unittest.mock import AsyncMock, patch
 
 import openai
 import pytest
-from httpx import Request, Response
+from httpx2 import Request, Response
 
 from free_claude_code.core.anthropic import ReasoningReplayMode
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
-from free_claude_code.providers.base import ProviderConfig
+from free_claude_code.providers.admission import ProviderOperationKind
 from free_claude_code.providers.openai_chat import (
     OpenAIChatProfile,
     OpenAIChatProvider,
@@ -26,13 +26,16 @@ from free_claude_code.providers.openai_chat.usage import (
     usage_int,
 )
 from tests.providers.request_factory import make_messages_request
-from tests.providers.support import immediate_admission
+from tests.providers.support import (
+    immediate_admission,
+    make_provider_config,
+)
 
 
 class _UsageTestProvider(OpenAIChatProvider):
     def __init__(self):
         super().__init__(
-            ProviderConfig(
+            make_provider_config(
                 api_key="test_key",
                 base_url="https://provider.example/v1",
                 rate_limit=100,
@@ -250,7 +253,8 @@ async def test_openai_chat_stream_retries_without_usage_when_option_is_rejected(
     with patch.object(provider._client.chat.completions, "create", create):
         _stream_obj, used_body, attempt = await provider._create_stream(
             body,
-            provider._admission.new_retry_session(),
+            provider._admission.start_execution(),
+            ProviderOperationKind.GENERATION,
         )
         await attempt.aclose()
 

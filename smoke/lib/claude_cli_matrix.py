@@ -13,6 +13,7 @@ from typing import Any
 from free_claude_code.cli.claude_env import build_claude_proxy_env
 from smoke.lib.child_process import run_captured_text
 from smoke.lib.config import ProviderModel, SmokeConfig, redacted
+from smoke.lib.outcomes import is_upstream_unavailable_text
 from smoke.lib.server import RunningServer
 
 REGRESSION_CLASSIFICATIONS = frozenset({"harness_bug", "product_failure"})
@@ -20,26 +21,6 @@ REGRESSION_CLASSIFICATIONS = frozenset({"harness_bug", "product_failure"})
 _HTTP_REGRESSION_PATTERNS = (
     r'POST /v1/messages[^"\n]* HTTP/1\.1" 4(?!01|03|04|08|09)\d\d',
     r'POST /v1/messages[^"\n]* HTTP/1\.1" 5\d\d',
-)
-_UPSTREAM_UNAVAILABLE_MARKERS = (
-    "upstream_unavailable",
-    "readtimeout",
-    "connecterror",
-    "connection refused",
-    "timed out",
-    "rate limit",
-    "overloaded",
-    "capacity",
-    "upstream provider",
-    "provider api request failed",
-    "httpstatuserror",
-)
-_HTTP_429_PATTERNS = (
-    r'HTTP/1\.[01]" 429\b',
-    r"\bHTTP/1\.[01] 429\b",
-    r"\bstatus_code=429\b",
-    r"\bstatus[=:]\s*429\b",
-    r"\b429 Too Many Requests\b",
 )
 _MISSING_ENV_MARKERS = (
     "api key",
@@ -100,6 +81,7 @@ def run_claude_cli(
     session_id: str | None = None,
     resume_session_id: str | None = None,
     no_session_persistence: bool = True,
+    auto_mode: bool = False,
 ) -> ClaudeCliRun:
     """Run Claude Code CLI against the local smoke proxy."""
     cwd.mkdir(parents=True, exist_ok=True)
@@ -115,12 +97,13 @@ def run_claude_cli(
             session_id=session_id,
             resume_session_id=resume_session_id,
             no_session_persistence=no_session_persistence,
+            auto_mode=auto_mode,
         )
     )
 
     env = build_claude_proxy_env(
         proxy_root_url=server.base_url,
-        auth_token=config.settings.anthropic_auth_token,
+        auth_token=config.settings.proxy_auth_token,
         base_env=os.environ,
     )
     env["TERM"] = "dumb"
@@ -166,6 +149,7 @@ def _build_claude_cli_command(
     session_id: str | None = None,
     resume_session_id: str | None = None,
     no_session_persistence: bool = True,
+    auto_mode: bool = False,
 ) -> tuple[str, ...]:
     cmd: list[str] = [claude_bin]
     if bare:
@@ -181,8 +165,13 @@ def _build_claude_cli_command(
             "--include-partial-messages",
             "--verbose",
             "--permission-mode",
-            "bypassPermissions",
-            "--dangerously-skip-permissions",
+            "auto" if auto_mode else "bypassPermissions",
+        ]
+    )
+    if not auto_mode:
+        cmd.append("--dangerously-skip-permissions")
+    cmd.extend(
+        [
             "--model",
             "sonnet",
         ]
@@ -192,7 +181,7 @@ def _build_claude_cli_command(
     cmd.extend(pre_tool_args)
     if tools is not None:
         cmd.extend(["--tools", tools])
-        if tools:
+        if tools and not auto_mode:
             cmd.extend(["--allowedTools", tools])
     cmd.extend(extra_args)
     cmd.extend(["-p", prompt])
@@ -320,7 +309,7 @@ def classify_probe(
 
     if cli_ok and marker_ok and tool_ok and agent_ok and task_ok and compact_ok:
         return "passed", "passed"
-    if _has_upstream_unavailable_text(combined):
+    if is_upstream_unavailable_text(combined):
         return "failed", "upstream_unavailable"
     if not _has_proxy_request(log_delta):
         return "failed", "harness_bug"
@@ -746,15 +735,6 @@ def _agent_tool_count(text: str) -> int:
 
 def _agent_result_count(text: str) -> int:
     return text.count("agentId:") + text.count('"agentId"') + text.count("'agentId'")
-
-
-def _has_upstream_unavailable_text(text: str) -> bool:
-    lower = text.lower()
-    if any(marker_text in lower for marker_text in _UPSTREAM_UNAVAILABLE_MARKERS):
-        return True
-    return any(
-        re.search(pattern, text, flags=re.IGNORECASE) for pattern in _HTTP_429_PATTERNS
-    )
 
 
 def _request_count(log_delta: str) -> int:

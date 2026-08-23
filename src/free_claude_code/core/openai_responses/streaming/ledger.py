@@ -3,8 +3,15 @@
 from collections.abc import Mapping
 from typing import Any
 
-from ..usage import estimate_text_tokens
+from free_claude_code.core.token_estimation import estimate_text_tokens
+
 from .blocks import BlockState
+
+_ANTHROPIC_INPUT_TOKEN_FIELDS = (
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
 
 
 class ResponsesOutputLedger:
@@ -14,7 +21,7 @@ class ResponsesOutputLedger:
         self._output_slots: list[dict[str, Any] | None] = []
         self._active_blocks: dict[int, BlockState] = {}
         self._fallback_text_index = -1
-        self._input_tokens: int | None = None
+        self._input_token_counts: dict[str, int] = {}
         self._output_tokens: int | None = None
         self._reasoning_tokens_estimate = 0
 
@@ -51,8 +58,10 @@ class ResponsesOutputLedger:
         usage = data.get("usage")
         if not isinstance(usage, dict):
             return
-        if isinstance(usage.get("input_tokens"), int):
-            self._input_tokens = usage["input_tokens"]
+        for field in _ANTHROPIC_INPUT_TOKEN_FIELDS:
+            value = usage.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                self._input_token_counts[field] = value
         if isinstance(usage.get("output_tokens"), int):
             self._output_tokens = usage["output_tokens"]
 
@@ -60,20 +69,23 @@ class ResponsesOutputLedger:
         self._reasoning_tokens_estimate += estimate_text_tokens(text)
 
     def usage(self) -> dict[str, Any] | None:
-        if self._input_tokens is None and self._output_tokens is None:
+        if not self._input_token_counts and self._output_tokens is None:
             return None
-        input_tokens = self._input_tokens or 0
+        input_tokens = sum(self._input_token_counts.values())
         output_tokens = self._output_tokens or 0
         usage: dict[str, Any] = {
             "input_tokens": input_tokens,
+            "input_tokens_details": {
+                "cached_tokens": self._input_token_counts.get(
+                    "cache_read_input_tokens", 0
+                )
+            },
             "output_tokens": output_tokens,
+            "output_tokens_details": {
+                "reasoning_tokens": min(self._reasoning_tokens_estimate, output_tokens)
+            },
             "total_tokens": input_tokens + output_tokens,
         }
-        capped_reasoning_tokens = min(self._reasoning_tokens_estimate, output_tokens)
-        if capped_reasoning_tokens:
-            usage["output_tokens_details"] = {
-                "reasoning_tokens": capped_reasoning_tokens
-            }
         return usage
 
     def safe_text_index(self, index: int | None) -> int:

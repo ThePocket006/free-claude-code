@@ -8,12 +8,28 @@ from free_claude_code.config.provider_catalog import (
 _EXPECTED_PROVIDER_ORDER: tuple[str, ...] = (
     "nvidia_nim",
     "open_router",
+    "groq",
+    "cline_pass",
+    "openai",
+    "xai",
+    "qwencloud",
+    "qwencloud_coding",
+    "together",
+    "deepinfra",
+    "siliconflow",
+    "nebius",
+    "chutes",
+    "featherless",
+    "agnes",
+    "zenmux",
+    "wandb",
+    "azure_openai",
     "gemini",
     "vertex",
     "deepseek",
     "mistral",
     "mistral_codestral",
-    "opencode",
+    "opencode_zen",
     "opencode_go",
     "vercel",
     "bedrock",
@@ -23,13 +39,18 @@ _EXPECTED_PROVIDER_ORDER: tuple[str, ...] = (
     "wafer",
     "kimi",
     "kimi_code",
+    "kilo",
     "minimax",
     "cerebras",
-    "groq",
     "sambanova",
     "fireworks",
+    "novita",
     "cloudflare",
     "zai",
+    "zai_api",
+    "tokenrouter",
+    "nararoute",
+    "poolside",
     "ollama_cloud",
     "lmstudio",
     "llamacpp",
@@ -38,7 +59,7 @@ _EXPECTED_PROVIDER_ORDER: tuple[str, ...] = (
 
 
 def test_provider_catalog_key_order_matches_canonical_plan() -> None:
-    """NIM first; OpenCode pair stays adjacent; gateways precede native remotes."""
+    """Lead with NIM, OpenRouter, and Groq while preserving catalog groupings."""
 
     assert tuple(PROVIDER_CATALOG.keys()) == _EXPECTED_PROVIDER_ORDER
     assert SUPPORTED_PROVIDER_IDS == _EXPECTED_PROVIDER_ORDER

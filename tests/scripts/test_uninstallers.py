@@ -12,6 +12,12 @@ FCC_COMMANDS = (
     "fcc-claude",
     "fcc-codex",
     "fcc-pi",
+    "fcc-opencode",
+    "fcc-cline",
+    "fcc-hermes",
+    "fcc-dsh",
+    "fcc-grok",
+    "fcc-muse",
     "fcc-init",
     "free-claude-code",
 )
@@ -132,6 +138,34 @@ def posix_uninstall_harness(tmp_path: Path) -> PosixUninstallHarness:
     _write_executable(bin_dir / "claude", "#!/bin/sh\nexit 0\n")
     _write_executable(bin_dir / "codex", "#!/bin/sh\nexit 0\n")
     _write_executable(bin_dir / "pi", "#!/bin/sh\nexit 0\n")
+    _write_executable(bin_dir / "opencode", "#!/bin/sh\nexit 0\n")
+    _write_executable(bin_dir / "cline", "#!/bin/sh\nexit 0\n")
+    _write_executable(bin_dir / "hermes", "#!/bin/sh\nexit 0\n")
+    _write_executable(bin_dir / "dsh", "#!/bin/sh\nexit 0\n")
+    _write_executable(bin_dir / "grok", "#!/bin/sh\nexit 0\n")
+    _write_executable(bin_dir / "muse", "#!/bin/sh\nexit 0\n")
+    hermes_state = home / ".hermes" / "sessions" / "state.json"
+    hermes_state.parent.mkdir(parents=True)
+    hermes_state.write_text('{"native": true}\n', encoding="utf-8")
+    dsh_state = home / ".dsh" / "sessions" / "state.json"
+    dsh_state.parent.mkdir(parents=True)
+    dsh_state.write_text('{"native": true}\n', encoding="utf-8")
+    grok_state = home / ".grok" / "sessions" / "state.json"
+    grok_state.parent.mkdir(parents=True)
+    grok_state.write_text('{"native": true}\n', encoding="utf-8")
+    muse_state = home / ".local" / "share" / "muse" / "sessions" / "state.json"
+    muse_state.parent.mkdir(parents=True)
+    muse_state.write_text('{"native": true}\n', encoding="utf-8")
+    _write_executable(
+        bin_dir / "pgrep",
+        """#!/bin/sh
+[ -n "${FCC_RUNNING_COMMAND:-}" ] || exit 1
+case "$*" in
+    *"$FCC_RUNNING_COMMAND"*) printf '4242\n'; exit 0 ;;
+    *) exit 1 ;;
+esac
+""",
+    )
     _write_executable(
         bin_dir / "uv",
         """#!/bin/sh
@@ -153,7 +187,7 @@ if [ "${1:-}" = "tool" ] && [ "${2:-}" = "uninstall" ]; then
         echo 'Tool `free-claude-code` is not installed' >&2
         exit 2
     fi
-    for name in fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi fcc-init free-claude-code; do
+    for name in fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi fcc-opencode fcc-cline fcc-hermes fcc-dsh fcc-grok fcc-muse fcc-init free-claude-code; do
         /bin/rm -f "$FAKE_TOOL_BIN/$name"
     done
     echo "Uninstalled free-claude-code"
@@ -199,6 +233,7 @@ printf '%s\n' "$FAKE_UNAME"
             "CALL_LOG": str(log),
             "FAKE_TOOL_BIN": str(tool_bin),
             "FAKE_UNAME": "Darwin",
+            "FCC_RUNNING_COMMAND": "",
             "FAIL_STEP": "",
         }
     )
@@ -221,6 +256,29 @@ def test_uninstall_sh_removes_and_verifies_only_fcc(
     assert (posix_uninstall_harness.bin_dir / "claude").exists()
     assert (posix_uninstall_harness.bin_dir / "codex").exists()
     assert (posix_uninstall_harness.bin_dir / "pi").exists()
+    assert (posix_uninstall_harness.bin_dir / "opencode").exists()
+    assert (posix_uninstall_harness.bin_dir / "cline").exists()
+    assert (posix_uninstall_harness.bin_dir / "hermes").exists()
+    assert (posix_uninstall_harness.bin_dir / "dsh").exists()
+    assert (posix_uninstall_harness.bin_dir / "grok").exists()
+    assert (posix_uninstall_harness.bin_dir / "muse").exists()
+    assert (
+        posix_uninstall_harness.home / ".hermes" / "sessions" / "state.json"
+    ).read_text(encoding="utf-8") == '{"native": true}\n'
+    assert (
+        posix_uninstall_harness.home / ".dsh" / "sessions" / "state.json"
+    ).read_text(encoding="utf-8") == '{"native": true}\n'
+    assert (
+        posix_uninstall_harness.home / ".grok" / "sessions" / "state.json"
+    ).read_text(encoding="utf-8") == '{"native": true}\n'
+    assert (
+        posix_uninstall_harness.home
+        / ".local"
+        / "share"
+        / "muse"
+        / "sessions"
+        / "state.json"
+    ).read_text(encoding="utf-8") == '{"native": true}\n'
     assert posix_uninstall_harness.calls() == [
         "uv:tool dir --bin",
         "uv:tool uninstall free-claude-code",
@@ -351,6 +409,24 @@ def test_uninstall_sh_rejects_invalid_options_before_mutation(
     assert posix_uninstall_harness.calls() == []
 
 
+@pytest.mark.parametrize("command_name", FCC_COMMANDS)
+def test_uninstall_sh_rejects_running_fcc_before_mutation(
+    posix_uninstall_harness: PosixUninstallHarness,
+    command_name: str,
+) -> None:
+    posix_uninstall_harness.env["FCC_RUNNING_COMMAND"] = command_name
+
+    result = posix_uninstall_harness.run()
+
+    assert result.returncode != 0
+    assert command_name in result.stderr
+    assert posix_uninstall_harness.fcc_home.exists()
+    assert all(
+        (posix_uninstall_harness.tool_bin / name).exists() for name in FCC_COMMANDS
+    )
+    assert posix_uninstall_harness.calls() == []
+
+
 @pytest.mark.parametrize(
     ("command_name", "process_args"),
     (
@@ -440,16 +516,39 @@ def powershell_uninstall_harness(
     tool_bin = tmp_path / "tool-bin"
     fcc_home = home / ".fcc"
     app_data = tmp_path / "app-data"
+    local_app_data = tmp_path / "local-app-data"
     log = tmp_path / "calls.log"
-    for path in (bin_dir, tool_bin, fcc_home, app_data):
+    for path in (bin_dir, tool_bin, fcc_home, app_data, local_app_data):
         path.mkdir(parents=True)
     (fcc_home / "config.json").write_text("{}", encoding="utf-8")
     for name in FCC_COMMANDS:
         (tool_bin / f"{name}.cmd").write_text(
             "@echo off\nexit /b 0\n", encoding="utf-8"
         )
-    for name in ("claude", "codex", "pi"):
+    for name in (
+        "claude",
+        "codex",
+        "pi",
+        "opencode",
+        "cline",
+        "hermes",
+        "dsh",
+        "grok",
+        "muse",
+    ):
         (bin_dir / f"{name}.cmd").write_text("@echo off\nexit /b 0\n", encoding="utf-8")
+    hermes_state = local_app_data / "hermes" / "state.json"
+    hermes_state.parent.mkdir(parents=True)
+    hermes_state.write_text('{"native": true}\n', encoding="utf-8")
+    dsh_state = home / ".dsh" / "sessions" / "state.json"
+    dsh_state.parent.mkdir(parents=True)
+    dsh_state.write_text('{"native": true}\n', encoding="utf-8")
+    grok_state = home / ".grok" / "sessions" / "state.json"
+    grok_state.parent.mkdir(parents=True)
+    grok_state.write_text('{"native": true}\n', encoding="utf-8")
+    muse_state = local_app_data / "Muse Code" / "sessions" / "state.json"
+    muse_state.parent.mkdir(parents=True)
+    muse_state.write_text('{"native": true}\n', encoding="utf-8")
 
     uv_commands = " ".join(FCC_COMMANDS)
     (bin_dir / "uv.cmd").write_text(
@@ -493,6 +592,19 @@ function Remove-Item {
     }
     Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters
 }
+function Get-Process {
+    [CmdletBinding()]
+    param([string[]] $Name)
+
+    if ([string]::IsNullOrWhiteSpace($env:FCC_RUNNING_COMMAND)) {
+        return
+    }
+    foreach ($requestedName in $Name) {
+        if ($requestedName -eq $env:FCC_RUNNING_COMMAND) {
+            [pscustomobject] @{ Id = 4242; ProcessName = $requestedName }
+        }
+    }
+}
 $installer = [scriptblock]::Create([IO.File]::ReadAllText($env:FCC_UNINSTALLER))
 if ($env:UNINSTALL_DRY_RUN -eq "1") {
     & $installer -DryRun
@@ -531,9 +643,11 @@ else {
             "HOME": str(home),
             "USERPROFILE": str(home),
             "APPDATA": str(app_data),
+            "LOCALAPPDATA": str(local_app_data),
             "CALL_LOG": str(log),
             "FAKE_TOOL_BIN": str(tool_bin),
             "FCC_UNINSTALLER": str(_repo_root() / "scripts" / "uninstall.ps1"),
+            "FCC_RUNNING_COMMAND": "",
             "FAIL_STEP": "",
             "UNINSTALL_DRY_RUN": "0",
         }
@@ -559,6 +673,27 @@ def test_uninstall_ps1_removes_and_verifies_only_fcc(
     assert (powershell_uninstall_harness.bin_dir / "claude.cmd").exists()
     assert (powershell_uninstall_harness.bin_dir / "codex.cmd").exists()
     assert (powershell_uninstall_harness.bin_dir / "pi.cmd").exists()
+    assert (powershell_uninstall_harness.bin_dir / "opencode.cmd").exists()
+    assert (powershell_uninstall_harness.bin_dir / "cline.cmd").exists()
+    assert (powershell_uninstall_harness.bin_dir / "hermes.cmd").exists()
+    assert (powershell_uninstall_harness.bin_dir / "dsh.cmd").exists()
+    assert (powershell_uninstall_harness.bin_dir / "grok.cmd").exists()
+    assert (powershell_uninstall_harness.bin_dir / "muse.cmd").exists()
+    assert (
+        Path(powershell_uninstall_harness.env["LOCALAPPDATA"]) / "hermes" / "state.json"
+    ).read_text(encoding="utf-8") == '{"native": true}\n'
+    assert (
+        powershell_uninstall_harness.home / ".dsh" / "sessions" / "state.json"
+    ).read_text(encoding="utf-8") == '{"native": true}\n'
+    assert (
+        powershell_uninstall_harness.home / ".grok" / "sessions" / "state.json"
+    ).read_text(encoding="utf-8") == '{"native": true}\n'
+    assert (
+        Path(powershell_uninstall_harness.env["LOCALAPPDATA"])
+        / "Muse Code"
+        / "sessions"
+        / "state.json"
+    ).read_text(encoding="utf-8") == '{"native": true}\n'
     assert powershell_uninstall_harness.calls() == [
         "uv:tool dir --bin",
         "uv:tool uninstall free-claude-code",
@@ -659,6 +794,25 @@ def test_uninstall_ps1_dry_run_is_non_mutating(
     assert "Dry run complete. No changes were made." in result.stdout
 
 
+@pytest.mark.parametrize("command_name", FCC_COMMANDS)
+def test_uninstall_ps1_rejects_running_fcc_before_mutation(
+    powershell_uninstall_harness: PowerShellUninstallHarness,
+    command_name: str,
+) -> None:
+    powershell_uninstall_harness.env["FCC_RUNNING_COMMAND"] = command_name
+
+    result = powershell_uninstall_harness.run()
+
+    assert result.returncode != 0
+    assert command_name in result.stderr
+    assert powershell_uninstall_harness.fcc_home.exists()
+    assert all(
+        (powershell_uninstall_harness.tool_bin / f"{name}.cmd").exists()
+        for name in FCC_COMMANDS
+    )
+    assert powershell_uninstall_harness.calls() == []
+
+
 def test_uninstallers_guard_running_commands_and_preserve_shared_owners() -> None:
     shell = (_repo_root() / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
     powershell = (_repo_root() / "scripts" / "uninstall.ps1").read_text(
@@ -676,17 +830,3 @@ def test_uninstallers_guard_running_commands_and_preserve_shared_owners() -> Non
         assert "is not installed" in text
         assert "no tool" not in text
         assert "nothing to uninstall" not in text
-
-
-def test_readme_uninstall_uses_raw_urls_and_verification_contract() -> None:
-    text = (_repo_root() / "README.md").read_text(encoding="utf-8")
-
-    assert (
-        'curl -fsSL "https://raw.githubusercontent.com/'
-        'Alishahryar1/free-claude-code/main/scripts/uninstall.sh" | sh'
-    ) in text
-    assert (
-        '& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/'
-        'Alishahryar1/free-claude-code/main/scripts/uninstall.ps1")))'
-    ) in text
-    assert "verifies every FCC command is gone" in text

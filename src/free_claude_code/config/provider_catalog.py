@@ -5,6 +5,7 @@ provider implementation imports (see contract tests).
 """
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 # Default upstream base URLs are owned here with the provider catalog.
 NVIDIA_NIM_DEFAULT_BASE = "https://integrate.api.nvidia.com/v1"
@@ -17,6 +18,7 @@ MINIMAX_DEFAULT_BASE = "https://api.minimax.io/v1"
 # DeepSeek Chat Completions API; cache usage is reported on this endpoint.
 DEEPSEEK_DEFAULT_BASE = "https://api.deepseek.com"
 FIREWORKS_DEFAULT_BASE = "https://api.fireworks.ai/inference/v1"
+NOVITA_DEFAULT_BASE = "https://api.novita.ai/openai/v1"
 # Cloudflare account-scoped AI REST root; provider appends /accounts/{id}/ai/v1.
 CLOUDFLARE_AI_REST_ROOT = "https://api.cloudflare.com/client/v4"
 OPENROUTER_DEFAULT_BASE = "https://openrouter.ai/api/v1"
@@ -27,7 +29,7 @@ LMSTUDIO_DEFAULT_BASE = "http://localhost:1234/v1"
 LLAMACPP_DEFAULT_BASE = "http://localhost:8080/v1"
 OLLAMA_DEFAULT_BASE = "http://localhost:11434"
 OLLAMA_CLOUD_DEFAULT_BASE = "https://ollama.com/v1"
-OPENCODE_DEFAULT_BASE = "https://opencode.ai/zen/v1"
+OPENCODE_ZEN_DEFAULT_BASE = "https://opencode.ai/zen/v1"
 OPENCODE_GO_DEFAULT_BASE = "https://opencode.ai/zen/go/v1"
 VERCEL_AI_GATEWAY_DEFAULT_BASE = "https://ai-gateway.vercel.sh/v1"
 # Amazon Bedrock Mantle OpenAI-compatible endpoint. The base URL remains
@@ -36,15 +38,60 @@ BEDROCK_DEFAULT_BASE = "https://bedrock-mantle.us-east-1.api.aws/v1"
 HUGGINGFACE_DEFAULT_BASE = "https://router.huggingface.co/v1"
 COHERE_DEFAULT_BASE = "https://api.cohere.ai/compatibility/v1"
 GITHUB_MODELS_DEFAULT_BASE = "https://models.github.ai/inference"
-# Z.ai GLM Coding Plan OpenAI-compatible Chat Completions API.
-ZAI_DEFAULT_BASE = "https://api.z.ai/api/coding/paas/v4"
+# Z.ai OpenAI-compatible Chat Completions APIs. The endpoint selects billing.
+ZAI_CODING_DEFAULT_BASE = "https://api.z.ai/api/coding/paas/v4"
+ZAI_API_DEFAULT_BASE = "https://api.z.ai/api/paas/v4"
 # Google AI Studio Gemini API OpenAI-compat layer (not Vertex AI).
 GEMINI_DEFAULT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 # Vertex AI API root. The provider owns project/location endpoint composition.
 VERTEX_AI_API_ROOT = "https://aiplatform.googleapis.com"
 GROQ_DEFAULT_BASE = "https://api.groq.com/openai/v1"
+# ClinePass subscription models through Cline's OpenAI-compatible API.
+CLINE_DEFAULT_BASE = "https://api.cline.bot/api/v1"
 CEREBRAS_DEFAULT_BASE = "https://api.cerebras.ai/v1"
 SAMBANOVA_DEFAULT_BASE = "https://api.sambanova.ai/v1"
+# Kilo.ai gateway OpenAI-compatible Chat Completions API.
+KILO_DEFAULT_BASE = "https://api.kilo.ai/api/gateway"
+OPENAI_CODEX_DEFAULT_BASE = "https://chatgpt.com/backend-api/codex"
+# xAI OpenAI-compatible Chat Completions API.
+XAI_DEFAULT_BASE = "https://api.x.ai/v1"
+# QwenCloud Token Plan OpenAI-compatible Chat Completions API.
+QWENCLOUD_DEFAULT_BASE = (
+    "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+)
+# QwenCloud Coding Plan OpenAI-compatible Chat Completions API.
+QWENCLOUD_CODING_DEFAULT_BASE = "https://coding-intl.dashscope.aliyuncs.com/v1"
+# Together AI OpenAI-compatible Chat Completions API.
+TOGETHER_DEFAULT_BASE = "https://api.together.ai/v1"
+# DeepInfra OpenAI-compatible Chat Completions API.
+DEEPINFRA_DEFAULT_BASE = "https://api.deepinfra.com/v1/openai"
+# SiliconFlow OpenAI-compatible Chat Completions API.
+SILICONFLOW_DEFAULT_BASE = "https://api.siliconflow.com/v1"
+# Nebius Token Factory OpenAI-compatible Chat Completions API.
+NEBIUS_DEFAULT_BASE = "https://api.tokenfactory.nebius.com/v1"
+# Chutes OpenAI-compatible Chat Completions API.
+CHUTES_DEFAULT_BASE = "https://llm.chutes.ai/v1"
+# Featherless AI OpenAI-compatible Chat Completions API.
+FEATHERLESS_DEFAULT_BASE = "https://api.featherless.ai/v1"
+# TokenRouter OpenAI-compatible Chat Completions gateway.
+TOKENROUTER_DEFAULT_BASE = "https://api.tokenrouter.com/v1"
+# NaraRoute OpenAI-compatible Chat Completions gateway.
+NARAROUTE_DEFAULT_BASE = "https://router.bynara.id/v1"
+# Poolside AI OpenAI-compatible Chat Completions API.
+POOLSIDE_DEFAULT_BASE = "https://inference.poolside.ai/v1"
+# Agnes AI OpenAI-compatible Chat Completions API.
+AGNES_DEFAULT_BASE = "https://apihub.agnes-ai.com/v1"
+# ZenMux OpenAI-compatible Chat Completions gateway.
+ZENMUX_DEFAULT_BASE = "https://zenmux.ai/api/v1"
+# W&B Serverless Inference OpenAI-compatible API.
+WANDB_INFERENCE_DEFAULT_BASE = "https://api.inference.wandb.ai/v1"
+
+
+class ProviderAuthKind(StrEnum):
+    """How a customer makes one provider available."""
+
+    CONFIGURATION = "configuration"
+    CONNECTED_ACCOUNT = "connected_account"
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +100,7 @@ class ProviderDescriptor:
 
     provider_id: str
     display_name: str
+    auth_kind: ProviderAuthKind = ProviderAuthKind.CONFIGURATION
     local: bool = False
     credential_env: str | None = None
     credential_url: str | None = None
@@ -92,6 +140,152 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         credential_attr="open_router_api_key",
         default_base_url=OPENROUTER_DEFAULT_BASE,
         proxy_attr="open_router_proxy",
+    ),
+    "groq": ProviderDescriptor(
+        provider_id="groq",
+        display_name="Groq",
+        credential_env="GROQ_API_KEY",
+        credential_url="https://console.groq.com/keys",
+        credential_attr="groq_api_key",
+        default_base_url=GROQ_DEFAULT_BASE,
+        proxy_attr="groq_proxy",
+    ),
+    "cline_pass": ProviderDescriptor(
+        provider_id="cline_pass",
+        display_name="ClinePass",
+        credential_env="CLINE_API_KEY",
+        credential_url="https://app.cline.bot",
+        credential_attr="cline_api_key",
+        default_base_url=CLINE_DEFAULT_BASE,
+        proxy_attr="cline_pass_proxy",
+    ),
+    "openai": ProviderDescriptor(
+        provider_id="openai",
+        display_name="OpenAI / ChatGPT",
+        auth_kind=ProviderAuthKind.CONNECTED_ACCOUNT,
+        default_base_url=OPENAI_CODEX_DEFAULT_BASE,
+        proxy_attr="openai_proxy",
+    ),
+    "xai": ProviderDescriptor(
+        provider_id="xai",
+        display_name="xAI (Grok)",
+        credential_env="XAI_API_KEY",
+        credential_url="https://console.x.ai/team/default/api-keys",
+        credential_attr="xai_api_key",
+        default_base_url=XAI_DEFAULT_BASE,
+        proxy_attr="xai_proxy",
+    ),
+    "qwencloud": ProviderDescriptor(
+        provider_id="qwencloud",
+        display_name="QwenCloud Token Plan",
+        credential_env="QWENCLOUD_API_KEY",
+        credential_url="https://home.qwencloud.com/api-keys",
+        credential_attr="qwencloud_api_key",
+        default_base_url=QWENCLOUD_DEFAULT_BASE,
+        proxy_attr="qwencloud_proxy",
+    ),
+    "qwencloud_coding": ProviderDescriptor(
+        provider_id="qwencloud_coding",
+        display_name="QwenCloud Coding Plan",
+        credential_env="QWENCLOUD_CODING_API_KEY",
+        credential_url="https://home.qwencloud.com/api-keys",
+        credential_attr="qwencloud_coding_api_key",
+        default_base_url=QWENCLOUD_CODING_DEFAULT_BASE,
+        proxy_attr="qwencloud_coding_proxy",
+    ),
+    "together": ProviderDescriptor(
+        provider_id="together",
+        display_name="Together AI",
+        credential_env="TOGETHER_API_KEY",
+        credential_url="https://api.together.ai/settings/api-keys",
+        credential_attr="together_api_key",
+        default_base_url=TOGETHER_DEFAULT_BASE,
+        proxy_attr="together_proxy",
+    ),
+    "deepinfra": ProviderDescriptor(
+        provider_id="deepinfra",
+        display_name="DeepInfra",
+        credential_env="DEEPINFRA_API_KEY",
+        credential_url="https://deepinfra.com/dash/api_keys",
+        credential_attr="deepinfra_api_key",
+        default_base_url=DEEPINFRA_DEFAULT_BASE,
+        proxy_attr="deepinfra_proxy",
+    ),
+    "siliconflow": ProviderDescriptor(
+        provider_id="siliconflow",
+        display_name="SiliconFlow",
+        credential_env="SILICONFLOW_API_KEY",
+        credential_url="https://cloud.siliconflow.com/account/ak",
+        credential_attr="siliconflow_api_key",
+        default_base_url=SILICONFLOW_DEFAULT_BASE,
+        proxy_attr="siliconflow_proxy",
+    ),
+    "nebius": ProviderDescriptor(
+        provider_id="nebius",
+        display_name="Nebius Token Factory",
+        credential_env="NEBIUS_API_KEY",
+        credential_url="https://tokenfactory.nebius.com/project/api-keys",
+        credential_attr="nebius_api_key",
+        default_base_url=NEBIUS_DEFAULT_BASE,
+        proxy_attr="nebius_proxy",
+    ),
+    "chutes": ProviderDescriptor(
+        provider_id="chutes",
+        display_name="Chutes",
+        credential_env="CHUTES_API_KEY",
+        credential_url="https://chutes.ai/docs/getting-started/authentication",
+        credential_attr="chutes_api_key",
+        default_base_url=CHUTES_DEFAULT_BASE,
+        proxy_attr="chutes_proxy",
+    ),
+    "featherless": ProviderDescriptor(
+        provider_id="featherless",
+        display_name="Featherless AI",
+        credential_env="FEATHERLESS_API_KEY",
+        credential_url="https://featherless.ai/account/api-keys",
+        credential_attr="featherless_api_key",
+        default_base_url=FEATHERLESS_DEFAULT_BASE,
+        proxy_attr="featherless_proxy",
+    ),
+    "agnes": ProviderDescriptor(
+        provider_id="agnes",
+        display_name="Agnes AI",
+        credential_env="AGNES_API_KEY",
+        credential_url="https://agnes-ai.com/",
+        credential_attr="agnes_api_key",
+        default_base_url=AGNES_DEFAULT_BASE,
+        proxy_attr="agnes_proxy",
+    ),
+    "zenmux": ProviderDescriptor(
+        provider_id="zenmux",
+        display_name="ZenMux",
+        credential_env="ZENMUX_API_KEY",
+        credential_url="https://zenmux.ai/platform/pay-as-you-go",
+        credential_attr="zenmux_api_key",
+        default_base_url=ZENMUX_DEFAULT_BASE,
+        proxy_attr="zenmux_proxy",
+    ),
+    "wandb": ProviderDescriptor(
+        provider_id="wandb",
+        display_name="W&B Inference",
+        credential_env="WANDB_API_KEY",
+        credential_url="https://wandb.ai/settings",
+        credential_attr="wandb_api_key",
+        default_base_url=WANDB_INFERENCE_DEFAULT_BASE,
+        proxy_attr="wandb_proxy",
+    ),
+    "azure_openai": ProviderDescriptor(
+        provider_id="azure_openai",
+        display_name="Azure OpenAI",
+        credential_env="AZURE_OPENAI_API_KEY",
+        credential_url="https://ai.azure.com/",
+        credential_attr="azure_openai_api_key",
+        base_url_attr="azure_openai_base_url",
+        proxy_attr="azure_openai_proxy",
+        required_settings_attrs=(
+            "azure_openai_api_key",
+            "azure_openai_base_url",
+        ),
     ),
     "gemini": ProviderDescriptor(
         provider_id="gemini",
@@ -139,14 +333,14 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         default_base_url=CODESTRAL_DEFAULT_BASE,
         proxy_attr="codestral_proxy",
     ),
-    "opencode": ProviderDescriptor(
-        provider_id="opencode",
+    "opencode_zen": ProviderDescriptor(
+        provider_id="opencode_zen",
         display_name="OpenCode Zen",
         credential_env="OPENCODE_API_KEY",
         credential_url="https://opencode.ai/auth",
         credential_attr="opencode_api_key",
-        default_base_url=OPENCODE_DEFAULT_BASE,
-        proxy_attr="opencode_proxy",
+        default_base_url=OPENCODE_ZEN_DEFAULT_BASE,
+        proxy_attr="opencode_zen_proxy",
     ),
     "opencode_go": ProviderDescriptor(
         provider_id="opencode_go",
@@ -230,6 +424,15 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         default_base_url=KIMI_CODE_DEFAULT_BASE,
         proxy_attr="kimi_code_proxy",
     ),
+    "kilo": ProviderDescriptor(
+        provider_id="kilo",
+        display_name="Kilo.ai",
+        credential_env="KILO_API_KEY",
+        credential_url="https://app.kilo.ai",
+        credential_attr="kilo_api_key",
+        default_base_url=KILO_DEFAULT_BASE,
+        proxy_attr="kilo_proxy",
+    ),
     "minimax": ProviderDescriptor(
         provider_id="minimax",
         display_name="MiniMax",
@@ -247,15 +450,6 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         credential_attr="cerebras_api_key",
         default_base_url=CEREBRAS_DEFAULT_BASE,
         proxy_attr="cerebras_proxy",
-    ),
-    "groq": ProviderDescriptor(
-        provider_id="groq",
-        display_name="Groq",
-        credential_env="GROQ_API_KEY",
-        credential_url="https://console.groq.com/keys",
-        credential_attr="groq_api_key",
-        default_base_url=GROQ_DEFAULT_BASE,
-        proxy_attr="groq_proxy",
     ),
     "sambanova": ProviderDescriptor(
         provider_id="sambanova",
@@ -275,6 +469,15 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         default_base_url=FIREWORKS_DEFAULT_BASE,
         proxy_attr="fireworks_proxy",
     ),
+    "novita": ProviderDescriptor(
+        provider_id="novita",
+        display_name="Novita AI",
+        credential_env="NOVITA_API_KEY",
+        credential_url="https://novita.ai/settings/key-management",
+        credential_attr="novita_api_key",
+        default_base_url=NOVITA_DEFAULT_BASE,
+        proxy_attr="novita_proxy",
+    ),
     "cloudflare": ProviderDescriptor(
         provider_id="cloudflare",
         display_name="Cloudflare",
@@ -290,11 +493,50 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
     ),
     "zai": ProviderDescriptor(
         provider_id="zai",
-        display_name="Z.ai",
+        display_name="Z.ai Coding Plan",
         credential_env="ZAI_API_KEY",
+        credential_url="https://z.ai/manage-apikey/apikey-list",
         credential_attr="zai_api_key",
-        default_base_url=ZAI_DEFAULT_BASE,
+        default_base_url=ZAI_CODING_DEFAULT_BASE,
         proxy_attr="zai_proxy",
+    ),
+    "zai_api": ProviderDescriptor(
+        provider_id="zai_api",
+        display_name="Z.ai API",
+        credential_env="ZAI_API_KEY",
+        credential_url="https://z.ai/manage-apikey/apikey-list",
+        credential_attr="zai_api_key",
+        default_base_url=ZAI_API_DEFAULT_BASE,
+        proxy_attr="zai_api_proxy",
+    ),
+    "tokenrouter": ProviderDescriptor(
+        provider_id="tokenrouter",
+        display_name="TokenRouter",
+        credential_env="TOKENROUTER_API_KEY",
+        credential_url="https://www.tokenrouter.com/",
+        credential_attr="tokenrouter_api_key",
+        default_base_url=TOKENROUTER_DEFAULT_BASE,
+        base_url_attr="tokenrouter_base_url",
+        proxy_attr="tokenrouter_proxy",
+    ),
+    "nararoute": ProviderDescriptor(
+        provider_id="nararoute",
+        display_name="NaraRoute",
+        credential_env="NARAROUTE_API_KEY",
+        credential_url="https://router.bynara.id/keys",
+        credential_attr="nararoute_api_key",
+        default_base_url=NARAROUTE_DEFAULT_BASE,
+        base_url_attr="nararoute_base_url",
+        proxy_attr="nararoute_proxy",
+    ),
+    "poolside": ProviderDescriptor(
+        provider_id="poolside",
+        display_name="Poolside AI",
+        credential_env="POOLSIDE_API_KEY",
+        credential_url="https://platform.poolside.ai/",
+        credential_attr="poolside_api_key",
+        default_base_url=POOLSIDE_DEFAULT_BASE,
+        proxy_attr="poolside_proxy",
     ),
     "ollama_cloud": ProviderDescriptor(
         provider_id="ollama_cloud",
@@ -334,7 +576,8 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
 }
 
 # Key order:
-# NVIDIA NIM first (README default), DeepSeek fourth, OpenCode gateways adjacent,
+# NVIDIA NIM, OpenRouter, and Groq lead the customer-facing ranking;
+# OpenCode gateways remain adjacent,
 # Vercel / Hugging Face / Cohere / GitHub Models follow gateway-style remotes,
 # then cloud gateways, Ollama Cloud, and local providers per project plan
 # (github.com/cheahjs/free-llm-api-resources Free Providers TOC as rough guide

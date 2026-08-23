@@ -35,6 +35,7 @@ from .models import (
     Tool,
     Usage,
 )
+from .openai_tool_names import OpenAIToolNameCodec
 from .request_serialization import dump_messages_request, serialize_tool_result_content
 from .request_snapshot import anthropic_request_snapshot
 from .sse_aggregation import aggregate_anthropic_sse_to_message
@@ -47,7 +48,7 @@ from .streaming import (
 )
 from .thinking import ContentChunk, ContentType, ThinkTagParser
 from .tokens import get_token_count
-from .tools import HeuristicToolParser
+from .tools import FunctionTagToolParser, HeuristicToolParser
 from .utils import set_if_not_none
 
 __all__ = [
@@ -65,11 +66,13 @@ __all__ = [
     "ContentBlockWebSearchToolResult",
     "ContentChunk",
     "ContentType",
+    "FunctionTagToolParser",
     "HeuristicToolParser",
     "Message",
     "MessagesRequest",
     "MessagesResponse",
     "OpenAIConversionError",
+    "OpenAIToolNameCodec",
     "ReasoningReplayMode",
     "StreamBlockLedger",
     "SystemContent",
