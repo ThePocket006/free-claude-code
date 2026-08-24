@@ -85,6 +85,7 @@ class OpenAIModelListing:
     collection_field: str | None = "data"
     id_field: str = "id"
     aliases_field: str | None = None
+    additional_model_ids: tuple[str, ...] = ()
     required_path_values: RequiredPathValues = ()
     required_null_field: str | None = None
     required_sequence_items: tuple[tuple[str, str], ...] = ()
@@ -423,16 +424,6 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
         _policy("CODESTRAL", ReasoningReplayMode.THINK_TAGS),
         NO_REASONING,
     ),
-    "opencode_zen": OpenAIChatProfile(
-        _policy("OPENCODE_ZEN", ReasoningReplayMode.REASONING_CONTENT),
-        NO_REASONING,
-        user_agent="opencode",
-    ),
-    "opencode_go": OpenAIChatProfile(
-        _policy("OPENCODE_GO", ReasoningReplayMode.REASONING_CONTENT),
-        NO_REASONING,
-        user_agent="opencode",
-    ),
     "vercel": OpenAIChatProfile(
         _policy(
             "VERCEL",
@@ -622,6 +613,24 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
             default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
         ),
         ChatTemplateReasoning(field="enable_thinking"),
+    ),
+    "llm7": OpenAIChatProfile(
+        _policy(
+            "LLM7",
+            ReasoningReplayMode.REASONING_CONTENT,
+            default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
+        ),
+        NO_REASONING,
+        model_listing=OpenAIModelListing(
+            path="/models",
+            additional_model_ids=("default", "fast", "pro"),
+            required_path_values=(
+                (("model_type",), ("chat",)),
+                (("stream",), (True,)),
+                (("tools_calling",), (True,)),
+            ),
+            thinking_boolean_path=("reasoning",),
+        ),
     ),
     "ollama_cloud": OpenAIChatProfile(
         _policy(

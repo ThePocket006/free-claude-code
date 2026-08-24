@@ -17,6 +17,7 @@ from free_claude_code.core.anthropic import (
 )
 from free_claude_code.core.circuit_breaker import CircuitBreakerRegistry
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
+from free_claude_code.core.inference import InferenceEvent, inference_event_size
 from free_claude_code.core.trace import (
     close_stream_input,
     trace_event,
@@ -168,7 +169,7 @@ class ProviderExecutor:
         raw_log_label: str,
         raw_log_payload: object,
         request_id: str,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[InferenceEvent]:
         """Preflight synchronously, then return the traced provider stream."""
         primary = routed.resolved.primary
         primary_provider = self._provider_resolver(primary.provider_id)
@@ -228,7 +229,7 @@ class ProviderExecutor:
             routed.request.tools,
         )
 
-        async def provider_body() -> AsyncIterator[str]:
+        async def provider_body() -> AsyncIterator[InferenceEvent]:
             loop = asyncio.get_running_loop()
             progress_deadline = loop.time() + self._progress_timeout_seconds
 
@@ -281,7 +282,7 @@ class ProviderExecutor:
                         reasoning=routed.reasoning,
                     )
 
-                provider_stream: AsyncIterator[str] | None = None
+                provider_stream: AsyncIterator[InferenceEvent] | None = None
                 candidate_committed = False
                 advance_failure: ExecutionFailure | None = None
                 try:
@@ -311,9 +312,6 @@ class ProviderExecutor:
                                 request_id=request_id,
                                 provider_id=target.provider_id,
                             ) from exc
-                        if not chunk:
-                            await asyncio.sleep(0)
-                            continue
                         if not candidate_committed:
                             candidate_committed = True
                             if index > 0:
@@ -390,4 +388,5 @@ class ProviderExecutor:
             ),
             chunk_event=None,
             extra=stream_trace,
+            item_size=inference_event_size,
         )
