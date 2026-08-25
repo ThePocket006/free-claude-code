@@ -14,11 +14,11 @@
       status, ps            Show server status (PID, port, health)
       health, check         Quick health check
       logs                  Tail the server logs
-      server [args]         Run fcc-server in foreground (passes args)
-      claude [args]         Launch Claude Code against the local server
-      codex [args]          Launch Codex against the local server
-      pi [args]             Launch Pi against the local server
-      version               Show project + server version
+    server [args]         Run fcc-server in foreground (passes args)
+    <agent> [args]        Launch an agent against the local server
+                          (claude, cline, codex, desktop, dsh, grok,
+                           hermes, muse, opencode, pi)
+    version               Show project + server version
       port                  Show the local port
       help                  Show this help
 #>
@@ -33,9 +33,20 @@ $ScriptDir    = $PSScriptRoot
 $ProjectDir   = Split-Path $ScriptDir -Parent
 $VenvDir      = Join-Path $ProjectDir '.venv'
 $ServerExe    = Join-Path $VenvDir 'Scripts\fcc-server.exe'
-$ClaudeExe    = Join-Path $VenvDir 'Scripts\fcc-claude.exe'
-$CodexExe     = Join-Path $VenvDir 'Scripts\fcc-codex.exe'
-$PiExe        = Join-Path $VenvDir 'Scripts\fcc-pi.exe'
+$PythonExe    = Join-Path $VenvDir 'Scripts\python.exe'
+# Client agents available in the venv (command name -> exe file stem after 'fcc-')
+$ClientAgents = @{
+    'claude'    = 'claude'
+    'cline'     = 'cline'
+    'codex'     = 'codex'
+    'desktop'   = 'desktop'
+    'dsh'       = 'dsh'
+    'grok'      = 'grok'
+    'hermes'    = 'hermes'
+    'muse'      = 'muse'
+    'opencode'  = 'opencode'
+    'pi'        = 'pi'
+}
 $LocalEnv     = Join-Path $ProjectDir '.fcc-local.env'
 $OutLog       = Join-Path $ProjectDir '_fcc-local.out.log'
 $ErrLog       = Join-Path $ProjectDir '_fcc-local.err.log'
@@ -59,9 +70,13 @@ function Assert-Project {
         Write-Error "Local server executable not found: $ServerExe (run 'uv sync' first)"
         exit 1
     }
-    if (-not (Test-Path $ClaudeExe)) {
-        Write-Error "Local claude launcher not found: $ClaudeExe (run 'uv sync' first)"
-        exit 1
+    $missing = @()
+    foreach ($agent in $ClientAgents.Keys) {
+        $exe = Join-Path $VenvDir "Scripts\fcc-$($ClientAgents[$agent]).exe"
+        if (-not (Test-Path $exe)) { $missing += $exe }
+    }
+    if ($missing.Count -gt 0) {
+        Write-Warning "Missing client launchers (run 'uv sync' to build them): $($missing -join ', ')"
     }
 }
 
@@ -110,7 +125,18 @@ function Test-Health {
 }
 
 function Set-LocalEnv {
+    # Load every KEY=VALUE from .fcc-local.env into the process environment.
+    # Process env vars take precedence over the managed config (~/.fcc/.env),
+    # so this cleanly isolates the local server from the global one.
     $env:FCC_ENV_FILE = $LocalEnv
+    if (-not (Test-Path $LocalEnv)) { return }
+    foreach ($line in Get-Content $LocalEnv) {
+        if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') {
+            $key = $Matches[1]
+            $value = $Matches[2].Trim().Trim('"', "'")
+            Set-Item -Path "env:$key" -Value $value
+        }
+    }
 }
 
 # ---------------------------------------------------------------
@@ -224,17 +250,14 @@ function Invoke-FccClient {
     if ($health -ne 200) {
         Write-Host "[$Name] server not healthy (port $(Get-LocalPort)); start it with: $ScriptName start" -ForegroundColor Yellow
     }
-    $exe = switch ($Client) {
-        'claude' { $ClaudeExe }
-        'codex'  { $CodexExe }
-        'pi'     { $PiExe }
-        default  { $null }
+    $exe = Join-Path $VenvDir "Scripts\fcc-$Client.exe"
+    if (Test-Path $exe) {
+        & $exe @Rest
+        exit $LASTEXITCODE
     }
-    if (-not $exe) {
-        Write-Error "Unknown client: $Client"
-        exit 1
-    }
-    & $exe @Rest
+    # Fallback: invoke the entry point directly when the exe shim is missing
+    # or locked (e.g. during a concurrent `uv sync`).
+    & $PythonExe -c "import sys; from free_claude_code.cli.launchers.$($ClientAgents[$Client]) import launch; sys.exit(launch())" @Rest
     exit $LASTEXITCODE
 }
 
@@ -263,9 +286,8 @@ function Show-FccHelp {
     Write-Host "    logs                  Tail the server logs"
     Write-Host "    logs -f               Follow the server logs (live)"
     Write-Host "    server [args]         Run fcc-server in foreground"
-    Write-Host "    claude [args]         Launch Claude Code against the local server"
-    Write-Host "    codex [args]          Launch Codex against the local server"
-    Write-Host "    pi [args]             Launch Pi against the local server"
+    Write-Host "    <agent> [args]        Launch an agent against the local server" -ForegroundColor White
+    Write-Host "                          Agents: $(( $ClientAgents.Keys | Sort-Object ) -join ', ')" -ForegroundColor Gray
     Write-Host "    version               Show project + server version"
     Write-Host "    port                  Show the local port"
     Write-Host "    help                  Show this help"
@@ -309,9 +331,9 @@ switch -Regex ($cmd) {
         }
     }
     '^server$'       { Invoke-FccServer -Rest $rest }
-    '^claude$'       { Invoke-FccClient -Client 'claude' -Rest $rest }
-    '^codex$'        { Invoke-FccClient -Client 'codex' -Rest $rest }
-    '^pi$'           { Invoke-FccClient -Client 'pi' -Rest $rest }
+    { $_ -in $ClientAgents.Keys } {
+        Invoke-FccClient -Client $cmd -Rest $rest
+    }
     '^(version|-v|--version)$' { Show-FccVersion }
     '^port$'         { Write-Host (Get-LocalPort) }
     '^(help|-h|--help)$' { Show-FccHelp }
