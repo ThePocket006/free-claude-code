@@ -213,9 +213,10 @@ def test_provider_catalog_covers_advertised_provider_ids():
 
 def test_opencode_profiles_carry_zen_compatible_user_agent():
     """The zen gateway rejects non-'opencode' User-Agents with HTTP 429."""
-    for profile_id in ("opencode", "opencode_go"):
-        profile = OPENAI_CHAT_PROFILES[profile_id]
-        assert profile.user_agent == "opencode"
+    from free_claude_code.providers.opencode.provider import _PROFILES
+
+    for profile_id in ("opencode_zen", "opencode_go"):
+        assert _PROFILES[profile_id].chat_profile.user_agent == "opencode"
 
 
 def test_ollama_descriptor_uses_local_openai_endpoint_semantics():

@@ -140,16 +140,19 @@ class ApplicationRuntime:
             return
         logger.info("Starting Claude Code Proxy...")
         try:
-            # Warm provider model cache with timeout to avoid blocking on slow providers
+            # Warm provider model cache with a timeout so a slow upstream
+            # catalog cannot block startup; real failures still propagate
+            # so owned resources are closed by the failure path.
             try:
                 await asyncio.wait_for(
                     self.provider_manager.warm_referenced_model_cache(),
                     timeout=10.0,
                 )
             except asyncio.TimeoutError:
-                logger.warning("Provider model cache warm-up timed out after 10s, continuing startup")
-            except Exception as exc:
-                logger.warning("Provider model cache warm-up failed: {}", exc)
+                logger.warning(
+                    "Provider model cache warm-up timed out after 10s, "
+                    "continuing startup"
+                )
             self.provider_manager.start_model_list_refresh()
             await self._start_messaging_if_configured()
             logging.getLogger("uvicorn.error").info(
