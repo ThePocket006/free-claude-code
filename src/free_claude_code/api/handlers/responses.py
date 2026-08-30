@@ -18,7 +18,6 @@ from free_claude_code.application.execution import ProviderExecutor
 from free_claude_code.application.ports import ProviderResolver
 from free_claude_code.application.routing import ModelRouter
 from free_claude_code.config.settings import Settings
-from free_claude_code.core.anthropic import MessagesRequest
 from free_claude_code.core.circuit_breaker import CircuitBreakerRegistry
 from free_claude_code.core.diagnostics import safe_exception_message
 from free_claude_code.core.failures import ExecutionFailure, find_execution_failure

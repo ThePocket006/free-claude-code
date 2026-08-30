@@ -19,9 +19,5 @@ llama_cache
 *.log
 *.env
 /test-results/
-run_debug*.py
-run_*.bat
 graphify-out/
-run_server_test_messages3.py
-run_simple.py
-_provider_keys.json
+Microsoft/Windows/PowerShell/

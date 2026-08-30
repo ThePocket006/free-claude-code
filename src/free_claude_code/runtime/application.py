@@ -148,7 +148,7 @@ class ApplicationRuntime:
                     self.provider_manager.warm_referenced_model_cache(),
                     timeout=10.0,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "Provider model cache warm-up timed out after 10s, "
                     "continuing startup"
