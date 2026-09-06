@@ -1,3 +1,5 @@
+import asyncio
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -18,11 +20,64 @@ from free_claude_code.config.admin.values import MASKED_SECRET
 from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
 from free_claude_code.config.server_urls import local_admin_url
 from free_claude_code.config.settings import Settings
+from free_claude_code.core.version import package_version
 from tests.api.support import create_test_app, provider_manager_for_app, runtime_for_app
 
 
 def _local_client(app):
-    return TestClient(app, client=("127.0.0.1", 50000))
+    return TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        client=("127.0.0.1", 50000),
+    )
+
+
+def test_admin_retirement_preview_apply_and_runtime_agree(monkeypatch, tmp_path):
+    _set_home(monkeypatch, tmp_path)
+    _clear_process_config(monkeypatch)
+    env_file = tmp_path / ".fcc" / ".env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text(
+        "FCC_CONFIG_SCHEMA=1\nMODEL=groq/default\nMODEL_OPUS=groq/managed\n"
+        "GITHUB_MODELS_TOKEN=preserve-secret\nGITHUB_MODELS_PROXY=http://user:secret@proxy.test\nPRIVATE=hidden\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MODEL_OPUS", "github_models/retired-process")
+    app = create_test_app()
+    client = _local_client(app)
+    body = client.post(
+        "/admin/api/config/apply",
+        json={
+            "values": {
+                "MODEL_SONNET": "github_models/stale",
+                "MODEL_OPUS": "deepseek/cannot-unlock",
+                "MODEL_FALLBACKS": "groq/a,github_models/old,deepseek/b",
+            }
+        },
+    ).json()
+    assert body["applied"]
+    text = env_file.read_text(encoding="utf-8")
+    assert "MODEL=groq/default" in text
+    assert "MODEL_SONNET" not in text
+    assert "MODEL_OPUS=groq/managed" in text
+    assert "MODEL_FALLBACKS=groq/a,deepseek/b" in text
+    assert "preserve-secret" in text and "http://user:secret@proxy.test" in text
+    assert "preserve-secret" not in body["env_preview"]
+    assert "http://user:secret@proxy.test" not in body["env_preview"]
+    assert "PRIVATE=********" in body["env_preview"]
+    effective = provider_manager_for_app(app).current_settings()
+    assert effective.model == "groq/default"
+    assert effective.model_opus is None and effective.model_sonnet is None
+    assert effective.model_fallbacks == ("groq/a", "deepseek/b")
+
+
+@pytest.fixture(autouse=True)
+def _offline_credential_checks(monkeypatch):
+    """These tests exercise config persistence; probe HTTP has its own suite."""
+    monkeypatch.setattr(
+        "free_claude_code.runtime.application.check_credentials",
+        AsyncMock(return_value=()),
+    )
 
 
 def _set_home(monkeypatch, tmp_path: Path) -> None:
@@ -89,12 +144,95 @@ def test_admin_page_is_loopback_only(monkeypatch, tmp_path):
     assert remote_client.get("/admin").status_code == 403
 
 
+def test_admin_page_uses_installed_version(monkeypatch, tmp_path):
+    _set_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "free_claude_code.api.admin_routes.package_version",
+        lambda: "9.8.7",
+    )
+
+    response = _local_client(create_test_app()).get("/admin")
+
+    assert response.status_code == 200
+    assert "<p>Server Control · v9.8.7</p>" in response.text
+    assert 'href="https://github.com/Alishahryar1/free-claude-code"' in response.text
+    assert 'target="_blank"' in response.text
+    assert 'rel="noopener noreferrer"' in response.text
+    assert 'aria-label="Open Free Claude Code on GitHub"' in response.text
+    assert 'src="/admin/assets/9.8.7/app-icon.svg"' in response.text
+    assert 'href="/admin/assets/9.8.7/admin.css"' in response.text
+    assert 'href="/admin/assets/9.8.7/chat_sessions.css"' in response.text
+    assert 'src="/admin/assets/9.8.7/model_combobox.js"' in response.text
+    assert 'src="/admin/assets/9.8.7/chat_sessions.js"' in response.text
+    assert 'src="/admin/assets/9.8.7/admin.js"' in response.text
+    assert 'href="/admin/assets/admin.css"' not in response.text
+    assert 'href="/admin/assets/chat_sessions.css"' not in response.text
+    assert 'src="/admin/assets/chat_sessions.js"' not in response.text
+    assert 'src="/admin/assets/admin.js"' not in response.text
+
+
+@pytest.mark.parametrize(
+    ("filename", "media_type"),
+    (
+        ("admin.css", "text/css"),
+        ("admin.js", "text/javascript"),
+        ("chat_sessions.css", "text/css"),
+        ("chat_sessions.js", "text/javascript"),
+        ("model_combobox.js", "text/javascript"),
+    ),
+)
+def test_admin_versioned_assets_serve_packaged_files(
+    monkeypatch,
+    tmp_path,
+    filename,
+    media_type,
+):
+    asset_path = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "free_claude_code"
+        / "api"
+        / "admin_static"
+        / filename
+    )
+    _set_home(monkeypatch, tmp_path)
+    response = _local_client(create_test_app()).get(
+        f"/admin/assets/{package_version()}/{filename}"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith(media_type)
+    assert response.content == asset_path.read_bytes()
+
+
+def test_admin_versioned_logo_reuses_packaged_app_icon(monkeypatch, tmp_path):
+    asset_path = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "free_claude_code"
+        / "assets"
+        / "app-icon.svg"
+    )
+    _set_home(monkeypatch, tmp_path)
+    response = _local_client(create_test_app()).get(
+        f"/admin/assets/{package_version()}/app-icon.svg"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/svg+xml")
+    assert response.content == asset_path.read_bytes()
+
+
 @pytest.mark.parametrize(
     "path",
     (
         "/admin",
-        "/admin/assets/admin.css",
-        "/admin/assets/admin.js",
+        f"/admin/assets/{package_version()}/app-icon.svg",
+        f"/admin/assets/{package_version()}/admin.css",
+        f"/admin/assets/{package_version()}/admin.js",
+        f"/admin/assets/{package_version()}/chat_sessions.css",
+        f"/admin/assets/{package_version()}/chat_sessions.js",
+        f"/admin/assets/{package_version()}/model_combobox.js",
         "/admin/api/config",
     ),
 )
@@ -110,7 +248,22 @@ def test_admin_responses_are_never_cached(monkeypatch, tmp_path, path):
     ("path", "client_host", "expected_status"),
     (
         ("/admin", "203.0.113.10", 403),
-        ("/admin/assets/missing.js", "127.0.0.1", 404),
+        ("/admin/assets/admin.js", "127.0.0.1", 404),
+        (
+            f"/admin/assets/{package_version()}.stale/admin.js",
+            "127.0.0.1",
+            404,
+        ),
+        (
+            f"/admin/assets/{package_version()}/missing.js",
+            "127.0.0.1",
+            404,
+        ),
+        (
+            f"/admin/assets/{package_version()}/admin.js",
+            "203.0.113.10",
+            403,
+        ),
     ),
 )
 def test_admin_http_errors_are_never_cached(
@@ -121,7 +274,11 @@ def test_admin_http_errors_are_never_cached(
     expected_status,
 ):
     _set_home(monkeypatch, tmp_path)
-    client = TestClient(create_test_app(), client=(client_host, 50000))
+    client = TestClient(
+        create_test_app(),
+        base_url="http://127.0.0.1",
+        client=(client_host, 50000),
+    )
 
     response = client.get(path)
 
@@ -146,12 +303,13 @@ def test_admin_unexpected_errors_are_never_cached(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)
     client = TestClient(
         create_test_app(),
+        base_url="http://127.0.0.1",
         client=("127.0.0.1", 50000),
         raise_server_exceptions=False,
     )
 
     with patch(
-        "free_claude_code.api.admin_routes.load_config_response",
+        "free_claude_code.runtime.configuration.ConfigurationService.admin_config",
         side_effect=RuntimeError("test error"),
     ):
         response = client.get("/admin/api/config")
@@ -177,32 +335,20 @@ def test_admin_api_fetches_bypass_browser_cache():
     assert 'cache: "no-store"' in script
 
 
-def test_admin_connected_account_login_preopens_sign_in_window():
-    script = Path("src/free_claude_code/api/admin_static/admin.js").read_text(
-        encoding="utf-8"
-    )
-
-    assert 'window.open("about:blank", "_blank")' in script
-    assert "popup.location.replace(target)" in script
-    assert "if (popup) popup.close()" in script
-    assert '"Reconnect"' in script
-    assert '"Copy code"' in script
-    assert "Restart your agent to refresh its model picker." in script
-    assert 'window.confirm("Disconnect this ChatGPT account from FCC?")' in script
-
-
 class _FakeConnectedAccount:
-    def __init__(self) -> None:
+    def __init__(self, provider_id: str = "openai") -> None:
+        self.provider_id = provider_id
         self.connected = False
         self.revision = 0
         self.cancelled = False
+        self.started_modes: list[ConnectedAccountLoginMode] = []
 
     def is_connected(self) -> bool:
         return self.connected
 
     def status(self) -> ConnectedAccountStatus:
-        return ConnectedAccountStatus(
-            provider_id="openai",
+        status = ConnectedAccountStatus(
+            provider_id=self.provider_id,
             state=(
                 ConnectedAccountState.CONNECTED
                 if self.connected
@@ -210,20 +356,37 @@ class _FakeConnectedAccount:
             ),
             connected=self.connected,
             revision=self.revision,
-            email="safe@example.com" if self.connected else None,
         )
+        if self.provider_id == "github_copilot":
+            return replace(
+                status,
+                display_identity="octocat" if self.connected else None,
+                supported_login_modes=(ConnectedAccountLoginMode.DEVICE,),
+                default_login_mode=ConnectedAccountLoginMode.DEVICE,
+            )
+        return replace(status, email="safe@example.com" if self.connected else None)
 
     async def start_login(
         self, mode: ConnectedAccountLoginMode
     ) -> ConnectedAccountStatus:
-        return ConnectedAccountStatus(
-            provider_id="openai",
+        self.started_modes.append(mode)
+        return replace(
+            self.status(),
             state=ConnectedAccountState.CONNECTING,
             connected=False,
-            revision=self.revision,
             attempt_id="login_safe",
             mode=mode,
-            authorization_url="https://auth.openai.com/safe",
+            authorization_url=(
+                "https://auth.openai.com/safe"
+                if mode == ConnectedAccountLoginMode.BROWSER
+                else None
+            ),
+            verification_url=(
+                "https://github.com/login/device"
+                if mode == ConnectedAccountLoginMode.DEVICE
+                else None
+            ),
+            user_code="ABCD-1234" if mode == ConnectedAccountLoginMode.DEVICE else None,
         )
 
     async def cancel_login(self) -> ConnectedAccountStatus:
@@ -266,12 +429,113 @@ def test_admin_connected_account_routes_are_safe_loopback_only_and_uncached(
         "attempt_id": "login_safe",
         "mode": "browser",
         "authorization_url": "https://auth.openai.com/safe",
+        "supported_login_modes": ["browser", "device"],
+        "default_login_mode": "browser",
     }
     assert "token" not in login_response.text.lower()
     assert cancel_response.status_code == 200
     assert account.cancelled is True
     remote = TestClient(app, client=("203.0.113.10", 50000))
     assert remote.get("/admin/api/providers/openai/auth").status_code == 403
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "default_mode"),
+    [("openai", "browser"), ("github_copilot", "device")],
+)
+@pytest.mark.parametrize("payload", [{}, {"mode": None}])
+def test_admin_login_uses_the_provider_default(
+    monkeypatch,
+    tmp_path,
+    provider_id,
+    default_mode,
+    payload,
+):
+    _set_home(monkeypatch, tmp_path)
+    account = _FakeConnectedAccount(provider_id)
+    client = _local_client(
+        create_test_app(providers={}, connected_accounts={provider_id: account})
+    )
+
+    response = client.post(
+        f"/admin/api/providers/{provider_id}/auth/login", json=payload
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["mode"] == default_mode
+    assert account.started_modes == [ConnectedAccountLoginMode(default_mode)]
+    if default_mode == "device":
+        assert response.json()["user_code"] == "ABCD-1234"
+        assert response.json()["verification_url"] == "https://github.com/login/device"
+        assert "authorization_url" not in response.json()
+
+
+@pytest.mark.parametrize("mode", ["browser", "unrecognized"])
+def test_admin_rejects_unsupported_login_modes_before_starting(
+    monkeypatch, tmp_path, mode
+):
+    _set_home(monkeypatch, tmp_path)
+    account = _FakeConnectedAccount("github_copilot")
+    client = _local_client(
+        create_test_app(providers={}, connected_accounts={"github_copilot": account})
+    )
+
+    response = client.post(
+        "/admin/api/providers/github_copilot/auth/login", json={"mode": mode}
+    )
+
+    assert response.status_code == 422
+    assert response.headers["cache-control"] == "no-store"
+    assert account.started_modes == []
+
+
+def test_admin_connected_account_identity_modes_and_disconnect_are_independent(
+    monkeypatch, tmp_path
+):
+    _set_home(monkeypatch, tmp_path)
+    openai = _FakeConnectedAccount()
+    copilot = _FakeConnectedAccount("github_copilot")
+    openai.connected = copilot.connected = True
+    client = _local_client(
+        create_test_app(
+            providers={},
+            connected_accounts={"openai": openai, "github_copilot": copilot},
+        )
+    )
+
+    openai_status = client.get("/admin/api/providers/openai/auth").json()
+    copilot_status = client.get("/admin/api/providers/github_copilot/auth").json()
+    assert openai_status["email"] == "safe@example.com"
+    assert openai_status["supported_login_modes"] == ["browser", "device"]
+    assert copilot_status["display_identity"] == "octocat"
+    assert "email" not in copilot_status
+    assert copilot_status["supported_login_modes"] == ["device"]
+    assert copilot_status["default_login_mode"] == "device"
+    assert "token" not in str(copilot_status).lower()
+
+    cancelled = client.post("/admin/api/providers/github_copilot/auth/cancel")
+    assert cancelled.status_code == 200
+    assert copilot.cancelled is True
+    assert openai.cancelled is False
+    disconnected = client.delete("/admin/api/providers/github_copilot/auth")
+    assert disconnected.status_code == 200
+    assert disconnected.json()["connected"] is False
+    assert disconnected.json()["supported_login_modes"] == ["device"]
+    assert client.get("/admin/api/providers/openai/auth").json()["connected"] is True
+
+
+def test_admin_openai_keeps_explicit_device_login(monkeypatch, tmp_path):
+    _set_home(monkeypatch, tmp_path)
+    account = _FakeConnectedAccount()
+    client = _local_client(create_test_app(connected_accounts={"openai": account}))
+
+    response = client.post(
+        "/admin/api/providers/openai/auth/login", json={"mode": "device"}
+    )
+
+    assert response.status_code == 200
+    assert account.started_modes == [ConnectedAccountLoginMode.DEVICE]
 
 
 def test_admin_rejects_auth_routes_for_non_connected_provider(monkeypatch, tmp_path):
@@ -343,23 +607,27 @@ def test_admin_static_model_combobox_owns_dropdown_and_search_behavior():
     script = Path("src/free_claude_code/api/admin_static/admin.js").read_text(
         encoding="utf-8"
     )
+    combobox_script = Path(
+        "src/free_claude_code/api/admin_static/model_combobox.js"
+    ).read_text(encoding="utf-8")
     styles = Path("src/free_claude_code/api/admin_static/admin.css").read_text(
         encoding="utf-8"
     )
 
     assert 'api("/admin/api/models" + (refresh ? "/refresh" : "")' in script
     assert 'field.type === "model" || field.type === "optional_model"' in script
-    assert 'input.setAttribute("role", "combobox")' in script
-    assert 'listbox.setAttribute("role", "listbox")' in script
-    assert 'toggle.className = "model-combobox-toggle"' in script
-    assert "class ModelCombobox" in script
-    assert 'input.addEventListener("click", () => this.open())' in script
-    assert "value.toLocaleLowerCase().includes(normalizedQuery)" in script
-    assert 'event.key === "ArrowDown" || event.key === "ArrowUp"' in script
-    assert "this.setActive(this.visibleOptions.length - 1)" in script
-    assert 'event.key === "Enter"' in script
-    assert 'event.key === "Escape"' in script
-    assert 'document.createElement("datalist")' not in script
+    assert "new window.FccModelCombobox" in script
+    assert 'input.setAttribute("role", "combobox")' in combobox_script
+    assert 'this.listbox.setAttribute("role", "listbox")' in combobox_script
+    assert 'this.toggle.className = "model-combobox-toggle"' in combobox_script
+    assert "class FccModelCombobox" in combobox_script
+    assert 'input.addEventListener("click", () => this.open())' in combobox_script
+    assert "value.toLocaleLowerCase().includes(normalizedQuery)" in combobox_script
+    assert 'event.key === "ArrowDown" || event.key === "ArrowUp"' in combobox_script
+    assert "this.setActive(this.visibleOptions.length - 1)" in combobox_script
+    assert 'event.key === "Enter"' in combobox_script
+    assert 'event.key === "Escape"' in combobox_script
+    assert 'document.createElement("datalist")' not in combobox_script
     assert ".model-combobox-list" in styles
     assert ".model-combobox-option.active" in styles
     assert styles.count("background-image: var(--dropdown-chevron)") == 2
@@ -401,7 +669,7 @@ def test_admin_config_masks_secrets_and_exposes_manifest(monkeypatch, tmp_path):
     assert "FIREWORKS_API_KEY" in keys
     assert "CLOUDFLARE_API_TOKEN" in keys
     assert "CLOUDFLARE_ACCOUNT_ID" in keys
-    assert "GITHUB_MODELS_TOKEN" in keys
+    assert "GITHUB_MODELS_TOKEN" not in keys
     assert "GEMINI_API_KEY" in keys
     assert "GROQ_API_KEY" in keys
     assert "SAMBANOVA_API_KEY" in keys
@@ -929,7 +1197,7 @@ def test_admin_apply_rejects_invalid_provider_proxy_without_side_effects(
     env_file.write_text("MODEL=open_router/test-model\n", encoding="utf-8")
     callbacks: list[str] = []
 
-    async def restart_callback() -> None:
+    def restart_callback() -> None:
         callbacks.append("restart")
 
     app = create_test_app(restart_callback=restart_callback)
@@ -1374,7 +1642,7 @@ def test_admin_apply_writes_cohere_key_and_masks_preview(monkeypatch, tmp_path):
     assert "COHERE_API_KEY=cohere-secret" in text
 
 
-def test_admin_apply_writes_github_models_token_and_masks_preview(
+def test_admin_apply_replaces_retired_model_and_ignores_retired_credential(
     monkeypatch, tmp_path
 ):
     _set_home(monkeypatch, tmp_path)
@@ -1394,11 +1662,11 @@ def test_admin_apply_writes_github_models_token_and_masks_preview(
     assert response.status_code == 200
     body = response.json()
     assert body["applied"] is True
-    assert "GITHUB_MODELS_TOKEN=********" in body["env_preview"]
+    assert "GITHUB_MODELS_TOKEN" not in body["env_preview"]
     env_file = tmp_path / ".fcc" / ".env"
     text = env_file.read_text(encoding="utf-8")
-    assert "MODEL=github_models/openai/gpt-4.1" in text
-    assert "GITHUB_MODELS_TOKEN=github-secret" in text
+    assert "MODEL=" not in text
+    assert "GITHUB_MODELS_TOKEN" not in text
 
 
 def test_admin_apply_preserves_hidden_diagnostics_and_smoke_values(
@@ -1503,10 +1771,11 @@ def test_admin_apply_restart_required_reports_automatic_restart(monkeypatch, tmp
     _clear_process_config(monkeypatch)
     callbacks: list[str] = []
 
-    async def restart_callback() -> None:
+    def restart_callback() -> None:
         callbacks.append("restart")
 
     app = create_test_app(restart_callback=restart_callback)
+    instance_id = _local_client(app).get("/admin/api/status").json()["instance_id"]
 
     response = _local_client(app).post(
         "/admin/api/config/apply",
@@ -1522,8 +1791,33 @@ def test_admin_apply_restart_required_reports_automatic_restart(monkeypatch, tmp
         "automatic": True,
         "admin_url": "http://127.0.0.1:9090/admin",
         "fields": ["PORT"],
+        "instance_id": instance_id,
     }
     assert callbacks == ["restart"]
+
+
+@pytest.mark.parametrize("origin", ["http://127.0.0.1:8082", "http://localhost:9090"])
+def test_admin_restart_status_can_be_read_from_another_local_address(origin):
+    app = create_test_app()
+    response = _local_client(app).get("/admin/api/status", headers={"Origin": origin})
+    assert response.status_code == 200
+    assert response.headers["Access-Control-Allow-Origin"] == origin
+    assert response.headers["Vary"] == "Origin"
+    initial = response.json()
+    assert initial["status"] == "running"
+    assert isinstance(initial["instance_id"], str) and initial["instance_id"]
+    runtime_for_app(app).begin_shutdown()
+    stopping = _local_client(app).get("/admin/api/status").json()
+    assert stopping["status"] == "stopping"
+    assert stopping["instance_id"] == initial["instance_id"]
+
+
+def test_admin_restart_status_does_not_allow_a_remote_web_origin():
+    response = _local_client(create_test_app()).get(
+        "/admin/api/status", headers={"Origin": "https://example.com"}
+    )
+    assert response.status_code == 403
+    assert "Access-Control-Allow-Origin" not in response.headers
 
 
 def test_admin_apply_restart_required_reports_manual_fallback(monkeypatch, tmp_path):
@@ -1546,6 +1840,107 @@ def test_admin_apply_restart_required_reports_manual_fallback(monkeypatch, tmp_p
         "admin_url": None,
         "fields": ["PORT"],
     }
+
+
+def test_restart_signal_failure_reports_saved_config_and_manual_restart(
+    monkeypatch, tmp_path, caplog
+):
+    _set_home(monkeypatch, tmp_path)
+    _clear_process_config(monkeypatch)
+
+    def restart_callback() -> None:
+        raise RuntimeError("private restart failure detail")
+
+    app = create_test_app(restart_callback=restart_callback)
+    client = _local_client(app)
+    original_port = client.get("/admin/api/status").json()["port"]
+    response = client.post("/admin/api/config/apply", json={"values": {"PORT": "9090"}})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["applied"] is True
+    assert body["restart"] == {
+        "required": True,
+        "automatic": False,
+        "admin_url": None,
+        "fields": ["PORT"],
+    }
+    assert "PORT=9090" in (tmp_path / ".fcc" / ".env").read_text()
+    status = client.get("/admin/api/status").json()
+    assert status["port"] == original_port
+    assert status["pending_fields"] == ["PORT"]
+    assert "private restart failure detail" not in response.text + caplog.text
+
+
+@pytest.mark.parametrize(
+    "followup",
+    [{"PORT": "9090"}, {"MODEL": "nvidia_nim/new"}, {"LOG_LEVEL": "WARNING"}],
+)
+@pytest.mark.parametrize("signal_recovers", [False, True])
+def test_pending_restart_survives_later_apply(
+    monkeypatch, tmp_path, followup, signal_recovers
+):
+    from unittest.mock import MagicMock
+
+    from free_claude_code.config.loader import ManagedConfigStore
+
+    _set_home(monkeypatch, tmp_path)
+    _clear_process_config(monkeypatch)
+    store = ManagedConfigStore()
+    store.initialize()
+    settings = store.read().settings
+    callback = MagicMock(
+        side_effect=[
+            RuntimeError("first signal failed"),
+            None if signal_recovers else RuntimeError("still unavailable"),
+        ]
+    )
+    app = create_test_app(settings, restart_callback=callback)
+    client = _local_client(app)
+    assert client.post(
+        "/admin/api/config/apply", json={"values": {"PORT": "9090"}}
+    ).json()["restart"]["required"]
+    result = client.post("/admin/api/config/apply", json={"values": followup}).json()
+    fields = ["PORT", "LOG_LEVEL"] if "LOG_LEVEL" in followup else ["PORT"]
+    assert result["applied"] is True
+    assert result["restart"]["required"] is True
+    assert result["restart"]["automatic"] is signal_recovers
+    assert result["restart"]["fields"] == fields
+    assert callback.call_count == 2
+    status = client.get("/admin/api/status").json()
+    assert status["port"] == settings.port
+    assert status["pending_fields"] == ([] if signal_recovers else fields)
+    assert provider_manager_for_app(app).current_generation_id == 1
+
+
+def test_reverting_pending_restart_restores_hot_apply(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+
+    from free_claude_code.config.loader import ManagedConfigStore
+
+    _set_home(monkeypatch, tmp_path)
+    _clear_process_config(monkeypatch)
+    store = ManagedConfigStore()
+    store.initialize()
+    settings = store.read().settings
+    callback = MagicMock(side_effect=RuntimeError("restart failed"))
+    app = create_test_app(settings, restart_callback=callback)
+    client = _local_client(app)
+    client.post("/admin/api/config/apply", json={"values": {"PORT": "9090"}})
+    with patch.object(
+        provider_manager_for_app(app), "_refresh_generation_in_background", AsyncMock()
+    ):
+        result = client.post(
+            "/admin/api/config/apply",
+            json={"values": {"PORT": str(settings.port), "MODEL": "nvidia_nim/new"}},
+        ).json()
+    assert result["applied"] is True
+    assert result["restart"]["required"] is False
+    assert callback.call_count == 1
+    status = client.get("/admin/api/status").json()
+    assert status["pending_fields"] == []
+    assert status["port"] == settings.port
+    assert status["model"] == "nvidia_nim/new"
 
 
 def test_admin_process_env_values_are_locked_and_not_written(monkeypatch, tmp_path):
@@ -1751,6 +2146,43 @@ def test_admin_local_provider_status_reports_reachable(monkeypatch, tmp_path):
     assert response.status_code == 200
     providers = response.json()["providers"]
     assert {provider["status"] for provider in providers} == {"reachable"}
+
+
+def test_admin_local_provider_status_checks_all_providers_concurrently(
+    monkeypatch, tmp_path
+):
+    _set_home(monkeypatch, tmp_path)
+    _clear_process_config(monkeypatch)
+    app = create_test_app()
+    calls = 0
+    active = 0
+    max_active = 0
+
+    class SlowAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url: str):
+            nonlocal active, calls, max_active
+            calls += 1
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return httpx.Response(200, json={"data": []})
+
+    with patch("free_claude_code.api.admin_routes.httpx.AsyncClient", SlowAsyncClient):
+        response = _local_client(app).get("/admin/api/providers/local-status")
+
+    assert response.status_code == 200
+    assert calls == 3
+    assert max_active == 3
 
 
 def test_admin_config_exposes_structured_provider_configuration_targets(

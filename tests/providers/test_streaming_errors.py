@@ -19,7 +19,7 @@ from free_claude_code.core.anthropic.streaming import (
     make_text_recovery_body,
     tool_schemas_by_name,
 )
-from free_claude_code.core.failures import ExecutionFailure
+from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.openai_tool_names import OpenAIToolNameCodec
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
@@ -202,6 +202,20 @@ def _make_chunk(
     return chunk
 
 
+def _make_context_length_bad_request() -> openai.BadRequestError:
+    response = httpx2.Response(
+        status_code=400,
+        request=httpx2.Request(
+            "POST", "https://test.api.nvidia.com/v1/chat/completions"
+        ),
+    )
+    return openai.BadRequestError(
+        "maximum context reached",
+        response=response,
+        body={"error": {"code": "context_length_exceeded"}},
+    )
+
+
 def _make_usage_chunk(*, prompt_tokens: int, completion_tokens: int):
     chunk = MagicMock()
     chunk.choices = []
@@ -349,6 +363,42 @@ class TestStreamingExceptionHandling:
             error = await _collect_stream_error(provider, request)
 
         assert "API failed" in error.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("wire_api", ["messages", "responses"])
+    async def test_context_finish_reason_is_terminal_before_output(
+        self,
+        wire_api: str,
+    ) -> None:
+        provider = _make_provider()
+        stream = AsyncStreamMock(
+            [_make_chunk(finish_reason=" Model_Context_Window_Exceeded ")]
+        )
+
+        with (
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                return_value=stream,
+            ) as create,
+            pytest.raises(ExecutionFailure) as exc_info,
+        ):
+            if wire_api == "messages":
+                await _collect_stream(provider, _make_request())
+            else:
+                [
+                    event
+                    async for event in provider.stream_responses(
+                        OpenAIResponsesRequest(model="test-model", input="hello"),
+                        request_id="req_context",
+                        response_model="public-model",
+                    )
+                ]
+
+        assert create.await_count == 1
+        assert exc_info.value.kind is FailureKind.CONTEXT_WINDOW_EXCEEDED
+        assert exc_info.value.retryable is False
 
     @pytest.mark.asyncio
     async def test_read_timeout_with_empty_message_raises_fallback(self):
@@ -1645,6 +1695,154 @@ class TestStreamingExceptionHandling:
         assert all(stream.closed for stream in streams)
 
     @pytest.mark.asyncio
+    async def test_recovery_stream_reopen_retains_accepted_corrected_body(self):
+        """Reopening one derived request reuses its accepted correction."""
+        provider = _make_provider()
+        runner = _make_stream_runner(provider)
+        execution = provider._admission.start_execution()
+        response = httpx2.Response(
+            status_code=400,
+            request=httpx2.Request("POST", "https://example.com/v1/chat/completions"),
+        )
+        usage_rejection = openai.BadRequestError(
+            "stream_options is unsupported",
+            response=response,
+            body={"error": {"message": "stream_options is unsupported"}},
+        )
+        failed_stream = ClosableAsyncStreamMock(
+            [_make_chunk(content="discarded")],
+            error=httpx.ReadError("recovery cutoff"),
+        )
+        successful_stream = ClosableAsyncStreamMock(
+            [_make_chunk(content="visible"), _make_chunk(finish_reason="stop")]
+        )
+        body = {
+            "messages": [],
+            "stream_options": {"include_usage": True},
+        }
+
+        with (
+            patch.object(
+                provider,
+                "_create_stream",
+                new_callable=AsyncMock,
+                wraps=provider._create_stream,
+            ) as create_stream,
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                side_effect=[usage_rejection, failed_stream, successful_stream],
+            ) as create,
+        ):
+            recovered = await runner._collect_recovery_output(
+                body,
+                include_reasoning=True,
+                execution=execution,
+                operation_kind=ProviderOperationKind.CONTINUATION,
+            )
+
+        assert create.await_count == 3
+        assert create.await_args_list[0].kwargs["stream_options"] == {
+            "include_usage": True
+        }
+        assert "stream_options" not in create.await_args_list[1].kwargs
+        assert "stream_options" not in create.await_args_list[2].kwargs
+        assert create_stream.await_count == 2
+        assert (
+            create_stream.await_args_list[0].kwargs["used_retry_kinds"]
+            is create_stream.await_args_list[1].kwargs["used_retry_kinds"]
+        )
+        assert recovered.text == "visible"
+        assert failed_stream.closed
+        assert successful_stream.closed
+
+    @pytest.mark.asyncio
+    async def test_tool_repair_iterations_reuse_accepted_corrected_body(self):
+        """Schema-repair retries reuse corrections accepted for that repair body."""
+        provider = _make_provider()
+        request = _make_request(
+            tools=[
+                {
+                    "name": "echo_smoke",
+                    "description": "Echo one message",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"message": {"type": "string"}},
+                        "required": ["message"],
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+        )
+        runner = _make_stream_runner(provider, request=request)
+        assembler = runner._new_stream_assembler(output_reasoning=False)
+        tuple(assembler.start_events())
+        tuple(
+            assembler.feed(
+                _make_tool_calls_chunk(
+                    name="echo_smoke",
+                    arguments='{"message":',
+                    tool_id="call_repair",
+                )
+            )
+        )
+        body = provider._build_request_body(request)
+        body["stream_options"] = {"include_usage": True}
+        response = httpx2.Response(
+            status_code=400,
+            request=httpx2.Request("POST", "https://example.com/v1/chat/completions"),
+        )
+        usage_rejection = openai.BadRequestError(
+            "stream_options is unsupported",
+            response=response,
+            body={"error": {"message": "stream_options is unsupported"}},
+        )
+        invalid_repair = ClosableAsyncStreamMock(
+            [_make_chunk(content="123}"), _make_chunk(finish_reason="stop")]
+        )
+        valid_repair = ClosableAsyncStreamMock(
+            [_make_chunk(content='"ok"}'), _make_chunk(finish_reason="stop")]
+        )
+        execution = provider._admission.start_execution()
+
+        with (
+            patch.object(
+                provider,
+                "_create_stream",
+                new_callable=AsyncMock,
+                wraps=provider._create_stream,
+            ) as create_stream,
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                side_effect=[usage_rejection, invalid_repair, valid_repair],
+            ) as create,
+        ):
+            events = await runner._repair_tool_args(
+                body=body,
+                output=assembler.output,
+                tool_argument_alias_buffers=assembler.tool_argument_alias_buffers,
+                execution=execution,
+            )
+
+        assert events is not None
+        assert create.await_count == 3
+        assert create.await_args_list[0].kwargs["stream_options"] == {
+            "include_usage": True
+        }
+        assert "stream_options" not in create.await_args_list[1].kwargs
+        assert "stream_options" not in create.await_args_list[2].kwargs
+        assert create_stream.await_count == 2
+        assert (
+            create_stream.await_args_list[0].kwargs["used_retry_kinds"]
+            is create_stream.await_args_list[1].kwargs["used_retry_kinds"]
+        )
+        assert invalid_repair.closed
+        assert valid_repair.closed
+
+    @pytest.mark.asyncio
     async def test_recovery_collect_text_accepts_finish_reason(self):
         """Recovery collectors return text only after the upstream terminal marker."""
         stream = ClosableAsyncStreamMock(
@@ -1674,6 +1872,123 @@ class TestStreamingExceptionHandling:
         assert result.thinking == ""
         assert result.tool_calls == ()
         assert stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_context_exhaustion_during_recovery_remains_terminal(self):
+        """A recovery request cannot turn context exhaustion into success."""
+        original = ClosableAsyncStreamMock(
+            [_make_chunk(content="partial" + ("x" * 70_000))]
+        )
+        recovery = ClosableAsyncStreamMock(
+            [
+                _make_chunk(content="continued"),
+                _make_chunk(finish_reason="model_context_window_exceeded"),
+            ]
+        )
+        provider = _make_provider()
+
+        with patch.object(
+            provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            side_effect=[original, recovery],
+        ):
+            events, failure = await _collect_stream_and_error(
+                provider,
+                _make_request(),
+            )
+
+        assert failure.kind is FailureKind.CONTEXT_WINDOW_EXCEEDED
+        assert failure.retryable is False
+        assert not any(
+            event.event == "message_stop" for event in parse_sse_text("".join(events))
+        )
+        assert original.closed is True
+        assert recovery.closed is True
+
+    @pytest.mark.asyncio
+    async def test_context_error_opening_continuation_remains_terminal(self):
+        """A derived continuation's SDK context error replaces the cutoff."""
+        original = ClosableAsyncStreamMock(
+            [_make_chunk(content="partial" + ("x" * 70_000))]
+        )
+        provider = _make_provider()
+
+        with patch.object(
+            provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            side_effect=[original, _make_context_length_bad_request()],
+        ) as create:
+            events, failure = await _collect_stream_and_error(
+                provider,
+                _make_request(),
+            )
+
+        assert create.await_count == 2
+        assert failure.kind is FailureKind.CONTEXT_WINDOW_EXCEEDED
+        assert failure.retryable is False
+        assert not any(
+            event.event == "message_stop" for event in parse_sse_text("".join(events))
+        )
+        assert original.closed is True
+
+    @pytest.mark.asyncio
+    async def test_context_error_opening_tool_repair_remains_terminal(self):
+        """A derived tool repair's SDK context error replaces the truncation."""
+        provider = _make_provider()
+        request = _make_request(
+            tools=[
+                {
+                    "name": "echo_smoke",
+                    "description": "Echo",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"message": {"type": "string"}},
+                        "required": ["message"],
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+        )
+        original = ClosableAsyncStreamMock(
+            [
+                _make_tool_calls_chunk(
+                    name="echo_smoke",
+                    arguments='{"message":"' + ("x" * 70_000),
+                    tool_id="call_repair",
+                )
+            ],
+            error=httpx.ReadError("tool stream cutoff"),
+        )
+
+        with (
+            patch.object(
+                provider,
+                "_create_stream",
+                new_callable=AsyncMock,
+                wraps=provider._create_stream,
+            ) as create_stream,
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                side_effect=[original, _make_context_length_bad_request()],
+            ) as create,
+        ):
+            events, failure = await _collect_stream_and_error(provider, request)
+
+        assert create.await_count == 2
+        assert [call.args[2] for call in create_stream.await_args_list] == [
+            ProviderOperationKind.GENERATION,
+            ProviderOperationKind.TOOL_REPAIR,
+        ]
+        assert failure.kind is FailureKind.CONTEXT_WINDOW_EXCEEDED
+        assert failure.retryable is False
+        assert not any(
+            event.event == "message_stop" for event in parse_sse_text("".join(events))
+        )
+        assert original.closed is True
 
     @pytest.mark.asyncio
     async def test_recovery_close_failure_preserves_completed_output(self):

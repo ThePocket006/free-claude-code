@@ -239,6 +239,21 @@ class ApplicationErrorPreflightProvider(FakeProvider):
         raise self._error
 
 
+class ExecutionFailurePreflightProvider(FakeProvider):
+    def __init__(self, failure: ExecutionFailure) -> None:
+        super().__init__()
+        self._failure = failure
+
+    def preflight_messages(
+        self,
+        request: MessagesRequest,
+        *,
+        reasoning: ReasoningPolicy,
+    ) -> None:
+        super().preflight_messages(request, reasoning=reasoning)
+        raise self._failure
+
+
 class FailingStreamConstructionProvider(FakeProvider):
     def stream_messages(
         self,
@@ -405,6 +420,69 @@ def _executor_stream(
         raw_log_payload={},
         request_id=request_id,
     )
+
+
+@pytest.mark.asyncio
+async def test_candidate_observer_runs_once_before_committed_output() -> None:
+    provider = FakeProvider()
+    selected: list[str] = []
+    executor = ProviderExecutor(
+        lambda _provider_id: provider,
+        progress_timeout_seconds=1.0,
+    )
+
+    async def observe(target: ProviderModelTarget) -> None:
+        selected.append(target.provider_model_ref)
+
+    stream = executor.stream_messages(
+        _routed_request(),
+        raw_log_payload={},
+        request_id="req_candidate_observer",
+        candidate_selected=observe,
+    )
+
+    assert [chunk async for chunk in stream]
+    assert selected == ["provider/provider-model"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_observer_records_only_successful_fallback() -> None:
+    primary = ControlledProvider([_execution_failure("overloaded")])
+    fallback = FakeProvider()
+    providers = {"provider": primary, "fallback": fallback}
+    selected: list[str] = []
+    executor = ProviderExecutor(
+        providers.__getitem__,
+        progress_timeout_seconds=1.0,
+    )
+    stream = executor.stream_messages(
+        _routed_request(_target("fallback", "model")),
+        raw_log_payload={},
+        request_id="req_candidate_fallback_observer",
+        candidate_selected=lambda target: selected.append(target.provider_model_ref),
+    )
+
+    assert [chunk async for chunk in stream]
+    assert selected == ["fallback/model"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_observer_records_normal_empty_completion() -> None:
+    provider = ControlledProvider([])
+    selected: list[str] = []
+    executor = ProviderExecutor(
+        lambda _provider_id: provider,
+        progress_timeout_seconds=1.0,
+    )
+    stream = executor.stream_messages(
+        _routed_request(),
+        raw_log_payload={},
+        request_id="req_empty_candidate_observer",
+        candidate_selected=lambda target: selected.append(target.provider_model_ref),
+    )
+
+    assert [chunk async for chunk in stream] == []
+    assert selected == ["provider/provider-model"]
 
 
 @pytest.mark.asyncio
@@ -742,6 +820,36 @@ async def test_nonretryable_provider_failure_selects_fallback_before_first_frame
     )
     assert fallback_started["failure_kind"] == failure_kind.value
     assert fallback_started["provider_retryable"] is False
+
+
+@pytest.mark.asyncio
+async def test_primary_canonical_preflight_failure_selects_fallback() -> None:
+    primary_failure = ExecutionFailure(
+        kind=FailureKind.CONTEXT_WINDOW_EXCEEDED,
+        status_code=400,
+        message="primary context exceeded",
+        retryable=False,
+    )
+    primary = ExecutionFailurePreflightProvider(primary_failure)
+    fallback = ControlledProvider(["fallback-frame"])
+    providers = {"provider": primary, "fallback": fallback}
+    failures: list[ExecutionFailure] = []
+    executor = ProviderExecutor(
+        providers.__getitem__,
+        progress_timeout_seconds=60.0,
+    )
+
+    stream = executor.stream_messages(
+        _routed_request(_target("fallback", "fallback-model")),
+        raw_log_payload={},
+        request_id="req_preflight_fallback",
+        candidate_failed=failures.append,
+    )
+
+    assert [chunk async for chunk in stream] == ["fallback-frame"]
+    assert failures == [primary_failure]
+    assert primary.stream_calls == []
+    assert fallback.preflight_calls[0][0].model == "fallback-model"
 
 
 @pytest.mark.asyncio

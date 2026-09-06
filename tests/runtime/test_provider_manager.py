@@ -90,6 +90,7 @@ async def test_startup_generation_lease_and_shutdown_close_exactly_once() -> Non
 
     assert lease.generation_id == 1
     assert lease.settings is settings
+    assert lease.model_infos == ()
     assert lease.is_provider_cached("cached") is True
     assert lease.resolve_provider("nvidia_nim") is factory.runtimes[0].provider
     await lease.release()
@@ -227,7 +228,7 @@ async def test_catalog_publication_tracks_replacement_and_its_refresh() -> None:
 
     await manager.replace(
         _settings("nvidia_nim/two"),
-        commit=lambda: None,
+        commit=AsyncMock(),
     )
     refresh_task = manager._refresh_task
     assert refresh_task is not None
@@ -283,7 +284,7 @@ async def test_replacement_keeps_leased_generation_open_until_final_release() ->
 
     generation_id = await manager.replace(
         second_settings,
-        commit=lambda: committed.append("persisted"),
+        commit=AsyncMock(side_effect=lambda: committed.append("persisted")),
     )
     new_lease = await manager.acquire()
 
@@ -321,7 +322,7 @@ async def test_hot_replacement_owns_admission_per_provider_generation() -> None:
         refresh = AsyncMock()
 
         with patch.object(manager, "_refresh_generation", refresh):
-            await manager.replace(second_settings, commit=lambda: None)
+            await manager.replace(second_settings, commit=AsyncMock())
             new_lease = await manager.acquire()
             new_provider = new_lease.resolve_provider("nvidia_nim")
             await asyncio.sleep(0)
@@ -354,7 +355,7 @@ async def test_replacement_closes_unleased_generation_immediately() -> None:
 
     await manager.replace(
         _settings("nvidia_nim/two"),
-        commit=lambda: None,
+        commit=AsyncMock(),
     )
 
     assert factory.runtimes[0].cleanup_calls == 1
@@ -382,7 +383,7 @@ async def test_cancelled_replacement_does_not_cancel_owned_generation_cleanup() 
         replace_task = asyncio.create_task(
             manager.replace(
                 _settings("nvidia_nim/two"),
-                commit=lambda: None,
+                commit=AsyncMock(),
             )
         )
         await cleanup_started.wait()
@@ -419,7 +420,7 @@ async def test_cancelled_final_lease_release_keeps_owned_cleanup_running() -> No
     lease = await manager.acquire()
     await manager.replace(
         _settings("nvidia_nim/two"),
-        commit=lambda: None,
+        commit=AsyncMock(),
     )
     cleanup_started = asyncio.Event()
     cleanup_release = asyncio.Event()
@@ -460,7 +461,7 @@ async def test_hot_cleanup_failure_keeps_published_replacement() -> None:
 
     generation_id = await manager.replace(
         _settings("nvidia_nim/two"),
-        commit=lambda: None,
+        commit=AsyncMock(),
     )
 
     assert generation_id == 2
@@ -487,7 +488,7 @@ async def test_candidate_construction_failure_preserves_current_generation() -> 
     with pytest.raises(RuntimeError, match="cannot construct"):
         await manager.replace(
             _settings("nvidia_nim/two"),
-            commit=lambda: None,
+            commit=AsyncMock(),
         )
 
     assert manager.current_generation_id == 1
@@ -504,7 +505,7 @@ async def test_failed_candidate_cleanup_is_retried_at_shutdown() -> None:
         runtime_factory=factory,
     )
 
-    def fail_commit() -> None:
+    async def fail_commit() -> None:
         factory.runtimes[1].cleanup_error = RuntimeError("private cleanup detail")
         raise OSError("disk full")
 
@@ -549,7 +550,7 @@ async def test_later_replacement_retries_failed_unpublished_candidate() -> None:
         runtime_factory=factory,
     )
 
-    def fail_commit() -> None:
+    async def fail_commit() -> None:
         factory.runtimes[1].cleanup_error = RuntimeError("cleanup failed")
         raise OSError("disk full")
 
@@ -562,7 +563,7 @@ async def test_later_replacement_retries_failed_unpublished_candidate() -> None:
     factory.runtimes[1].cleanup_error = None
     generation_id = await manager.replace(
         _settings("nvidia_nim/three"),
-        commit=lambda: None,
+        commit=AsyncMock(),
     )
 
     assert generation_id == 2
@@ -581,7 +582,7 @@ async def test_cancelled_candidate_cleanup_remains_owned_until_shutdown() -> Non
     cleanup_started = asyncio.Event()
     cleanup_release = asyncio.Event()
 
-    def fail_commit() -> None:
+    async def fail_commit() -> None:
         candidate = factory.runtimes[1]
         candidate.cleanup_started = cleanup_started
         candidate.cleanup_release = cleanup_release
@@ -633,14 +634,14 @@ async def test_concurrent_replacements_are_serialized_in_call_order() -> None:
         first = asyncio.create_task(
             manager.replace(
                 _settings("nvidia_nim/two"),
-                commit=lambda: None,
+                commit=AsyncMock(),
             )
         )
         await first_entered.wait()
         second = asyncio.create_task(
             manager.replace(
                 _settings("nvidia_nim/three"),
-                commit=lambda: None,
+                commit=AsyncMock(),
             )
         )
         await asyncio.sleep(0)
@@ -692,7 +693,7 @@ async def test_cancelled_shutdown_retains_generation_for_retry() -> None:
     with pytest.raises(ApplicationUnavailableError, match="shutting down"):
         await manager.acquire()
     with pytest.raises(ApplicationUnavailableError, match="shutting down"):
-        await manager.replace(_settings("nvidia_nim/two"), commit=lambda: None)
+        await manager.replace(_settings("nvidia_nim/two"), commit=AsyncMock())
     assert factory.runtimes[0].cleanup_calls == 0
 
     await lease.release()
@@ -786,7 +787,7 @@ async def test_application_catalog_survives_generation_replacement() -> None:
 
     await manager.replace(
         _settings("nvidia_nim/two"),
-        commit=lambda: None,
+        commit=AsyncMock(),
     )
 
     assert manager.cached_model_ids() == {"lmstudio": frozenset({"persisted"})}
@@ -794,6 +795,41 @@ async def test_application_catalog_survives_generation_replacement() -> None:
         "persisted",
         supports_thinking=True,
     )
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_generation_lease_keeps_its_model_metadata_after_replacement() -> None:
+    factory = RuntimeFactory()
+    first_settings = _settings("open_router/one").model_copy(
+        update={"open_router_api_key": "open-router-key"}
+    )
+    manager = ProviderRuntimeManager(first_settings, runtime_factory=factory)
+    manager.cache_model_infos(
+        "open_router",
+        {
+            ProviderModelInfo(
+                "old-model",
+                context_window_tokens=32_000,
+                max_output_tokens=4_096,
+            )
+        },
+    )
+    lease = await manager.acquire(include_model_infos=True)
+
+    await manager.replace(
+        _settings("nvidia_nim/two"),
+        commit=AsyncMock(),
+    )
+
+    assert lease.model_infos == (
+        ProviderModelInfo(
+            "open_router/old-model",
+            context_window_tokens=32_000,
+            max_output_tokens=4_096,
+        ),
+    )
+    await lease.release()
     await manager.close()
 
 
@@ -808,7 +844,7 @@ async def test_replacement_prunes_and_rejects_removed_remote_provider_cache() ->
 
     await manager.replace(
         _settings("nvidia_nim/two"),
-        commit=lambda: None,
+        commit=AsyncMock(),
     )
     manager.cache_model_infos("open_router", {ProviderModelInfo("late-old-model")})
 
@@ -828,7 +864,7 @@ async def test_generation_lifecycle_traces_contain_minimal_correlation_fields() 
         lease = await manager.acquire()
         await manager.replace(
             _settings("nvidia_nim/two"),
-            commit=lambda: None,
+            commit=AsyncMock(),
             reason="test_replace",
         )
         await lease.release()
