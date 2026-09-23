@@ -3,10 +3,9 @@
 import re
 from dataclasses import dataclass, field
 
+from free_claude_code.application.model_catalog import CatalogModel, model_order_key
 from free_claude_code.core.json_types import JsonObject
 from free_claude_code.core.model_capabilities import ModelInputModality
-
-from .model_catalog import ClientModel
 
 AIDER_API_KEY_ENV_PREFIX = "FCC_AIDER_PROXY_AUTH_"
 _AIDER_API_KEY_ENV_PATTERN = re.compile(rf"{AIDER_API_KEY_ENV_PREFIX}[A-Z0-9]+")
@@ -21,10 +20,11 @@ class AiderConfig:
 
 
 def build_aider_config(
-    models: tuple[ClientModel, ...],
+    models: tuple[CatalogModel, ...],
     *,
     messages_url: str,
     api_key_env: str,
+    launch_id: str,
 ) -> AiderConfig:
     """Project a non-empty FCC Messages catalog into Aider's file contracts."""
 
@@ -38,7 +38,14 @@ def build_aider_config(
         by_name.setdefault(f"anthropic/{model.wire_slug}", model)
     settings: list[JsonObject] = []
     metadata: JsonObject = {}
-    for name, model in by_name.items():
+    for name, model in sorted(
+        by_name.items(),
+        key=lambda item: (
+            model_order_key(item[1].provider_model_ref),
+            item[0] != item[1].wire_slug,
+            item[0],
+        ),
+    ):
         entry: JsonObject = {
             "name": name,
             "weak_model_name": name,
@@ -47,6 +54,7 @@ def build_aider_config(
                 "model": f"anthropic/{model.wire_slug}",
                 "api_base": messages_url,
                 "api_key": f"os.environ/{api_key_env}",
+                "extra_headers": {"x-fcc-launch-id": launch_id},
             },
         }
         if model.supports_reasoning is not None:
@@ -58,7 +66,7 @@ def build_aider_config(
     return AiderConfig(settings=settings, metadata=metadata)
 
 
-def _model_metadata(model: ClientModel) -> JsonObject:
+def _model_metadata(model: CatalogModel) -> JsonObject:
     metadata: JsonObject = {
         "litellm_provider": "anthropic",
         "mode": "chat",

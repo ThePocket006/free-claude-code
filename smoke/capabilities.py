@@ -24,6 +24,25 @@ class CapabilityContract:
 
 CAPABILITY_CONTRACTS: tuple[CapabilityContract, ...] = (
     CapabilityContract(
+        "persistence",
+        "code_session_settings_and_reviews",
+        "code_session_modes",
+        "free_claude_code.application.code_sessions.service.CodeService",
+        "Idle session settings updates and native Codex approval events",
+        "Per-turn mode selection, original permission settings, and ordered review history",
+        "Conflicting updates are rejected; native errors and interrupted reviews remain visible",
+        (
+            "tests/application/test_code_sessions.py",
+            "tests/runtime/test_code_sessions_sqlite.py",
+            "e2e/test_code_sessions.py",
+        ),
+        (
+            "test_codex_modes_local_e2e",
+            "test_codex_child_review_local_e2e",
+            "test_codex_modes_free_provider_e2e",
+        ),
+    ),
+    CapabilityContract(
         "api_compatibility",
         "routes_and_probes",
         "anthropic_api_routes",
@@ -77,6 +96,8 @@ CAPABILITY_CONTRACTS: tuple[CapabilityContract, ...] = (
             "tests/providers/test_openai_chat_stream_output.py",
             "tests/cli/test_entrypoints.py",
             "tests/cli/test_codex_model_catalog.py",
+            "tests/harnesses/test_codex_model_catalog.py",
+            "tests/runtime/test_codex_catalog.py",
         ),
         (
             "test_probe_and_models_routes",
@@ -543,6 +564,8 @@ CAPABILITY_CONTRACTS: tuple[CapabilityContract, ...] = (
         "shared startup; required catalog failure stops launch; private catalog cleanup",
         (
             "tests/cli/test_codex_model_catalog.py",
+            "tests/harnesses/test_codex_model_catalog.py",
+            "tests/runtime/test_codex_catalog.py",
             "tests/cli/test_codex_launcher.py",
             "tests/cli/test_launcher_workflow.py",
             "tests/cli/test_launcher_resources.py",
@@ -565,12 +588,14 @@ CAPABILITY_CONTRACTS: tuple[CapabilityContract, ...] = (
         "opencode_cli_integration",
         "opencode_cli_integration",
         "free_claude_code.cli.launchers.opencode",
-        "OpenCode V1 binary, live FCC model catalog, and child-process config",
+        "OpenCode 2 binary, live FCC model catalog, and child-process config",
         "Responses provider scoped to FCC with bearer authentication",
         "version, proxy, config conflict, or catalog failure exits without fallback",
         (
             "tests/cli/test_opencode_launcher.py",
-            "tests/cli/test_model_catalog.py",
+            "tests/application/test_model_catalog.py",
+            "tests/cli/test_model_catalog_decoder.py",
+            "tests/cli/test_catalog_http.py",
         ),
         ("test_opencode_cli_prompt_e2e",),
     ),
@@ -585,7 +610,9 @@ CAPABILITY_CONTRACTS: tuple[CapabilityContract, ...] = (
         (
             "tests/cli/test_aider_config.py",
             "tests/cli/test_aider_launcher.py",
-            "tests/cli/test_model_catalog.py",
+            "tests/application/test_model_catalog.py",
+            "tests/cli/test_model_catalog_decoder.py",
+            "tests/cli/test_catalog_http.py",
         ),
         ("test_aider_cli_prompt_e2e",),
     ),
@@ -599,7 +626,9 @@ CAPABILITY_CONTRACTS: tuple[CapabilityContract, ...] = (
         "version, proxy, catalog, or private-file failure exits before inference",
         (
             "tests/cli/test_cline_launcher.py",
-            "tests/cli/test_model_catalog.py",
+            "tests/application/test_model_catalog.py",
+            "tests/cli/test_model_catalog_decoder.py",
+            "tests/cli/test_catalog_http.py",
         ),
         ("test_cline_cli_prompt_e2e",),
     ),
@@ -645,7 +674,9 @@ CAPABILITY_CONTRACTS: tuple[CapabilityContract, ...] = (
         "version, process config conflict, proxy, or catalog failure exits before inference",
         (
             "tests/cli/test_grok_launcher.py",
-            "tests/cli/test_model_catalog.py",
+            "tests/application/test_model_catalog.py",
+            "tests/cli/test_model_catalog_decoder.py",
+            "tests/cli/test_catalog_http.py",
         ),
         ("test_grok_cli_headless_e2e",),
     ),

@@ -1,26 +1,30 @@
 """Single owner for application startup, shutdown, and runtime operations."""
 
 import asyncio
+import importlib
 import inspect
 import logging
 import os
 import traceback
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from functools import partial
+from typing import TYPE_CHECKING, Literal
 
 from loguru import logger
 
-import free_claude_code.cli.managed as cli_managed
-import free_claude_code.messaging.session as messaging_session
-import free_claude_code.messaging.workflow as messaging_workflow_module
-from free_claude_code.application.chat import ChatService
+from free_claude_code.application.code_sessions import CodeService
 from free_claude_code.application.connected_accounts import (
     ConnectedAccountLoginMode,
     ConnectedAccountPort,
     ConnectedAccountStatus,
 )
-from free_claude_code.application.errors import ApplicationUnavailableError
+from free_claude_code.application.errors import (
+    ApplicationError,
+    ApplicationUnavailableError,
+    InvalidRequestError,
+)
 from free_claude_code.application.model_metadata import ProviderModelRefreshResult
 from free_claude_code.application.ports import StopResult
 from free_claude_code.config.admin.persistence import (
@@ -30,10 +34,20 @@ from free_claude_code.config.admin.state import ConfigInputValue, ValueState
 from free_claude_code.config.admin.status import provider_config_status
 from free_claude_code.config.loader import clear_settings_cache
 from free_claude_code.config.model_refs import parse_provider_type
-from free_claude_code.config.paths import messaging_state_dir_path
+from free_claude_code.config.paths import (
+    claude_desktop_disconnect_path,
+    codex_model_catalog_path,
+    messaging_state_dir_path,
+)
 from free_claude_code.config.server_urls import local_admin_url, local_proxy_root_url
 from free_claude_code.config.settings import Settings
 from free_claude_code.core.json_types import JsonObject
+from free_claude_code.harnesses import (
+    claude_desktop_integration,
+    claude_integration,
+    codex_integration,
+    jetbrains_acp_integration,
+)
 from free_claude_code.messaging.platforms import factory as messaging_platform_factory
 from free_claude_code.messaging.platforms.factory import MessagingPlatformOptions
 from free_claude_code.messaging.platforms.ports import (
@@ -46,10 +60,37 @@ from free_claude_code.providers.credential_validation import (
     check_credentials,
 )
 
+if TYPE_CHECKING:
+    import free_claude_code.cli.managed as cli_managed
+    import free_claude_code.messaging.workflow as messaging_workflow_module
+
+from free_claude_code.application.readiness import InitializationWait
+from free_claude_code.core.async_tasks import run_sync_owned
+
 from .configuration import ConfigurationService
+from .folder_picker import NativeFolderPicker
 from .provider_manager import ProviderRuntimeManager
+from .retired_chat import remove_retired_chat_history
 
 RestartCallback = Callable[[], None]
+IntegrationAction = Literal["status", "connect", "disconnect", "refresh"]
+
+
+@dataclass
+class _IntegrationUpdate:
+    state: Literal["starting", "ready", "failed"] = "ready"
+    changed: bool = False
+    message: str | None = None
+    task: asyncio.Task[None] | None = None
+
+    def snapshot(self) -> JsonObject:
+        return {"state": self.state, "changed": self.changed, "message": self.message}
+
+    def complete(self, changed: bool = False) -> None:
+        self.state = "ready"
+        self.changed = changed
+        self.message = None
+
 
 _PROVIDER_CHECK_FAILURE_MESSAGE = (
     "Could not refresh this provider's models. Verify its configuration and access."
@@ -139,14 +180,18 @@ class ApplicationRuntime:
         *,
         configuration: ConfigurationService,
         transcriber: Transcriber | None,
-        chat_service: ChatService | None = None,
+        code_service: CodeService | None = None,
+        transcriber_factory: Callable[[Settings], Awaitable[Transcriber | None]]
+        | None = None,
         restart_callback: RestartCallback | None = None,
         connected_accounts: Mapping[str, ConnectedAccountPort] | None = None,
     ) -> None:
         self.provider_manager = provider_manager
         self._configuration = configuration
-        self._chat_service = chat_service
+        self._code_service = code_service
+        self._folder_picker = NativeFolderPicker()
         self._transcriber = transcriber
+        self._transcriber_factory = transcriber_factory
         self._restart_callback = restart_callback
         self._connected_accounts = dict(connected_accounts or {})
         self._connected_account_revisions = {
@@ -167,6 +212,16 @@ class ApplicationRuntime:
         self._provider_manager_closed = False
         self._connected_accounts_closed = False
         self._lifecycle_lock = asyncio.Lock()
+        self._startup_tasks: list[asyncio.Task[None]] = []
+        self._claude_update = _IntegrationUpdate()
+        self._desktop_update = _IntegrationUpdate()
+        self._codex_update = _IntegrationUpdate()
+        self._jetbrains_update = _IntegrationUpdate()
+        self._http_ready = asyncio.Event()
+        self._messaging_state = (
+            "disabled" if self.settings.messaging_platform == "none" else "starting"
+        )
+        self._messaging_error: str | None = None
 
     @property
     def settings(self) -> Settings:
@@ -194,30 +249,28 @@ class ApplicationRuntime:
                     raise ApplicationUnavailableError(
                         "Application runtime is shutting down."
                     )
-                # Warm provider model cache with a timeout so a slow upstream
-                # catalog cannot block startup; real failures still propagate
-                # so owned resources are closed by the failure path.
-                try:
-                    await asyncio.wait_for(
-                        self.provider_manager.warm_referenced_model_cache(),
-                        timeout=10.0,
-                    )
-                except TimeoutError:
-                    logger.warning(
-                        "Provider model cache warm-up timed out after 10s, "
-                        "continuing startup"
-                    )
                 self.provider_manager.start_model_list_refresh()
-                if self._chat_service is not None:
-                    await self._chat_service.start()
-                await self._start_messaging_if_configured()
-                if self._draining:
-                    raise ApplicationUnavailableError(
-                        "Application runtime is shutting down."
+                await self.refresh_claude_vscode()
+                await self.refresh_codex_integration()
+                await self.refresh_claude_desktop()
+                await self.refresh_jetbrains_acp()
+                self._startup_tasks.append(
+                    asyncio.create_task(
+                        run_sync_owned(remove_retired_chat_history),
+                        name="fcc-retired-chat-cleanup",
                     )
-                logging.getLogger("uvicorn.error").info(
-                    "Admin UI: %s (local-only)",
-                    local_admin_url(self.settings),
+                )
+                if self._code_service is not None:
+                    self._startup_tasks.append(
+                        asyncio.create_task(
+                            self._code_service.start(), name="fcc-code-startup"
+                        )
+                    )
+                self._startup_tasks.append(
+                    asyncio.create_task(
+                        self._start_messaging_if_configured(),
+                        name="fcc-messaging-startup",
+                    )
                 )
                 self._started = True
         except asyncio.CancelledError:
@@ -230,11 +283,22 @@ class ApplicationRuntime:
             await self.close()
             raise
 
+    def http_started(self) -> None:
+        """Called by the server after lifespan and socket adoption, not at reservation."""
+        if self._draining or self._http_ready.is_set():
+            return
+        self._http_ready.set()
+        logging.getLogger("uvicorn.error").info(
+            "Admin UI: %s (local-only)", local_admin_url(self.settings)
+        )
+
     def begin_shutdown(self) -> None:
         """Finish indefinite observer responses before the server drains HTTP."""
         self._draining = True
-        if self._chat_service is not None:
-            self._chat_service.begin_shutdown()
+        self.provider_manager.begin_shutdown()
+        self._folder_picker.begin_shutdown()
+        if self._code_service is not None:
+            self._code_service.begin_shutdown()
 
     async def close(self) -> bool:
         self.begin_shutdown()
@@ -242,6 +306,17 @@ class ApplicationRuntime:
             if self._closed:
                 return True
             logger.info("Shutdown requested, cleaning up...")
+            for task in self._startup_tasks:
+                if not task.done():
+                    task.cancel()
+            results = await asyncio.gather(*self._startup_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(
+                        "Background initialization ended with exc_type={}",
+                        type(result).__name__,
+                    )
+            self._startup_tasks.clear()
             async with self._config_lock:
                 self._closed = await self._close_owned_resources()
             if self._closed:
@@ -252,6 +327,9 @@ class ApplicationRuntime:
                     "Server shutdown incomplete; owned resources remain for retry"
                 )
             return self._closed
+
+    async def pick_folder(self, initial_path: str | None) -> str | None:
+        return await self._folder_picker.pick_folder(initial_path)
 
     async def apply_admin_config(
         self,
@@ -348,12 +426,326 @@ class ApplicationRuntime:
     async def admin_values(self) -> ValueState:
         return await self._configuration.admin_values()
 
+    async def claude_vscode_status(self) -> JsonObject:
+        return await self._claude_vscode("status")
+
+    async def connect_claude_vscode(self) -> JsonObject:
+        return await self._claude_vscode("connect")
+
+    async def disconnect_claude_vscode(self) -> JsonObject:
+        return await self._claude_vscode("disconnect")
+
+    def _check_integration_available(self) -> None:
+        if self._draining or self._pending_fields:
+            raise ApplicationUnavailableError(
+                "Wait for FCC to restart before changing the integration."
+            )
+
+    def _start_integration_update(
+        self,
+        update: _IntegrationUpdate,
+        operation: Callable[[], Awaitable[JsonObject]],
+    ) -> JsonObject:
+        self._check_integration_available()
+        if update.task is None or update.task.done():
+            update.state, update.changed, update.message = "starting", False, None
+
+            async def run() -> None:
+                try:
+                    result = await operation()
+                    update.complete(result.get("changed") is True)
+                except ApplicationError as exc:
+                    update.state, update.message = "failed", exc.message
+                except Exception as exc:
+                    update.state = "failed"
+                    update.message = (
+                        "Could not update integration settings. Retry shortly."
+                    )
+                    logger.warning(
+                        "Integration update failed: exc_type={}", type(exc).__name__
+                    )
+
+            update.task = asyncio.create_task(run(), name="fcc-integration-update")
+            self._startup_tasks.append(update.task)
+            update.task.add_done_callback(self._startup_tasks.remove)
+        return {"update": update.snapshot()}
+
+    async def refresh_claude_vscode(self) -> JsonObject:
+        return self._start_integration_update(
+            self._claude_update, partial(self._claude_vscode, "refresh")
+        )
+
+    async def refresh_codex_integration(self) -> JsonObject:
+        return self._start_integration_update(
+            self._codex_update, partial(self._codex_integration, "refresh")
+        )
+
+    async def jetbrains_acp_status(self) -> JsonObject:
+        return await self._jetbrains_acp("status")
+
+    async def connect_jetbrains_acp(self) -> JsonObject:
+        return await self._jetbrains_acp("connect")
+
+    async def disconnect_jetbrains_acp(self) -> JsonObject:
+        return await self._jetbrains_acp("disconnect")
+
+    async def refresh_jetbrains_acp(self) -> JsonObject:
+        return self._start_integration_update(
+            self._jetbrains_update, partial(self._jetbrains_acp, "refresh")
+        )
+
+    async def _jetbrains_acp(self, action: IntegrationAction) -> JsonObject:
+        async with self._config_lock:
+            self._check_integration_available()
+            settings = self.settings
+
+            def operate() -> JsonObject:
+                path = jetbrains_acp_integration.config_path()
+                url = local_proxy_root_url(settings)
+                if action == "refresh":
+                    return {
+                        "changed": jetbrains_acp_integration.refresh_connected(
+                            path, url, settings.proxy_auth_token
+                        )
+                    }
+                return jetbrains_acp_integration.configure(
+                    path,
+                    url,
+                    settings.proxy_auth_token,
+                    None if action == "status" else action == "connect",
+                )
+
+            try:
+                result = await run_sync_owned(operate)
+            except jetbrains_acp_integration.SetupError as exc:
+                raise InvalidRequestError(str(exc)) from None
+            except ValueError, UnicodeError:
+                raise InvalidRequestError(
+                    "Could not read JetBrains ACP configuration. Check the JSON in acp.json and the installed Claude Agent metadata."
+                ) from None
+            except OSError:
+                raise ApplicationUnavailableError(
+                    "Could not access JetBrains ACP files. Finish any configuration edits, check file permissions, and retry."
+                ) from None
+            if action in {"connect", "disconnect"}:
+                self._jetbrains_update.complete()
+            if action == "status":
+                result["update"] = self._jetbrains_update.snapshot()
+            return result
+
+    async def claude_desktop_status(self) -> JsonObject:
+        return await self._claude_desktop("status")
+
+    async def connect_claude_desktop(self) -> JsonObject:
+        return await self._claude_desktop("connect")
+
+    async def disconnect_claude_desktop(self) -> JsonObject:
+        return await self._claude_desktop("disconnect")
+
+    async def refresh_claude_desktop(self) -> JsonObject:
+        return self._start_integration_update(
+            self._desktop_update, partial(self._claude_desktop, "refresh")
+        )
+
+    async def _claude_desktop(self, action: IntegrationAction) -> JsonObject:
+        async with self._config_lock:
+            self._check_integration_available()
+            settings = self.settings
+
+            def operate() -> JsonObject:
+                root = claude_desktop_integration.config_root()
+                url = local_proxy_root_url(settings)
+                if action == "refresh":
+                    return {
+                        "changed": claude_desktop_integration.refresh_connected(
+                            root,
+                            url,
+                            settings.proxy_auth_token,
+                            disconnect_path=claude_desktop_disconnect_path(),
+                        )
+                    }
+                return claude_desktop_integration.configure(
+                    root,
+                    url,
+                    settings.proxy_auth_token,
+                    None if action == "status" else action == "connect",
+                    disconnect_path=claude_desktop_disconnect_path(),
+                )
+
+            try:
+                result = await run_sync_owned(operate)
+            except claude_desktop_integration.ManagedDesktopError:
+                raise InvalidRequestError(
+                    "Claude Desktop is managed by an organization, or its policy could not be read. FCC can configure only unmanaged Desktop installations."
+                ) from None
+            except claude_desktop_integration.PendingDisconnectError:
+                raise InvalidRequestError(
+                    "Finish disconnecting Claude Desktop before connecting again."
+                ) from None
+            except claude_desktop_integration.PendingMigrationError:
+                raise InvalidRequestError(
+                    "Claude Desktop has data in its previous Windows location. Launch Claude Desktop once so it can migrate that data, fully quit it, then retry Connect."
+                ) from None
+            except ValueError, UnicodeError:
+                raise InvalidRequestError(
+                    "Could not configure Claude Desktop. Check its configuration JSON and FCC disconnect record, and ensure FCC uses a localhost address and a nonempty managed token."
+                ) from None
+            except OSError:
+                raise ApplicationUnavailableError(
+                    "Could not access Claude Desktop settings or the FCC disconnect record. Fully quit Claude Desktop, check file permissions, and retry."
+                ) from None
+            if action in {"connect", "disconnect"}:
+                self._desktop_update.complete()
+            if action == "status":
+                if self._desktop_update.state != "ready":
+                    result["connected"] = None
+                result["update"] = self._desktop_update.snapshot()
+            return result
+
+    async def _claude_vscode(self, action: IntegrationAction) -> JsonObject:
+        async with self._config_lock:
+            self._check_integration_available()
+            settings = self.settings
+
+            def operate() -> JsonObject:
+                path = claude_integration.settings_path()
+                state_path = claude_integration.claude_state_path()
+                if action == "status" and self._claude_update.state != "ready":
+                    return {
+                        "connected": None,
+                        "paths": {
+                            "vscode_settings": str(path.resolve()),
+                            "claude_state": str(state_path.resolve()),
+                        },
+                    }
+                if action == "refresh":
+                    return {
+                        "changed": claude_integration.refresh_connected(
+                            path,
+                            state_path,
+                            local_proxy_root_url(settings),
+                            settings.proxy_auth_token,
+                        )
+                    }
+                return claude_integration.configure(
+                    path,
+                    state_path,
+                    local_proxy_root_url(settings),
+                    settings.proxy_auth_token,
+                    None if action == "status" else action == "connect",
+                )
+
+            try:
+                result = await run_sync_owned(operate)
+            except ValueError, UnicodeError:
+                raise InvalidRequestError(
+                    "Could not read Claude integration settings. Check the JSON in VS Code settings.json and .claude.json."
+                ) from None
+            except OSError:
+                raise ApplicationUnavailableError(
+                    "Could not access VS Code settings.json or .claude.json. Check file permissions and try again."
+                ) from None
+            if action in {"connect", "disconnect"}:
+                self._claude_update.complete()
+            if action == "status":
+                result["update"] = self._claude_update.snapshot()
+            return result
+
+    async def codex_integration_status(self) -> JsonObject:
+        return await self._codex_integration("status")
+
+    async def connect_codex(self) -> JsonObject:
+        return await self._codex_integration("connect")
+
+    async def disconnect_codex(self) -> JsonObject:
+        return await self._codex_integration("disconnect")
+
+    async def _codex_integration(self, action: IntegrationAction) -> JsonObject:
+        wait = InitializationWait(None) if action == "refresh" else InitializationWait()
+        needs_catalog = action in {"connect", "refresh"}
+        try:
+            if action == "refresh":
+                async with self._config_lock:
+                    self._check_integration_available()
+                    url = local_proxy_root_url(self.settings)
+                    if not await run_sync_owned(
+                        lambda: codex_integration.recognizes_connection(
+                            codex_integration.config_path(), url
+                        )
+                    ):
+                        return {"changed": False}
+            while True:
+                generation_id = (
+                    await self.provider_manager.wait_for_catalog_file(wait)
+                    if needs_catalog
+                    else None
+                )
+                async with self._config_lock:
+                    self._check_integration_available()
+                    if needs_catalog and (
+                        generation_id != self.provider_manager.current_generation_id
+                        or self.provider_manager.catalog_status()["catalog"] != "ready"
+                    ):
+                        continue
+                    url = local_proxy_root_url(self.settings)
+
+                    def operate(url: str = url) -> JsonObject:
+                        path = codex_integration.config_path()
+                        if action == "status" and self._codex_update.state != "ready":
+                            return {
+                                "connected": None,
+                                "paths": {"codex_config": str(path.resolve())},
+                            }
+                        if action == "refresh":
+                            return {
+                                "changed": codex_integration.refresh_connected(
+                                    path, codex_model_catalog_path(), url
+                                )
+                            }
+                        return codex_integration.configure(
+                            path,
+                            codex_model_catalog_path(),
+                            url,
+                            None if action == "status" else action == "connect",
+                        )
+
+                    result = await run_sync_owned(operate)
+                    if action in {"connect", "disconnect"}:
+                        self._codex_update.complete()
+                    if action == "status":
+                        result["update"] = self._codex_update.snapshot()
+                    return result
+        except ValueError, UnicodeError:
+            raise InvalidRequestError(
+                "Could not read Codex settings. Check the TOML in config.toml."
+            ) from None
+        except OSError:
+            raise ApplicationUnavailableError(
+                "Could not access Codex config.toml. Check file permissions and try again."
+            ) from None
+
     async def admin_status(self) -> JsonObject:
         values = await self.admin_values()
         settings = self.settings
         return {
             "status": "stopping" if self._draining else "running",
             "instance_id": self._instance_id,
+            "startup": {
+                **self.provider_manager.catalog_status(),
+                "code": self._code_service.storage_status()
+                if self._code_service
+                else {"state": "disabled"},
+                "messaging": {
+                    "state": self._messaging_state,
+                    "message": self._messaging_error,
+                },
+                "integrations": {
+                    "claude-vscode": self._claude_update.snapshot(),
+                    "claude-desktop": self._desktop_update.snapshot(),
+                    "codex": self._codex_update.snapshot(),
+                    "jetbrains-acp": self._jetbrains_update.snapshot(),
+                },
+            },
             "host": settings.host,
             "port": settings.port,
             "model": settings.model,
@@ -367,28 +759,19 @@ class ApplicationRuntime:
         }
 
     async def test_provider(self, provider_id: str) -> JsonObject:
-        lease = await self.provider_manager.acquire()
-        try:
-            provider = lease.resolve_provider(provider_id)
-            infos = await provider.list_model_infos()
-        except Exception as exc:
-            logger.warning(
-                "Admin provider check failed: provider={} exc_type={}",
-                provider_id,
-                type(exc).__name__,
-            )
+        result = await self.provider_manager.refresh_provider(provider_id)
+        if result.failed_provider_ids:
             return {
                 "provider_id": provider_id,
                 "ok": False,
                 "message": _PROVIDER_CHECK_FAILURE_MESSAGE,
             }
-        finally:
-            await lease.release()
-        self.provider_manager.cache_model_infos(provider_id, infos)
         return {
             "provider_id": provider_id,
             "ok": True,
-            "models": sorted(info.model_id for info in infos),
+            "models": sorted(
+                self.provider_manager.cached_model_ids().get(provider_id, ())
+            ),
         }
 
     async def refresh_models(self) -> ProviderModelRefreshResult:
@@ -496,14 +879,34 @@ class ApplicationRuntime:
         return result
 
     async def _start_messaging_if_configured(self) -> None:
+        if self.settings.messaging_platform == "none":
+            return
         try:
+
+            def load_modules() -> None:
+                for name in ("cli.managed", "messaging.session", "messaging.workflow"):
+                    importlib.import_module(f"free_claude_code.{name}")
+                importlib.import_module(
+                    f"free_claude_code.messaging.platforms.{self.settings.messaging_platform}"
+                )
+
+            await run_sync_owned(load_modules)
+            if self._transcriber_factory is not None:
+                self._transcriber = await self._transcriber_factory(self.settings)
             components = messaging_platform_factory.create_messaging_components(
                 self.settings.messaging_platform,
                 self._messaging_options(),
             )
             if components is not None:
                 await self._start_messaging_workflow(components)
+                self._messaging_state = "ready"
+            else:
+                self._messaging_state = "disabled"
         except ImportError as exc:
+            self._messaging_state = "failed"
+            self._messaging_error = (
+                "Messaging could not start. Check its configuration and restart FCC."
+            )
             cleaned = await self._cleanup_messaging()
             if self.settings.log_api_error_tracebacks:
                 logger.warning("Messaging module import error: {}", exc)
@@ -515,6 +918,10 @@ class ApplicationRuntime:
             if not cleaned:
                 raise RuntimeError("Messaging startup cleanup incomplete") from exc
         except Exception as exc:
+            self._messaging_state = "failed"
+            self._messaging_error = (
+                "Messaging could not start. Check its configuration and restart FCC."
+            )
             cleaned = await self._cleanup_messaging()
             if self.settings.log_api_error_tracebacks:
                 logger.error("Failed to start messaging platform: {}", exc)
@@ -547,6 +954,10 @@ class ApplicationRuntime:
         self,
         components: MessagingPlatformComponents,
     ) -> None:
+        import free_claude_code.cli.managed as cli_managed
+        import free_claude_code.messaging.session as messaging_session
+        import free_claude_code.messaging.workflow as messaging_workflow_module
+
         settings = self.settings
         self._messaging_runtime = components.runtime
         workspace = (
@@ -554,9 +965,9 @@ class ApplicationRuntime:
             if settings.allowed_dir
             else os.getcwd()
         )
-        os.makedirs(workspace, exist_ok=True)
+        await run_sync_owned(partial(os.makedirs, workspace, exist_ok=True))
         data_path = os.path.abspath(messaging_state_dir_path())
-        os.makedirs(data_path, exist_ok=True)
+        await run_sync_owned(partial(os.makedirs, data_path, exist_ok=True))
         allowed_dirs = [workspace] if settings.allowed_dir else []
 
         self._cli_manager = cli_managed.ManagedClaudeSessionManager(
@@ -567,9 +978,12 @@ class ApplicationRuntime:
             log_raw_cli_diagnostics=settings.log_raw_cli_diagnostics,
             log_messaging_error_details=settings.log_messaging_error_details,
         )
-        session_store = messaging_session.SessionStore(
-            storage_path=os.path.join(data_path, "sessions.json"),
-            managed_message_cap=settings.max_message_log_entries_per_chat,
+        session_store = await run_sync_owned(
+            partial(
+                messaging_session.SessionStore,
+                storage_path=os.path.join(data_path, "sessions.json"),
+                managed_message_cap=settings.max_message_log_entries_per_chat,
+            )
         )
         workflow = messaging_workflow_module.MessagingWorkflow(
             platform_name=components.name,
@@ -585,6 +999,9 @@ class ApplicationRuntime:
         self._messaging_workflow = workflow
         workflow.restore()
         components.runtime.on_message(workflow.handle_message)
+        await self._http_ready.wait()
+        if self._draining:
+            return
         await components.runtime.start()
         await workflow.repair_restored_statuses()
         if components.startup_notice is not None:
@@ -592,12 +1009,14 @@ class ApplicationRuntime:
         logger.info("{} platform started with messaging workflow", components.name)
 
     async def _close_owned_resources(self) -> bool:
+        if not await best_effort("folder_picker.close", self._folder_picker.close()):
+            return False
         if not await self._cleanup_messaging():
             return False
         verbose = self.settings.log_api_error_tracebacks
-        if self._chat_service is not None and not await best_effort(
-            "chat_service.close",
-            self._chat_service.close(),
+        if self._code_service is not None and not await best_effort(
+            "code_service.close",
+            self._code_service.close(),
             log_verbose_errors=verbose,
         ):
             return False

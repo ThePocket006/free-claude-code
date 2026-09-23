@@ -2,13 +2,17 @@
 
 import asyncio
 import json
+import re
 from collections.abc import Callable, Mapping
+from copy import deepcopy
+from typing import Any
 
 import httpx2
 import pytest
 from openai import AsyncOpenAI
 
 from free_claude_code.application.errors import InvalidRequestError
+from free_claude_code.core.anthropic import ReasoningReplayMode
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.anthropic.stream_contracts import (
     assert_anthropic_stream_contract,
@@ -17,10 +21,78 @@ from free_claude_code.core.anthropic.stream_contracts import (
     thinking_content,
 )
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
-from free_claude_code.core.openai_responses import OpenAIResponsesRequest
+from free_claude_code.core.json_types import JsonObject
+from free_claude_code.core.openai_responses import (
+    OpenAIResponsesRequest,
+    ResponsesToolPolicy,
+    build_responses_chat_request,
+)
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
+from free_claude_code.providers.openai_chat.stream_output import (
+    ChatStreamUsage,
+    ResponsesChatStreamOutput,
+)
 from free_claude_code.providers.openai_responses import OpenAIResponsesTransport
+from tests.core.openai_responses.test_client_tool_discovery import AGENTS, SEARCH
 from tests.providers.support import REASONING_ON, immediate_admission
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream_error", [False, True])
+@pytest.mark.parametrize(
+    "error",
+    [
+        {
+            "code": "invalid_request_error",
+            "message": "Reasoning is mandatory and cannot be disabled.",
+        },
+        {
+            "code": "unsupported_value",
+            "param": "reasoning.effort",
+            "message": "Value 'none' is not supported",
+        },
+    ],
+    ids=["mandatory", "unsupported_value"],
+)
+async def test_tolerant_classifier_corrects_required_reasoning(stream_error, error):
+    bodies = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        if body.get("reasoning", {}).get("effort") == "none":
+            if stream_error:
+                return httpx2.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    text=_sse({"type": "error", **error, "sequence_number": 0}),
+                )
+            return httpx2.Response(400, json={"error": error})
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse(_text_delta("<severity>0</severity>"), _completed_event()),
+        )
+
+    client = _client(handler)
+    try:
+        output = [
+            event
+            async for event in _transport(client).stream_messages(
+                _request(max_tokens=64, thinking={"type": "disabled"}),
+                input_tokens=11,
+                request_id="classifier",
+                response_model="public",
+                reasoning=ReasoningPolicy.prefer_off(),
+            )
+        ]
+        assert text_content(parse_sse_text("".join(output))) == "<severity>0</severity>"
+        assert len(bodies) == 2
+        assert bodies[0]["reasoning"]["effort"] == "none"
+        assert "max_output_tokens" not in bodies[0]
+        assert "reasoning" not in bodies[1]
+    finally:
+        await client.close()
 
 
 def _request(**overrides: object) -> MessagesRequest:
@@ -108,16 +180,23 @@ def _sse(*events: Mapping[str, object]) -> str:
 
 def _client(
     handler: Callable[[httpx2.Request], httpx2.Response],
+    *,
+    api_key: str = "test-key",
 ) -> AsyncOpenAI:
     return AsyncOpenAI(
-        api_key="test-key",
+        api_key=api_key,
         base_url="https://provider.invalid/v1",
         max_retries=0,
         http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
     )
 
 
-def _transport(client: AsyncOpenAI, *, max_attempts: int = 5):
+def _transport(
+    client: AsyncOpenAI,
+    *,
+    max_attempts: int = 5,
+    tool_policy: ResponsesToolPolicy = ResponsesToolPolicy(),
+):
     return OpenAIResponsesTransport(
         client=client,
         admission=immediate_admission(
@@ -127,6 +206,7 @@ def _transport(client: AsyncOpenAI, *, max_attempts: int = 5):
         provider_name="TEST_RESPONSES",
         read_timeout_s=120.0,
         log_raw_sse_events=False,
+        tool_policy=tool_policy,
     )
 
 
@@ -162,6 +242,305 @@ async def _collect_native(
             reasoning=reasoning,
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_default_transport_keeps_native_tool_capabilities() -> None:
+    tools = [
+        {
+            "type": "custom",
+            "name": "edit",
+            "format": {"type": "text"},
+            "defer_loading": True,
+            "allowed_callers": ["direct"],
+        },
+        {"type": "web_search", "search_content_types": ["text", "image"]},
+    ]
+    history = [
+        {"type": "custom_tool_call", "call_id": "c", "name": "edit", "input": "patch"}
+    ]
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        payload = json.loads(request.content)
+        assert payload["tools"] == tools and payload["input"] == history
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse(_completed_event()),
+        )
+
+    client = _client(handler)
+    try:
+        await _collect_native(
+            _transport(client),
+            OpenAIResponsesRequest(model="example", tools=tools, input=history),
+        )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_adaptation_retries_start_with_fresh_event_state() -> None:
+    attempts = 0
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        nonlocal attempts
+        attempts += 1
+        wire = json.loads(request.content)
+        assert wire["tools"][0]["type"] == "function"
+        created = {
+            "type": "response.created",
+            "sequence_number": 100 if attempts == 1 else 0,
+            "response": {**_completed_response(), "status": "in_progress"},
+        }
+        text = (
+            _sse(created)
+            if attempts == 1
+            else _sse(
+                created, _text_delta("hello", sequence=1), _completed_event(sequence=2)
+            )
+        )
+        return httpx2.Response(
+            200, headers={"content-type": "text/event-stream"}, text=text
+        )
+
+    client = _client(handler)
+    try:
+        transport = _transport(
+            client,
+            max_attempts=2,
+            tool_policy=ResponsesToolPolicy(custom_tools_as_functions=True),
+        )
+        chunks = await _collect_native(
+            transport,
+            OpenAIResponsesRequest(
+                model="example",
+                input="hello",
+                tools=[{"type": "custom", "name": "edit"}],
+            ),
+        )
+    finally:
+        await client.close()
+    events = parse_sse_text("".join(chunks))
+    assert attempts == 2
+    assert [event.data["sequence_number"] for event in events] == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requests_do_not_share_tool_identities() -> None:
+    started = 0
+    both_started = asyncio.Event()
+
+    class ResponseStream(httpx2.AsyncByteStream):
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+        async def __aiter__(self):
+            await asyncio.wait_for(both_started.wait(), timeout=5)
+            yield self.content.encode()
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        nonlocal started
+        started += 1
+        if started == 2:
+            both_started.set()
+        body = json.loads(request.content)
+        call = {
+            "type": "function_call",
+            "id": "fc_same_item",
+            "call_id": "same_call",
+            "name": "edit",
+            "arguments": '{"input":"patch"}',
+            "status": "completed",
+        }
+        response = {
+            **_completed_response(),
+            "output": [call],
+            "metadata": {"owner": body["input"]},
+        }
+        events = _sse(
+            {
+                "type": "response.output_item.added",
+                "sequence_number": 0,
+                "output_index": 0,
+                "item": {**call, "arguments": "", "status": "in_progress"},
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "sequence_number": 1,
+                "item_id": "fc_same_item",
+                "output_index": 0,
+                "delta": call["arguments"],
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "sequence_number": 2,
+                "item_id": "fc_same_item",
+                "output_index": 0,
+                "arguments": call["arguments"],
+            },
+            {
+                "type": "response.output_item.done",
+                "sequence_number": 3,
+                "output_index": 0,
+                "item": call,
+            },
+            {"type": "response.completed", "sequence_number": 4, "response": response},
+        )
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=ResponseStream(events),
+        )
+
+    client = _client(handler)
+    transport = _transport(
+        client, tool_policy=ResponsesToolPolicy(custom_tools_as_functions=True)
+    )
+    try:
+        chunks = await asyncio.gather(
+            *[
+                _collect_native(
+                    transport,
+                    OpenAIResponsesRequest(
+                        model="example",
+                        input=kind,
+                        tools=[{"type": kind, "name": "edit"}],
+                    ),
+                )
+                for kind in ("custom", "function")
+            ]
+        )
+    finally:
+        await client.close()
+    custom_events, function_events = [
+        parse_sse_text("".join(output)) for output in chunks
+    ]
+    assert custom_events[-1].data["response"]["output"][0]["type"] == "custom_tool_call"
+    assert function_events[-1].data["response"]["output"][0]["type"] == "function_call"
+    for events, item_id in (
+        (custom_events, "ctc_same_item"),
+        (function_events, "fc_same_item"),
+    ):
+        assert events[-1].data["response"]["output"][0]["id"] == item_id
+        assert [
+            event.data["item"]["id"] for event in events if "item" in event.data
+        ] == [
+            item_id,
+            item_id,
+        ]
+        assert [
+            event.data["item_id"] for event in events if "item_id" in event.data
+        ] == [
+            item_id,
+            item_id,
+        ]
+    assert not any(
+        event.event
+        in {
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+        }
+        for event in custom_events
+    )
+    assert any(
+        event.event == "response.function_call_arguments.delta"
+        for event in function_events
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("legacy", "adapt_custom", "expected_type", "keep_id"),
+    [
+        (False, False, "custom_tool_call", True),
+        (True, False, "custom_tool_call", False),
+        (False, True, "function_call", False),
+        (True, True, "function_call", True),
+    ],
+)
+async def test_chat_custom_history_replays_with_native_wire_compatible_ids(
+    legacy: bool, adapt_custom: bool, expected_type: str, keep_id: bool
+) -> None:
+    request = OpenAIResponsesRequest(
+        model="example", input="edit", tools=[{"type": "custom", "name": "edit"}]
+    )
+    prepared = build_responses_chat_request(
+        request, reasoning_replay=ReasoningReplayMode.DISABLED
+    )
+    writer = ResponsesChatStreamOutput(prepared.tool_adapter, input_tokens=1)
+    frames = writer.start_events()
+    frames.append(writer.start_tool_block(0, "call_edit", "edit"))
+    frames.append(writer.emit_tool_delta(0, '{"input":"patch"}'))
+    frames.extend(
+        writer.finish_success(
+            stop_reason="tool_calls",
+            usage=ChatStreamUsage(input_tokens=3, output_tokens=2),
+        )
+    )
+    item = parse_sse_text("".join(frames))[-1].data["response"]["output"][0]
+    if legacy:
+        item["id"] = "fc_legacy"
+    continuation = OpenAIResponsesRequest(
+        model="example",
+        tools=request.tools,
+        input=[
+            item,
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_edit",
+                "output": "done",
+            },
+        ],
+    )
+    original = continuation.model_dump()
+    captured: list[dict[str, object]] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured.append(json.loads(request.content))
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse(_completed_event()),
+        )
+
+    client = _client(handler)
+    try:
+        await _collect_native(
+            _transport(
+                client,
+                tool_policy=ResponsesToolPolicy(custom_tools_as_functions=adapt_custom),
+            ),
+            continuation,
+        )
+    finally:
+        await client.close()
+    assert len(captured) == 1
+    history = captured[0]["input"]
+    assert isinstance(history, list)
+    call, result = history
+    assert call["type"] == expected_type
+    assert call["call_id"] == "call_edit"
+    assert call["name"] == "edit"
+    if keep_id:
+        assert call["id"] == item["id"]
+    else:
+        assert "id" not in call
+    if adapt_custom:
+        assert json.loads(call["arguments"]) == {"input": "patch"}
+        assert result == {
+            "type": "function_call_output",
+            "call_id": "call_edit",
+            "output": "done",
+        }
+    else:
+        assert call["input"] == "patch"
+        assert result == {
+            "type": "custom_tool_call_output",
+            "call_id": "call_edit",
+            "output": "done",
+        }
+    assert continuation.model_dump() == original
 
 
 @pytest.mark.asyncio
@@ -469,6 +848,177 @@ async def test_native_committed_truncation_emits_one_failed_terminal() -> None:
     assert events[-1].data["response"]["id"] == "resp_test"
     assert events[-1].data["response"]["model"] == "public-model"
     assert events[-1].data["response"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_interrupted_discovery_can_continue_through_native_transport() -> None:
+    bodies: list[dict[str, Any]] = []
+    saved_text = "Saved work" * 7_000
+    user: JsonObject = {"role": "user", "content": "Find an agent"}
+    retry: JsonObject = {"role": "user", "content": "Continue"}
+    sibling: JsonObject = {
+        "id": "item_text",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": saved_text, "annotations": []}],
+    }
+    error = {"code": "server_error", "message": "Original upstream timeout"}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        created = {
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {
+                **_completed_response(),
+                "status": "in_progress",
+                "usage": None,
+            },
+        }
+        call = {
+            "type": "function_call",
+            "id": "fc_search",
+            "call_id": "search",
+            "name": "fcc_tool_search",
+            "status": "incomplete",
+            "arguments": '{"query":',
+        }
+        if len(bodies) == 1:
+            events = [
+                created,
+                # Commit the attempt before its failure, using the existing buffer limit.
+                _text_delta(saved_text, sequence=1),
+                {
+                    "type": "response.output_item.done",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "item": sibling,
+                },
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": 3,
+                    "output_index": 1,
+                    "item": {**call, "status": "in_progress"},
+                },
+                {
+                    "type": "response.failed",
+                    "sequence_number": 4,
+                    "response": {
+                        **_completed_response(),
+                        "status": "failed",
+                        "error": error,
+                        "output": [sibling, call],
+                    },
+                },
+            ]
+        elif len(bodies) == 2:
+            assert body["input"] == [user, sibling, retry]
+            complete = {
+                **call,
+                "call_id": "retry_search",
+                "status": "completed",
+                "arguments": '{"query":"agent"}',
+            }
+            events = [
+                created,
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item": {**complete, "status": "in_progress", "arguments": ""},
+                },
+                {
+                    "type": "response.output_item.done",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "item": complete,
+                },
+                {
+                    "type": "response.completed",
+                    "sequence_number": 3,
+                    "response": {**_completed_response(), "output": [complete]},
+                },
+            ]
+        else:
+            assert len(bodies) == 3
+            assert body["input"][-2]["type"] == "function_call"
+            assert body["input"][-2]["call_id"] == "retry_search"
+            result = body["input"][-1]
+            assert result["type"] == "function_call_output"
+            assert result["call_id"] == "retry_search"
+            assert json.loads(result["output"])[0]["name"] == "agents__spawn_agent"
+            assert "agents__spawn_agent" in [tool["name"] for tool in body["tools"]]
+            events = [created, _completed_event()]
+        return httpx2.Response(
+            200, headers={"content-type": "text/event-stream"}, text=_sse(*events)
+        )
+
+    client = _client(handler)
+    transport = _transport(
+        client,
+        max_attempts=2,
+        tool_policy=ResponsesToolPolicy(
+            client_tool_search=True, flatten_namespaces=True
+        ),
+    )
+    history: list[JsonObject] = [user]
+    try:
+        first = OpenAIResponsesRequest(model="example", input=history, tools=[SEARCH])
+        original = first.model_dump()
+        events = parse_sse_text("".join(await _collect_native(transport, first)))
+        assert first.model_dump() == original
+        failed = events[-1].data["response"]
+        assert events[-1].event == "response.failed"
+        assert failed["error"] == error
+        assert failed["output"][0] == sibling
+        partial = failed["output"][1]
+        assert partial["type"] == "tool_search_call"
+        assert partial["arguments"] == '{"query":'
+        assert partial["status"] == "incomplete"
+        assert len(bodies) == 1
+        history.extend([*failed["output"], retry])
+        second = OpenAIResponsesRequest(model="example", input=history, tools=[SEARCH])
+        original = deepcopy(history)
+        events = parse_sse_text("".join(await _collect_native(transport, second)))
+        assert history == original
+        assert events[-1].event == "response.completed"
+        complete = events[-1].data["response"]["output"][0]
+        assert complete["type"] == "tool_search_call"
+        assert complete["arguments"] == {"query": "agent"}
+        history.extend(
+            [
+                complete,
+                {
+                    "type": "tool_search_output",
+                    "execution": "client",
+                    "call_id": "retry_search",
+                    "tools": [AGENTS],
+                },
+            ]
+        )
+        events = parse_sse_text(
+            "".join(
+                await _collect_native(
+                    transport,
+                    OpenAIResponsesRequest(
+                        model="example", input=history, tools=[SEARCH]
+                    ),
+                )
+            )
+        )
+        assert events[-1].event == "response.completed"
+        with pytest.raises(InvalidRequestError, match="usable input"):
+            await _collect_native(
+                transport,
+                OpenAIResponsesRequest(
+                    model="example", input=[partial], tools=[SEARCH]
+                ),
+            )
+        assert len(bodies) == 3
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio
@@ -894,13 +1444,64 @@ async def test_cancellation_closes_the_sdk_stream() -> None:
 
 
 @pytest.mark.asyncio
-async def test_preflight_rejects_fields_responses_cannot_represent() -> None:
+async def test_startup_rejects_fields_responses_cannot_represent() -> None:
     client = _client(lambda _request: httpx2.Response(500))
     transport = _transport(client)
     request = _request(stop_sequences=["done"])
 
     try:
         with pytest.raises(InvalidRequestError, match="stop_sequences"):
-            transport.preflight_messages(request, reasoning=REASONING_ON)
+            transport.stream_messages(
+                request,
+                input_tokens=0,
+                request_id=None,
+                response_model=request.model,
+                reasoning=REASONING_ON,
+            )
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_claude_artifact_pattern_is_portable_on_the_sdk_wire():
+    captured = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        captured.append(body)
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse(_text_delta("ok"), _completed_event()),
+        )
+
+    pattern = r"^[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}]{1,200}$"
+    request = _request(
+        tools=[
+            {
+                "name": "Artifact",
+                "description": "Test artifact",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "pattern": pattern},
+                        "slug": {"type": "string", "pattern": "^[a-z]+$"},
+                    },
+                },
+            }
+        ]
+    )
+    client = _client(handler)
+    try:
+        await _collect(_transport(client), request)
+    finally:
+        await client.close()
+    assert len(captured) == 1
+    properties = captured[0]["tools"][0]["parameters"]["properties"]
+    assert properties["slug"]["pattern"] == "^[a-z]+$"
+    regex = re.compile(properties["name"]["pattern"])
+    assert regex.fullmatch("demo")
+    assert not regex.fullmatch("bad\U000e0001name")
+    assert request.tools is not None
+    assert request.tools[0].input_schema is not None
+    assert request.tools[0].input_schema["properties"]["name"]["pattern"] == pattern

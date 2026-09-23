@@ -1,19 +1,17 @@
 """Installed Pi launcher using the bundled FCC provider extension."""
 
+import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from free_claude_code.cli.environment import client_environment
+from free_claude_code.harnesses.environment import client_environment
+from free_claude_code.harnesses.launch import NativeCheck, PreparedLaunch
+from free_claude_code.harnesses.resources import LaunchResources
 
-from .resources import LaunchResources
-from .runner import (
-    HarnessSpec,
-    LaunchContext,
-    NativeCheck,
-    PreparedLaunch,
-    launch_harness,
-)
+from .runner import HarnessSpec, LaunchContext, launch_harness, version_at_least
+
+_VERSION_PATTERN = re.compile(r"(?m)^\s*(\d+)\.(\d+)\.(\d+)\s*$")
 
 
 def pi_extension_path() -> Path:
@@ -61,9 +59,9 @@ SPEC = HarnessSpec(
     install_hint=pi_install_hint(),
     configure=_configure,
     compatibility_check=NativeCheck(
-        ("--help",),
-        lambda output: all(marker in output for marker in ("--extension", "--models")),
-        "The 'pi' command is not a compatible Pi Coding Agent.",
+        ("--version",),
+        lambda output: version_at_least(output, _VERSION_PATTERN, (0, 80, 4)),
+        "FCC requires Pi 0.80.4 or newer for provider request headers.",
     ),
 )
 

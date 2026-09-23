@@ -1,5 +1,7 @@
 """OpenAI Responses API product flow for Codex clients."""
 
+from collections.abc import Mapping
+
 from fastapi.responses import JSONResponse
 
 from free_claude_code.api.request_errors import (
@@ -42,6 +44,7 @@ class ResponsesHandler:
         provider_executor: ProviderExecutor | None = None,
         generation_id: int | None = None,
         circuit_breakers: CircuitBreakerRegistry | None = None,
+        request_headers: Mapping[str, str] | None = None,
     ) -> None:
         self._settings = settings
         self._model_router = model_router or ModelRouter(settings)
@@ -51,6 +54,7 @@ class ResponsesHandler:
             generation_id=generation_id,
             log_raw_payloads=settings.log_raw_api_payloads,
             circuit_breakers=circuit_breakers,
+            request_headers=request_headers,
         )
 
     async def create(

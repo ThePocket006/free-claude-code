@@ -1,3 +1,5 @@
+const adminAssetBase = new URL(".", document.currentScript.src);
+
 const state = {
   config: null,
   applying: false,
@@ -6,7 +8,17 @@ const state = {
   modelOptions: [],
   modelComboboxes: new Set(),
   authPollers: new Map(),
-  activeView: window.location.pathname.startsWith("/admin/chat") ? "chat" : "providers",
+  authStatuses: new Map(),
+  providerChecks: new Map(),
+  providerId: null,
+  localStatusRequest: null,
+  startup: null,
+  startupRequest: null,
+  startupTimer: null,
+  startupAgain: false,
+  codeCatalogRetry: false,
+  modelOptionsRequest: 0,
+  activeView: viewFromLocation(),
 };
 
 const MASKED_SECRET = "********";
@@ -16,7 +28,7 @@ const VIEW_GROUPS = [
     id: "providers",
     label: "Providers",
     title: "Providers",
-    sections: ["providers", "runtime"],
+    sections: ["runtime"],
     containerId: "providersSections",
   },
   {
@@ -34,13 +46,24 @@ const VIEW_GROUPS = [
     containerId: "messagingSections",
   },
   {
-    id: "chat",
-    label: "Chat Sessions",
-    title: "Chat Sessions",
+    id: "integrations",
+    label: "Integrations",
+    title: "Integrations",
     sections: [],
-    containerId: "chatRoot",
+    containerId: "view-integrations",
+  },
+  {
+    id: "code",
+    label: "Code sessions",
+    title: "Code sessions",
+    sections: [],
+    containerId: "codeRoot",
   },
 ];
+
+function viewFromLocation() {
+  return window.location.pathname.split("/")[2] || "providers";
+}
 
 const byId = (id) => document.getElementById(id);
 
@@ -65,13 +88,6 @@ function sourceText(field) {
   return parts.join(" ");
 }
 
-function statusClass(status) {
-  if (["configured", "reachable", "running", "connected"].includes(status)) return "ok";
-  if (["missing_key", "missing_config", "missing_url", "unknown", "connecting"].includes(status)) return "warn";
-  if (["offline", "error"].includes(status)) return "error";
-  return "neutral";
-}
-
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
@@ -93,21 +109,122 @@ async function api(path, options = {}) {
   return response.json();
 }
 
-async function load() {
+function startupButton(button, loading) {
+  if (button.dataset.operationBusy) return;
+  button.disabled = loading;
+  button.classList.toggle("startup-busy", loading);
+  button.setAttribute("aria-busy", String(loading));
+}
+
+function renderStartup() {
+  const startup = state.startup?.startup;
+  const message = byId("startupMessage");
+  if (message) {
+    const messaging = startup?.messaging;
+    const visible = state.activeView === "messaging" && ["starting", "failed"].includes(messaging?.state);
+    message.hidden = !visible;
+    message.classList.toggle("startup-spinner", visible && messaging.state === "starting");
+    message.classList.toggle("error", messaging?.state === "failed");
+    message.textContent = messaging?.state === "failed" ? messaging.message || "Messaging could not start." : "";
+    message.setAttribute("aria-label", "Messaging is starting");
+  }
+  if (!startup) return;
+  document.querySelectorAll("[data-startup-provider]").forEach((button) => {
+    startupButton(button, startup.providers?.[button.dataset.startupProvider] === "starting");
+  });
+  document.querySelectorAll("[data-startup-catalog]").forEach((button) => {
+    startupButton(button, Object.values(startup.providers || {}).includes("starting"));
+  });
+  state.config.provider_status.forEach((provider) => {
+    renderProviderCheckResult(provider.provider_id);
+  });
+  renderClaudeIntegration();
+  renderJetBrainsIntegration();
+  renderCodexIntegration();
+  renderClaudeDesktopIntegration();
+}
+
+async function refreshStartup() {
+  if (!state.config || document.hidden || state.restart) return;
+  if (state.startupRequest) { state.startupAgain = true; return; }
+  clearTimeout(state.startupTimer);
+  state.startupTimer = null;
+  const request = { controller: new AbortController(), config: state.config };
+  state.startupRequest = request;
+  let pending = false;
+  try {
+    const result = await api("/admin/api/status", { signal: request.controller.signal });
+    if (state.startupRequest !== request || state.config !== request.config) return;
+    const previous = state.startup;
+    const current = result.startup;
+    if (!current) return;
+    if (previous?.instance_id === result.instance_id && (
+      current.generation_id < previous.startup.generation_id ||
+      (current.generation_id === previous.startup.generation_id &&
+       current.catalog_revision < previous.startup.catalog_revision)
+    )) return;
+    state.startup = result;
+    renderStartup();
+    refreshIntegrationUpdates(
+      previous?.instance_id === result.instance_id ? previous.startup.integrations : null,
+      current.integrations,
+    );
+    const changed = !previous || previous.instance_id !== result.instance_id ||
+      JSON.stringify(previous.startup) !== JSON.stringify(current);
+    if (changed) void hydrateModelOptions();
+    if (changed || state.codeCatalogRetry) state.codeCatalogRetry = await window.CodeSessions?.refresh(result) === false;
+    pending = state.codeCatalogRetry || current.catalog === "starting" || current.catalog_file === "starting" ||
+      current.code?.state === "starting" || current.messaging?.state === "starting" ||
+      Object.values(current.integrations || {}).some((update) => update.state === "starting") ||
+      Object.values(current.providers || {}).includes("starting");
+  } catch (error) {
+    if (error.name !== "AbortError") pending = true;
+  } finally {
+    if (state.startupRequest === request) {
+      state.startupRequest = null;
+      if ((pending || state.startupAgain) && !document.hidden) state.startupTimer = setTimeout(refreshStartup, 500);
+      state.startupAgain = false;
+    }
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  clearTimeout(state.startupTimer);
+  if (document.hidden) {
+    state.startupRequest?.controller.abort();
+    state.startupRequest = null;
+  } else {
+    void refreshStartup();
+  }
+});
+window.addEventListener("pagehide", () => {
+  clearTimeout(state.startupTimer);
+  state.startupRequest?.controller.abort();
+  state.startupRequest = null;
+});
+
+async function load({ providersOnly = false } = {}) {
+  state.localStatusRequest = null;
+  state.startupRequest?.controller.abort();
+  state.startupRequest = null;
   showMessage("Loading admin config");
   const config = await api("/admin/api/config");
   state.config = config;
+  state.startup = null;
   state.fields = new Map(config.fields.map((field) => [field.key, field]));
-  renderNav();
+  if (!providersOnly) renderNav();
+  state.providerChecks.clear();
   renderProviders(config.provider_status);
-  renderSections(config.sections, config.fields);
+  if (!providersOnly) renderSections(config.sections, config.fields);
   byId("configPath").textContent = config.paths.managed;
+  void refreshLocalStatus(config);
+  void refreshStartup();
   await Promise.all([
     refreshConnectedAccounts(),
     hydrateModelOptions(),
-    refreshLocalStatus(),
-    window.ChatSessions ? window.ChatSessions.initialize(api) : Promise.resolve(),
+    providersOnly ? window.CodeSessions.refresh() : window.CodeSessions.initialize(api),
   ]);
+  if (state.config !== config) return;
   updateDirtyState();
   showMessage("");
 }
@@ -137,11 +254,14 @@ function setActiveView(viewId, { scroll = false } = {}) {
     VIEW_GROUPS.find((view) => view.id === viewId) || VIEW_GROUPS[0];
   state.activeView = activeView.id;
   byId("pageTitle").textContent = activeView.title;
-  const chatActive = activeView.id === "chat";
-  document.querySelector(".app-shell").classList.toggle("chat-active", chatActive);
-  document.querySelector(".main").classList.toggle("chat-main", chatActive);
-  document.querySelector(".topbar").hidden = chatActive;
-  document.querySelector(".action-bar").hidden = chatActive;
+  renderStartup();
+  if (activeView.id === "code") state.codeCatalogRetry = true;
+  void refreshStartup();
+  const sessionActive = activeView.id === "code";
+  document.querySelector(".app-shell").classList.toggle("session-active", sessionActive);
+  document.querySelector(".main").classList.toggle("session-main", sessionActive);
+  document.querySelector(".topbar").hidden = sessionActive;
+  document.querySelector(".action-bar").hidden = sessionActive || activeView.id === "integrations";
 
   document.querySelectorAll(".nav-link").forEach((link) => {
     const selected = link.dataset.view === activeView.id;
@@ -162,161 +282,179 @@ function setActiveView(viewId, { scroll = false } = {}) {
   if (scroll) {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
-  if (chatActive && window.ChatSessions) {
-    window.ChatSessions.activate(window.location.pathname);
+  if (activeView.id === "code") window.CodeSessions.activate(window.location.pathname);
+  else window.CodeSessions.deactivate();
+  if (activeView.id === "integrations") {
+    refreshClaudeIntegration();
+    refreshJetBrainsIntegration();
+    refreshCodexIntegration();
+    refreshClaudeDesktopIntegration();
   }
 }
 
 function navigateToView(viewId) {
-  if (viewId === "chat") {
-    if (window.location.pathname !== "/admin/chat") {
-      window.history.pushState({}, "", "/admin/chat");
-    }
-  } else if (window.location.pathname.startsWith("/admin/chat")) {
-    window.history.pushState({}, "", "/admin");
+  const target = viewId === "providers" ? "/admin" : `/admin/${viewId}`;
+  if (window.location.pathname + window.location.search !== target) {
+    window.history.pushState({}, "", target);
   }
   setActiveView(viewId, { scroll: true });
 }
 
 function renderProviders(providerStatus) {
-  const grid = byId("providerGrid");
-  const connectedGrid = byId("connectedAccountGrid");
-  grid.innerHTML = "";
-  connectedGrid.innerHTML = "";
-  const connected = providerStatus.filter(
-    (provider) => provider.kind === "connected_account",
-  );
-  byId("connectedAccountsSection").hidden = connected.length === 0;
-  providerStatus.forEach((provider) => {
-    if (provider.kind === "connected_account") {
-      connectedGrid.appendChild(renderConnectedAccountCard(provider));
-      return;
-    }
-    const card = document.createElement("article");
+  const container = byId("providerGroups");
+  container.replaceChildren();
+  [
+    ["oauth", "OAuth providers"],
+    ["cloud", "Cloud providers"],
+    ["local", "Local providers"],
+  ].forEach(([kind, label]) => {
+    const group = document.createElement("section");
+    group.className = "provider-strip";
+    group.dataset.providerGroup = kind;
+    const heading = document.createElement("h3");
+    heading.textContent = label;
+    group.appendChild(heading);
+    const subgroups = [
+      ["configured", kind === "oauth" ? "Connected" : "Configured"],
+      ["unconfigured", kind === "oauth" ? "Not connected" : "Not configured"],
+    ];
+    if (kind === "oauth") subgroups.unshift(["loading", "Checking account status"]);
+    subgroups.forEach(([subgroupId, subgroupLabel]) => {
+      const subgroup = document.createElement("div");
+      subgroup.dataset.providerSubgroup = subgroupId;
+      subgroup.hidden = true;
+      const title = document.createElement("h4");
+      title.textContent = subgroupLabel;
+      title.hidden = subgroupId === "loading";
+      const grid = document.createElement("div");
+      grid.className = "provider-grid";
+      grid.id = `providers-${kind}-${subgroupId}`;
+      subgroup.append(title, grid);
+      group.appendChild(subgroup);
+    });
+    container.appendChild(group);
+  });
+  providerStatus.forEach(updateProviderCard);
+}
+
+function updateProviderCard(provider) {
+  const oauth = provider.kind === "connected_account";
+  const status = state.authStatuses.get(provider.provider_id);
+  const kind = oauth ? "oauth" : provider.kind === "local" ? "local" : "cloud";
+  const configured = oauth ? status?.connected : provider.status === "configured";
+  const subgroup = oauth && configured == null ? "loading" : configured ? "configured" : "unconfigured";
+  const grid = byId(`providers-${kind}-${subgroup}`);
+  let card = document.querySelector(`[data-provider="${provider.provider_id}"]`);
+  if (!card) {
+    card = document.createElement("article");
     card.className = "provider-card";
     card.dataset.provider = provider.provider_id;
-
-    const title = document.createElement("div");
-    title.className = "provider-title";
-    const name = document.createElement("strong");
-    name.textContent = provider.display_name || provider.provider_id;
-
-    const pill = document.createElement("span");
-    pill.className = `status-pill ${statusClass(provider.status)}`;
-    pill.textContent = provider.label;
-    title.append(name, pill);
-
-    const meta = document.createElement("div");
-    meta.className = "provider-meta";
-    const configurationKeys = Array.isArray(provider.configuration_keys)
-      ? provider.configuration_keys
-      : [];
-    const missingConfigurationKeys = Array.isArray(
-      provider.missing_configuration_keys,
-    )
-      ? provider.missing_configuration_keys
-      : [];
-    meta.textContent = configurationKeys.join(" + ");
-
-    const result = document.createElement("div");
-    result.className = "provider-check-result";
-    result.dataset.providerCheckResult = provider.provider_id;
-    result.setAttribute("aria-live", "polite");
-    result.hidden = true;
-
-    const actions = document.createElement("div");
-    actions.className = "provider-actions";
-    if (configurationKeys.length) {
-      const configuring = missingConfigurationKeys.length > 0;
-      actions.appendChild(
-        providerActionButton(configuring ? "Configure" : "Edit", () =>
-          navigateToProviderConfiguration(provider, configuring),
-        ),
-      );
-    }
-
-    if (missingConfigurationKeys.length === 0) {
-      const button = providerActionButton(
-        provider.kind === "local" ? "Test" : "Refresh models",
-        () => testProvider(provider.provider_id, button),
-        "secondary-button",
-      );
-      actions.appendChild(button);
-    }
-
-    card.append(title, meta, result, actions);
-    grid.appendChild(card);
-  });
-}
-
-function providerActionButton(label, action, className = "test-button") {
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = className;
-  button.textContent = label;
-  button.addEventListener("click", action);
-  return button;
-}
-
-function navigateToProviderConfiguration(provider, configuring) {
-  const keys = configuring
-    ? provider.missing_configuration_keys
-    : provider.configuration_keys;
-  const fieldKey = Array.isArray(keys) ? keys[0] : null;
-  const input = fieldKey ? byId(`field-${fieldKey}`) : null;
-  if (!input) {
-    showMessage("Provider configuration field is unavailable.", "error");
-    return;
   }
-  const reducedMotion = window.matchMedia(
-    "(prefers-reduced-motion: reduce)",
-  ).matches;
-  input.scrollIntoView({
-    behavior: reducedMotion ? "instant" : "smooth",
-    block: "center",
+  const focused = card.contains(document.activeElement);
+  const focusedLabel = focused ? document.activeElement.textContent : null;
+  const title = document.createElement("span");
+  title.className = "provider-title";
+  const name = document.createElement("strong");
+  name.textContent = connectedAccountName(provider);
+  const website = document.createElement("a");
+  website.href = provider.website_url;
+  website.target = "_blank";
+  website.rel = "noopener noreferrer";
+  const logo = document.createElement("img");
+  logo.className = "provider-logo";
+  logo.src = new URL(`providers/${provider.logo_filename}`, adminAssetBase);
+  logo.alt = "";
+  logo.width = 20;
+  logo.height = 20;
+  website.append(name, logo);
+  title.appendChild(website);
+  const meta = document.createElement("span");
+  meta.className = "provider-meta";
+  meta.hidden = !oauth;
+  const result = document.createElement("span");
+  result.className = "provider-check-result";
+  result.dataset.providerCheckResult = provider.provider_id;
+  result.hidden = true;
+  const actions = document.createElement("div");
+  actions.className = "provider-actions";
+  if (oauth) populateConnectedAccountActions(provider, status, actions);
+  if (provider.settings_keys?.length) {
+    const edit = oauth || configured;
+    const settings = authButton(edit ? "Edit" : "Configure", () => openProviderDialog(provider.provider_id), edit ? "secondary-button" : "primary-button");
+    settings.dataset.providerSettings = "true";
+    settings.setAttribute("aria-haspopup", "dialog");
+    settings.setAttribute("aria-controls", "providerDialog");
+    actions.appendChild(settings);
+  }
+  card.replaceChildren(title, meta, result, actions);
+  const next = [...grid.children].find((other) => other !== card &&
+    connectedAccountName(provider).localeCompare(providerDisplayName(other.dataset.provider), "en", { sensitivity: "base" }) < 0);
+  if (card.parentElement !== grid || card.nextElementSibling !== (next || null)) grid.insertBefore(card, next || null);
+  document.querySelectorAll("[data-provider-subgroup]").forEach((section) => {
+    section.hidden = section.querySelector(".provider-grid").childElementCount === 0;
   });
-  input.focus({ preventScroll: true });
+  if (focused) {
+    const controls = [...card.querySelectorAll("a[href], button:not(:disabled)")];
+    (controls.find((control) => control.textContent === focusedLabel) || actions.querySelector("button:not(:disabled)"))?.focus({ preventScroll: true });
+  }
+  renderProviderCheckResult(provider.provider_id);
+}
+
+function openProviderDialog(providerId) {
+  state.providerId = providerId;
+  const provider = connectedAccountDescriptor(providerId);
+  byId("providerDialogTitle").textContent = connectedAccountName(provider);
+  byId("providerMessage").textContent = "";
+  const fields = byId("providerFields");
+  fields.replaceChildren();
+  (provider.settings_keys || []).forEach((key) => {
+    const field = state.fields.get(key);
+    const wrapper = renderField(field);
+    const shared = state.config.provider_status.filter((other) =>
+      other.provider_id !== providerId && other.settings_keys?.includes(key),
+    );
+    if (shared.length) {
+      const note = document.createElement("div");
+      note.className = "field-description";
+      note.textContent = `Shared with ${shared.map(connectedAccountName).join(", ")}.`;
+      wrapper.appendChild(note);
+    }
+    fields.appendChild(wrapper);
+  });
+  renderProviderDialogActions(provider);
+  updateDirtyState();
+  byId("providerDialog").showModal();
+  const missing = provider.missing_configuration_keys?.[0];
+  const first = missing ? byId(`field-${missing}`) : fields.querySelector("input:not(:disabled), select:not(:disabled), textarea:not(:disabled)");
+  first?.focus();
+}
+
+function renderProviderDialogActions(provider) {
+  if (state.providerId !== provider.provider_id) return;
+  const actions = byId("providerDialogActions");
+  actions.replaceChildren();
+  const oauth = provider.kind === "connected_account";
+  if (!oauth && !provider.missing_configuration_keys.length) {
+    const button = authButton(provider.kind === "local" ? "Test" : "Refresh models", (target) => testProvider(provider.provider_id, target), "secondary-button");
+    button.dataset.startupProvider = provider.provider_id;
+    if (state.providerChecks.get(provider.provider_id)?.status === "checking") {
+      button.dataset.operationBusy = "true";
+      button.disabled = true;
+      button.textContent = "Checking...";
+    }
+    actions.appendChild(button);
+  }
+  const check = oauth ? null : providerCheckResult(provider.provider_id);
+  const result = byId("providerDialogCheck");
+  result.className = `provider-check-result ${check?.status || ""}`;
+  result.textContent = check?.message || "";
+  result.hidden = !check?.message;
+  byId("saveProvider").hidden = !provider.settings_keys?.length;
+  renderStartup();
 }
 
 function connectedAccountName(provider) {
   return provider.display_name || provider.provider_id;
-}
-
-function renderConnectedAccountCard(provider, status = null) {
-  const card = document.createElement("article");
-  card.className = "provider-card";
-  card.dataset.provider = provider.provider_id;
-  card.dataset.connectedAccount = "true";
-
-  const title = document.createElement("div");
-  title.className = "provider-title";
-  const name = document.createElement("strong");
-  name.textContent = connectedAccountName(provider);
-  const pill = document.createElement("span");
-  pill.className = `status-pill ${statusClass(status?.state)}`;
-  pill.textContent = connectedAccountLabel(status);
-  title.append(name, pill);
-
-  const meta = document.createElement("div");
-  meta.className = "provider-meta";
-  meta.textContent = connectedAccountMeta(provider, status);
-
-  const actions = document.createElement("div");
-  actions.className = "provider-actions";
-  populateConnectedAccountActions(provider, status, actions);
-  card.append(title, meta, actions);
-  return card;
-}
-
-function connectedAccountLabel(status) {
-  if (!status) return "Loading";
-  const labels = {
-    disconnected: "Not connected",
-    connecting: "Connecting",
-    connected: "Connected",
-    error: "Needs attention",
-  };
-  return labels[status.state] || "Not connected";
 }
 
 function connectedAccountMeta(provider, status) {
@@ -329,12 +467,7 @@ function connectedAccountMeta(provider, status) {
     return status.message || "Finish signing in, then return to this page.";
   }
   if (status.connected) {
-    const identity = status.display_identity || status.email || `${providerName} account connected`;
-    const models = Number.isInteger(status.model_count)
-      ? `${status.model_count} model${status.model_count === 1 ? "" : "s"} available. `
-      : "";
-    const error = status.message ? `${status.message} ` : "";
-    return `${identity}. ${models}${error}Restart your agent to refresh its model picker.`;
+    return providerCheckResult(provider.provider_id)?.message || "Checking models…";
   }
   return status.message || `Connect your ${providerName} account to discover models.`;
 }
@@ -342,8 +475,9 @@ function connectedAccountMeta(provider, status) {
 function populateConnectedAccountActions(provider, status, actions) {
   const providerId = provider.provider_id;
   if (!status) {
-    const loading = authButton("Loading…", () => {});
+    const loading = authButton("Loading…", () => {}, "secondary-button startup-busy");
     loading.disabled = true;
+    loading.setAttribute("aria-busy", "true");
     actions.appendChild(loading);
     return;
   }
@@ -358,8 +492,12 @@ function populateConnectedAccountActions(provider, status, actions) {
       );
     }
     actions.appendChild(
-      authButton("Cancel", () => cancelConnectedAccountLogin(providerId), "secondary-button"),
+      authButton("Cancel sign-in", () => cancelConnectedAccountLogin(providerId), "secondary-button"),
     );
+    return;
+  }
+  if (status.connected) {
+    actions.appendChild(authButton("Disconnect", () => disconnectConnectedAccount(providerId), "danger-button"));
     return;
   }
   const modes = Array.isArray(status.supported_login_modes) ? status.supported_login_modes : [];
@@ -370,27 +508,13 @@ function populateConnectedAccountActions(provider, status, actions) {
   }
   actions.appendChild(
     authButton(
-      status.connected ? "Reconnect" : "Connect",
+      "Connect",
       (button) => startConnectedAccountLogin(providerId, defaultMode, button),
     ),
   );
-  if (status.connected) {
-    actions.appendChild(
-      authButton("Disconnect", () => disconnectConnectedAccount(providerId), "secondary-button"),
-    );
-    return;
-  }
-  modes.filter((mode) => mode !== defaultMode).forEach((mode) => {
-    const label = { browser: "Use browser", device: "Use device code" }[mode];
-    if (label) {
-      actions.appendChild(
-        authButton(label, (button) => startConnectedAccountLogin(providerId, mode, button), "secondary-button"),
-      );
-    }
-  });
 }
 
-function authButton(label, action, className = "test-button") {
+function authButton(label, action, className = "primary-button") {
   const button = document.createElement("button");
   button.type = "button";
   button.className = className;
@@ -407,26 +531,30 @@ async function refreshConnectedAccounts() {
 }
 
 async function refreshConnectedAccount(provider) {
+  const config = state.config;
   clearConnectedAccountPoll(provider.provider_id);
   updateConnectedAccountCard(provider, null);
   try {
     const status = await api(`/admin/api/providers/${provider.provider_id}/auth`);
+    if (config !== state.config) return;
     updateConnectedAccountCard(provider, status);
     if (status.state === "connecting") pollConnectedAccount(provider);
   } catch (error) {
+    if (config !== state.config) return;
     updateConnectedAccountCard(provider, {
       state: "error",
-      connected: false,
+      connected: null,
       message: error.message,
     });
   }
 }
 
 function updateConnectedAccountCard(provider, status) {
-  const current = document.querySelector(
-    `[data-provider="${provider.provider_id}"][data-connected-account="true"]`,
-  );
-  if (current) current.replaceWith(renderConnectedAccountCard(provider, status));
+  if (status) void refreshStartup();
+  if (JSON.stringify(state.authStatuses.get(provider.provider_id)) === JSON.stringify(status)) return;
+  state.authStatuses.set(provider.provider_id, status);
+  updateProviderCard(provider);
+  renderProviderDialogActions(provider);
 }
 
 async function startConnectedAccountLogin(providerId, mode, button) {
@@ -534,18 +662,61 @@ async function copyDeviceCode(code) {
   }
 }
 
-function updateProviderCheckResult(providerId, status, message) {
+function modelCountMessage(count) {
+  return `${count} model${count === 1 ? "" : "s"} available`;
+}
+
+function providerCheckResult(providerId) {
+  const check = state.providerChecks.get(providerId);
+  // An explicit check takes precedence over background discovery and reachability.
+  if (check?.source === "manual") return check;
+  const discovery = state.startup?.startup?.providers?.[providerId];
+  if (discovery === "starting") return { status: "checking", message: "Checking models…" };
+  if (discovery === "failed") {
+    return { status: "error", message: "Could not load models. Check the provider's settings and retry." };
+  }
+  if (discovery === "ready") {
+    return { status: "ok", message: modelCountMessage(state.startup.cached_models[providerId]?.length || 0) };
+  }
+  return check;
+}
+
+function updateProviderCheckResult(providerId, status, message, source = "manual") {
+  state.providerChecks.set(providerId, { status, message, source });
+  renderProviderCheckResult(providerId);
+}
+
+function renderProviderCheckResult(providerId) {
+  const { status = "", message = "" } = providerCheckResult(providerId) || {};
   const card = document.querySelector(`[data-provider="${providerId}"]`);
   if (!card) return;
+  const provider = connectedAccountDescriptor(providerId);
+  if (provider.kind === "connected_account") {
+    const account = state.authStatuses.get(providerId);
+    const meta = card.querySelector(".provider-meta");
+    meta.textContent = connectedAccountMeta(provider, account);
+    meta.className = "provider-meta";
+    if (account?.connected && account.state !== "connecting") {
+      meta.classList.add("provider-check-result", status || "checking");
+    }
+    if (account?.state === "error") meta.classList.add("error");
+    return;
+  }
   const result = card.querySelector(".provider-check-result");
   result.className = `provider-check-result ${status}`;
   result.textContent = message;
   result.hidden = !message;
+  if (state.providerId === providerId) {
+    const modalResult = byId("providerDialogCheck");
+    modalResult.className = result.className;
+    modalResult.textContent = message;
+    modalResult.hidden = !message;
+  }
 }
 
 function renderSections(sections, fields) {
   state.modelComboboxes.clear();
-  VIEW_GROUPS.forEach((view) => {
+  VIEW_GROUPS.filter((view) => view.sections.length).forEach((view) => {
     byId(view.containerId).innerHTML = "";
   });
 
@@ -576,6 +747,7 @@ function renderSections(sections, fields) {
         refreshButton.type = "button";
         refreshButton.className = "secondary-button";
         refreshButton.textContent = "Refresh models";
+        refreshButton.dataset.startupCatalog = "true";
         refreshButton.addEventListener("click", () => refreshModelOptions(refreshButton));
         heading.appendChild(refreshButton);
       }
@@ -624,7 +796,7 @@ function renderField(field) {
     label.appendChild(sourceEl);
   }
 
-  const input = inputForField(field);
+  const input = window.FccFormControls.configure(inputForField(field));
   input.id = `field-${field.key}`;
   input.dataset.key = field.key;
   input.dataset.original = comparableValue(field.value);
@@ -724,7 +896,9 @@ function inputForField(field) {
   const input = document.createElement("input");
   input.type = field.type === "number" ? "number" : "text";
   if (field.type === "secret") {
-    input.type = "password";
+    input.setAttribute("autocapitalize", "none");
+    input.spellcheck = false;
+    input.setAttribute("autocorrect", "off");
     input.placeholder = field.configured
       ? "Configured - enter a new value to replace"
       : "Not configured";
@@ -766,7 +940,7 @@ class ModelListEditor {
 
     const addRow = document.createElement("div");
     addRow.className = "model-list-add";
-    this.addInput = document.createElement("input");
+    this.addInput = window.FccFormControls.configure(document.createElement("input"));
     this.addInput.id = this.inputId;
     this.addInput.type = "text";
     this.addInput.autocomplete = "off";
@@ -905,9 +1079,9 @@ function comparableValue(value) {
   return value === null ? NULL_VALUE : String(value);
 }
 
-function changedValues() {
+function changedValues(root = byId("adminViews")) {
   const values = {};
-  document.querySelectorAll("[data-key]").forEach((input) => {
+  root.querySelectorAll("[data-key]").forEach((input) => {
     if (input.disabled || !input.matches("input, select, textarea")) return;
     const value = readFieldValue(input);
     if (comparableValue(value) !== input.dataset.original) {
@@ -922,6 +1096,7 @@ function updateDirtyState() {
   byId("dirtyState").textContent =
     state.restart ? "Changes saved" : count === 0 ? "No changes" : `${count} unsaved change${count === 1 ? "" : "s"}`;
   byId("applyButton").disabled = state.applying || (!state.restart && count === 0);
+  byId("saveProvider").disabled = state.applying || !!state.restart || !Object.keys(changedValues(byId("providerFields"))).length;
 }
 
 function clearCredentialError(input) {
@@ -951,10 +1126,15 @@ function showCredentialErrors(checks) {
 
 function setApplying(applying) {
   state.applying = applying;
-  VIEW_GROUPS.filter((view) => view.id !== "chat").forEach((view) => {
+  VIEW_GROUPS.filter((view) => view.id !== "code").forEach((view) => {
     byId(`view-${view.id}`).inert = applying || !!state.restart;
   });
   if (applying) state.modelComboboxes.forEach((combobox) => combobox.close());
+  byId("providerDialogBody").inert = applying || !!state.restart;
+  byId("closeProviderDialog").disabled = applying;
+  byId("cancelProviderDialog").disabled = applying;
+  byId("saveProvider").textContent = applying ? "Saving…" : "Save";
+  byId("saveProvider").setAttribute("aria-busy", String(applying));
   byId("applyButton").textContent = state.restart
     ? applying ? "Reconnecting…" : "Reconnect"
     : applying ? "Applying…" : "Apply";
@@ -992,7 +1172,12 @@ function appendAdminLink(target) {
 }
 
 async function reconnectAfterRestart() {
-  const { restart, warnings } = state.restart;
+  clearTimeout(state.startupTimer);
+  state.startupTimer = null;
+  state.startupRequest?.controller.abort();
+  state.startupRequest = null;
+  state.startupAgain = false;
+  const { restart, warnings, providersOnly } = state.restart;
   const target = new URL(restart.admin_url || "/admin", window.location.href);
   setApplying(true);
   showMessage(["Applied. Reconnecting to the server…", ...warnings].join("\n"), warnings.length ? "warn" : "ok");
@@ -1004,8 +1189,9 @@ async function reconnectAfterRestart() {
       window.location.replace(target.href);
       return;
     }
-    await load();
+    await load({ providersOnly });
     state.restart = null;
+    void refreshStartup();
     showMessage(["Applied", ...warnings].join("\n"), warnings.length ? "warn" : "ok");
   } catch (error) {
     showMessage([`Settings were saved. ${error.message} Use Reconnect to try again.`, ...warnings].join("\n"), "warn");
@@ -1033,13 +1219,13 @@ function showRestartNotice() {
   }
 }
 
-async function apply() {
+async function apply(providerId = null) {
   if (state.applying) return;
   if (state.restart) {
     await reconnectAfterRestart();
     return;
   }
-  const values = changedValues();
+  const values = changedValues(providerId ? byId("providerFields") : byId("adminViews"));
   if (!Object.keys(values).length) return;
   const checkingKeys = Object.keys(values).some((key) => {
     const field = state.fields.get(key);
@@ -1061,17 +1247,18 @@ async function apply() {
       return;
     }
     applied = true;
+    if (providerId) byId("providerDialog").close();
     const warnings = checks.filter((check) => check.status === "unverified").map((check) =>
       `${state.fields.get(check.key)?.label || check.key}: ${check.message}`
     );
     const restart = result.restart || {};
     if (restart.required && restart.automatic) {
-      state.restart = { restart, warnings };
+      state.restart = { restart, warnings, providersOnly: !!providerId };
       await reconnectAfterRestart();
       return;
     }
     const pending = restart.required ? restart.fields || [] : result.pending_fields || [];
-    await load();
+    await load({ providersOnly: !!providerId });
     const message = pending.length
       ? `Applied. Restart fcc-server to use: ${pending.join(", ")}`
       : "Applied";
@@ -1081,41 +1268,69 @@ async function apply() {
   } finally {
     setApplying(false);
     if (rejectedField) {
-      navigateToView("providers");
+      if (!providerId) navigateToView("providers");
       rejectedField.closest(".settings-section")?.classList.add("show-advanced");
       rejectedField.scrollIntoView({ block: "center", behavior: "instant" });
       rejectedField.focus();
+    } else if (providerId && applied) {
+      document.querySelector(`[data-provider="${providerId}"] [data-provider-settings]`)?.focus({ preventScroll: true });
     }
   }
 }
 
-async function refreshLocalStatus() {
-  const result = await api("/admin/api/providers/local-status");
-  result.providers.forEach((provider) => {
-    if (provider.status === "missing_url") return;
-    if (provider.status === "reachable") {
+async function refreshLocalStatus(config) {
+  const request = {
+    providerIds: new Set(config.provider_status.filter((provider) =>
+      provider.kind === "local" && provider.status === "configured",
+    ).map((provider) => provider.provider_id)),
+  };
+  state.localStatusRequest = request;
+  try {
+    const result = await api("/admin/api/providers/local-status");
+    if (state.localStatusRequest !== request) return;
+    result.providers.forEach((provider) => {
+      if (!request.providerIds.has(provider.provider_id) || provider.status === "missing_url") return;
+      if (provider.status === "reachable") {
+        updateProviderCheckResult(
+          provider.provider_id,
+          "ok",
+          `Reachable: ${provider.base_url}`,
+          "availability",
+        );
+        return;
+      }
+      const detail = provider.message
+        ? provider.message
+        : provider.status_code
+          ? `${provider.base_url} returned HTTP ${provider.status_code}`
+          : "The local provider did not respond.";
       updateProviderCheckResult(
         provider.provider_id,
-        "ok",
-        `Reachable: ${provider.base_url}`,
+        "error",
+        `Unavailable: ${detail}`,
+        "availability",
       );
-      return;
-    }
-    const detail = provider.message
-      ? provider.message
-      : provider.status_code
-        ? `${provider.base_url} returned HTTP ${provider.status_code}`
-        : "The local provider did not respond.";
-    updateProviderCheckResult(
-      provider.provider_id,
-      "error",
-      `Unavailable: ${detail}`,
-    );
-  });
+    });
+  } catch {
+    if (state.localStatusRequest !== request) return;
+    request.providerIds.forEach((providerId) => {
+      updateProviderCheckResult(
+        providerId,
+        "error",
+        "Availability check failed. Use Test to retry.",
+        "availability",
+      );
+    });
+  } finally {
+    if (state.localStatusRequest === request) state.localStatusRequest = null;
+  }
 }
 
 async function testProvider(providerId, button) {
+  const config = state.config;
+  state.localStatusRequest?.providerIds.delete(providerId);
   const original = button.textContent;
+  button.dataset.operationBusy = "true";
   button.disabled = true;
   button.textContent = "Checking...";
   updateProviderCheckResult(providerId, "checking", "Checking...");
@@ -1124,16 +1339,14 @@ async function testProvider(providerId, button) {
       method: "POST",
       body: "{}",
     });
+    if (config !== state.config) return;
     if (result.ok) {
       updateProviderCheckResult(
         providerId,
         "ok",
-        `${result.models.length} models available`,
+        modelCountMessage(result.models.length),
       );
-      setModelOptions([
-        ...state.modelOptions,
-        ...result.models.map((model) => `${providerId}/${model}`),
-      ]);
+      await hydrateModelOptions();
     } else {
       updateProviderCheckResult(
         providerId,
@@ -1142,14 +1355,19 @@ async function testProvider(providerId, button) {
       );
     }
   } catch {
+    if (config !== state.config) return;
     updateProviderCheckResult(
       providerId,
       "error",
       "Provider check could not be completed.",
     );
   } finally {
+    delete button.dataset.operationBusy;
     button.disabled = false;
     button.textContent = original;
+    if (config === state.config) renderProviderDialogActions(connectedAccountDescriptor(providerId));
+    void refreshStartup();
+    renderStartup();
   }
 }
 
@@ -1162,16 +1380,19 @@ async function hydrateModelOptions() {
 }
 
 async function loadModelOptions(refresh = false) {
+  const request = ++state.modelOptionsRequest;
+  const config = state.config;
   const result = await api("/admin/api/models" + (refresh ? "/refresh" : ""), {
     method: refresh ? "POST" : "GET",
   });
-  setModelOptions(result.models);
-  if (refresh && window.ChatSessions) await window.ChatSessions.refresh();
+  if (request === state.modelOptionsRequest && config === state.config) setModelOptions(result.models);
+  if (refresh && window.CodeSessions) await window.CodeSessions.refresh();
   return result;
 }
 
 async function refreshModelOptions(button) {
   const original = button.textContent;
+  button.dataset.operationBusy = "true";
   button.disabled = true;
   button.textContent = "Refreshing";
   try {
@@ -1189,8 +1410,11 @@ async function refreshModelOptions(button) {
   } catch (error) {
     showMessage(`Could not refresh models: ${error.message}`, "error");
   } finally {
+    delete button.dataset.operationBusy;
     button.disabled = false;
     button.textContent = original;
+    void refreshStartup();
+    renderStartup();
   }
 }
 
@@ -1204,7 +1428,7 @@ function providerDisplayName(providerId) {
 function setModelOptions(models) {
   state.modelOptions = Array.from(
     new Set(models.filter((model) => typeof model === "string" && model.trim())),
-  ).sort((left, right) => left.localeCompare(right));
+  );
   state.modelComboboxes.forEach((combobox) => {
     if (combobox.isOpen) combobox.render(combobox.query);
   });
@@ -1214,9 +1438,32 @@ function showMessage(message, kind = "") {
   const area = byId("messageArea");
   area.textContent = message;
   area.className = `message-area ${kind}`.trim();
+  if (byId("providerDialog").open) {
+    byId("providerMessage").textContent = message;
+    byId("providerMessage").className = area.className;
+  }
 }
 
-byId("applyButton").addEventListener("click", apply);
+byId("applyButton").addEventListener("click", () => apply());
+byId("saveProvider").addEventListener("click", () => apply(state.providerId));
+byId("closeProviderDialog").addEventListener("click", () => byId("providerDialog").close());
+byId("cancelProviderDialog").addEventListener("click", () => byId("providerDialog").close());
+byId("providerDialog").addEventListener("cancel", (event) => {
+  if (state.applying) event.preventDefault();
+});
+byId("providerDialog").addEventListener("click", (event) => {
+  if (event.target !== event.currentTarget || state.applying) return;
+  const rect = event.currentTarget.getBoundingClientRect();
+  if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) event.currentTarget.close();
+});
+byId("providerDialog").addEventListener("close", () => {
+  if (byId("providerDialog").open) return;
+  const providerId = state.providerId;
+  state.providerId = null;
+  byId("providerFields").replaceChildren();
+  updateDirtyState();
+  document.querySelector(`[data-provider="${providerId}"] [data-provider-settings]`)?.focus({ preventScroll: true });
+});
 document.addEventListener("pointerdown", (event) => {
   state.modelComboboxes.forEach((combobox) => {
     if (combobox.isOpen && !combobox.element.contains(event.target)) combobox.close();
@@ -1224,11 +1471,463 @@ document.addEventListener("pointerdown", (event) => {
 });
 
 window.addEventListener("popstate", () => {
-  const viewId = window.location.pathname.startsWith("/admin/chat")
-    ? "chat"
-    : "providers";
+  const viewId = viewFromLocation();
   setActiveView(viewId, { scroll: false });
 });
+
+try {
+  for (const key of Object.keys(sessionStorage)) {
+    if (key.startsWith("fcc.chat.draft.")) sessionStorage.removeItem(key);
+  }
+} catch {
+  console.warn("Chat draft cleanup deferred until the next page load: storage unavailable");
+}
+
+const claudeIntegrationDialog = byId("claudeIntegrationDialog");
+const claudeIntegration = { connected: null, busy: false, paths: null, update: null };
+const claudeIntegrationPath = "/admin/api/integrations/claude-vscode";
+
+function integrationMessage(id, message, error = false) {
+  const element = byId(id);
+  element.textContent = message;
+  element.hidden = !message;
+  element.classList.toggle("error", error);
+}
+
+function integrationUpdating(integration, id) {
+  return integration.update?.state === "starting" ||
+    state.startup?.startup?.integrations?.[id]?.state === "starting";
+}
+
+function refreshIntegrationUpdates(previous, current) {
+  if (state.activeView !== "integrations") return;
+  for (const [id, integration, refresh, messageId, message] of [
+    ["claude-vscode", claudeIntegration, refreshClaudeIntegration, "claudeIntegrationMessage", "Settings updated. Reload VS Code."],
+    ["jetbrains-acp", jetBrainsIntegration, refreshJetBrainsIntegration, "jetBrainsIntegrationMessage", "Settings updated. Reopen JetBrains and start a new chat."],
+    ["codex", codexIntegration, refreshCodexIntegration, "codexIntegrationMessage", "Settings updated. Restart Codex."],
+    ["claude-desktop", claudeDesktopIntegration, refreshClaudeDesktopIntegration, "claudeDesktopIntegrationMessage", "Settings updated. Reopen Claude Desktop."],
+  ]) {
+    const phase = current?.[id]?.state;
+    if (phase && phase !== "starting" && (
+      previous?.[id]?.state === "starting" || integration.update?.state === "starting"
+    )) void refresh(false, { background: true });
+    if (previous?.[id]?.state === "starting" && phase === "ready" && current[id].changed === true) {
+      integrationMessage(messageId, message);
+    }
+  }
+}
+
+function renderClaudeIntegration() {
+  const { connected, paths } = claudeIntegration;
+  const busy = claudeIntegration.busy || integrationUpdating(claudeIntegration, "claude-vscode");
+  const action = connected ? "Disconnect" : "Connect";
+  byId("openClaudeIntegration").textContent = busy ? "Loading…" : connected === null ? "Retry" : action;
+  byId("openClaudeIntegration").disabled = busy;
+  byId("openClaudeIntegration").setAttribute("aria-busy", String(busy));
+  byId("confirmClaudeIntegration").textContent = busy ? "Saving…" : action;
+  byId("confirmClaudeIntegration").disabled = busy || connected === null;
+  byId("openClaudeIntegration").className = connected && !busy ? "danger-button" : "primary-button";
+  byId("confirmClaudeIntegration").className = connected ? "danger-button" : "primary-button";
+  byId("claudeIntegrationDescription").textContent = connected
+    ? "Remove FCC's VS Code settings. Claude onboarding stays completed."
+    : "Will set FCC's URL and token, enable model discovery, skip VS Code login, and complete Claude onboarding.";
+  const files = byId("claudeIntegrationFiles");
+  files.replaceChildren();
+  if (paths) {
+    const targets = connected ? [paths.vscode_settings] : [paths.vscode_settings, paths.claude_state];
+    targets.forEach((path) => {
+      const item = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = path;
+      item.appendChild(code);
+      files.appendChild(item);
+    });
+  }
+}
+
+async function refreshClaudeIntegration(retry = false, { background = false } = {}) {
+  if (!background) integrationMessage("claudeIntegrationMessage", "");
+  if (claudeIntegration.busy) return;
+  claudeIntegration.busy = true;
+  renderClaudeIntegration();
+  try {
+    if (retry) await api(`${claudeIntegrationPath}/refresh`, { method: "POST" });
+    const result = await api(claudeIntegrationPath);
+    claudeIntegration.connected = result.connected;
+    claudeIntegration.paths = result.paths;
+    claudeIntegration.update = result.update;
+    if (result.update?.state === "failed") integrationMessage("claudeIntegrationMessage", result.update.message, true);
+    else if (byId("claudeIntegrationMessage").classList.contains("error")) integrationMessage("claudeIntegrationMessage", "");
+  } catch (error) {
+    claudeIntegration.connected = null;
+    claudeIntegration.update = null;
+    integrationMessage("claudeIntegrationMessage", error.message, true);
+  } finally {
+    claudeIntegration.busy = false;
+    renderClaudeIntegration();
+    if (claudeIntegration.update?.state === "starting") void refreshStartup();
+  }
+}
+
+byId("openClaudeIntegration").addEventListener("click", () => {
+  if (claudeIntegration.connected === null) {
+    refreshClaudeIntegration(claudeIntegration.update?.state === "failed");
+    return;
+  }
+  integrationMessage("claudeIntegrationDialogMessage", "");
+  claudeIntegrationDialog.showModal();
+});
+byId("confirmClaudeIntegration").addEventListener("click", async () => {
+  if (byId("confirmClaudeIntegration").disabled) return;
+  const disconnect = claudeIntegration.connected;
+  claudeIntegration.busy = true;
+  renderClaudeIntegration();
+  integrationMessage("claudeIntegrationDialogMessage", "");
+  integrationMessage("claudeIntegrationMessage", "");
+  try {
+    const result = await api(`${claudeIntegrationPath}/${disconnect ? "disconnect" : "connect"}`, { method: "POST" });
+    claudeIntegration.connected = result.connected;
+    claudeIntegration.update = null;
+    claudeIntegrationDialog.close();
+    integrationMessage("claudeIntegrationMessage", disconnect
+      ? "Settings removed. Reload VS Code to disconnect."
+      : "Settings saved. Reload VS Code to connect.");
+  } catch (error) {
+    integrationMessage("claudeIntegrationDialogMessage", error.message, true);
+    integrationMessage("claudeIntegrationMessage", error.message, true);
+  } finally {
+    claudeIntegration.busy = false;
+    renderClaudeIntegration();
+  }
+});
+byId("closeClaudeIntegration").addEventListener("click", () => claudeIntegrationDialog.close());
+claudeIntegrationDialog.addEventListener("click", (event) => {
+  if (event.target !== claudeIntegrationDialog) return;
+  const bounds = claudeIntegrationDialog.getBoundingClientRect();
+  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) {
+    claudeIntegrationDialog.close();
+  }
+});
+
+const codexIntegrationDialog = byId("codexIntegrationDialog");
+const codexIntegration = { connected: null, busy: false, paths: null, update: null };
+const codexIntegrationPath = "/admin/api/integrations/codex";
+
+function renderCodexIntegration() {
+  const { connected, paths } = codexIntegration;
+  const initializing = connected === false && state.startup?.startup?.catalog_file === "starting";
+  const unavailable = connected === false && state.startup?.startup?.catalog_file === "failed";
+  const busy = codexIntegration.busy || initializing || integrationUpdating(codexIntegration, "codex");
+  const catalogError = "Could not prepare the Codex model catalog. Refresh models to retry.";
+  if (unavailable) integrationMessage("codexIntegrationMessage", catalogError, true);
+  else if (byId("codexIntegrationMessage").textContent === catalogError) integrationMessage("codexIntegrationMessage", "");
+  const action = connected ? "Disconnect" : "Connect";
+  byId("openCodexIntegration").textContent = busy ? "Loading…" : connected === null ? "Retry" : action;
+  byId("openCodexIntegration").disabled = busy;
+  byId("openCodexIntegration").setAttribute("aria-busy", String(busy));
+  byId("confirmCodexIntegration").textContent = busy ? "Saving…" : action;
+  byId("confirmCodexIntegration").disabled = busy || connected === null || unavailable;
+  byId("openCodexIntegration").className = connected && !busy ? "danger-button" : "primary-button";
+  byId("confirmCodexIntegration").className = connected ? "danger-button" : "primary-button";
+  byId("codexIntegrationDescription").textContent = connected
+    ? "Remove FCC's Codex configuration. Other settings stay unchanged."
+    : "Configure Codex to use FCC. Your selected model stays unchanged.";
+  const files = byId("codexIntegrationFiles");
+  files.replaceChildren();
+  if (paths) {
+    const targets = [paths.codex_config];
+    targets.forEach((path) => {
+      const item = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = path;
+      item.appendChild(code);
+      files.appendChild(item);
+    });
+  }
+}
+
+async function refreshCodexIntegration(retry = false, { background = false } = {}) {
+  if (!background) integrationMessage("codexIntegrationMessage", "");
+  if (codexIntegration.busy) return;
+  codexIntegration.busy = true;
+  renderCodexIntegration();
+  try {
+    if (retry) await api(`${codexIntegrationPath}/refresh`, { method: "POST" });
+    const result = await api(codexIntegrationPath);
+    codexIntegration.connected = result.connected;
+    codexIntegration.paths = result.paths;
+    codexIntegration.update = result.update;
+    if (result.update?.state === "failed") integrationMessage("codexIntegrationMessage", result.update.message, true);
+    else if (byId("codexIntegrationMessage").classList.contains("error")) integrationMessage("codexIntegrationMessage", "");
+  } catch (error) {
+    codexIntegration.connected = null;
+    codexIntegration.update = null;
+    integrationMessage("codexIntegrationMessage", error.message, true);
+  } finally {
+    codexIntegration.busy = false;
+    renderCodexIntegration();
+    if (codexIntegration.update?.state === "starting") void refreshStartup();
+  }
+}
+
+byId("openCodexIntegration").addEventListener("click", () => {
+  if (codexIntegration.connected === null) {
+    refreshCodexIntegration(codexIntegration.update?.state === "failed");
+    return;
+  }
+  integrationMessage("codexIntegrationDialogMessage", "");
+  codexIntegrationDialog.showModal();
+});
+byId("confirmCodexIntegration").addEventListener("click", async () => {
+  if (byId("confirmCodexIntegration").disabled) return;
+  const disconnect = codexIntegration.connected;
+  codexIntegration.busy = true;
+  renderCodexIntegration();
+  integrationMessage("codexIntegrationDialogMessage", "");
+  integrationMessage("codexIntegrationMessage", "");
+  try {
+    const result = await api(`${codexIntegrationPath}/${disconnect ? "disconnect" : "connect"}`, { method: "POST" });
+    codexIntegration.connected = result.connected;
+    codexIntegration.paths = result.paths;
+    codexIntegration.update = null;
+    codexIntegrationDialog.close();
+    integrationMessage("codexIntegrationMessage", disconnect
+      ? "Settings removed. Restart Codex to disconnect."
+      : "Settings saved. Restart Codex and select an FCC model.");
+  } catch (error) {
+    integrationMessage("codexIntegrationDialogMessage", error.message, true);
+    integrationMessage("codexIntegrationMessage", error.message, true);
+  } finally {
+    codexIntegration.busy = false;
+    renderCodexIntegration();
+  }
+});
+byId("closeCodexIntegration").addEventListener("click", () => codexIntegrationDialog.close());
+codexIntegrationDialog.addEventListener("click", (event) => {
+  if (event.target !== codexIntegrationDialog) return;
+  const bounds = codexIntegrationDialog.getBoundingClientRect();
+  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) {
+    codexIntegrationDialog.close();
+  }
+});
+
+const jetBrainsIntegrationDialog = byId("jetBrainsIntegrationDialog");
+const jetBrainsIntegration = { connected: null, busy: false, paths: null, update: null };
+const jetBrainsIntegrationPath = "/admin/api/integrations/jetbrains-acp";
+
+function renderJetBrainsIntegration() {
+  const { connected, paths } = jetBrainsIntegration;
+  const busy = jetBrainsIntegration.busy || integrationUpdating(jetBrainsIntegration, "jetbrains-acp");
+  const action = connected ? "Disconnect" : "Connect";
+  byId("openJetBrainsIntegration").textContent = busy ? "Loading…" : connected === null ? "Retry" : action;
+  byId("openJetBrainsIntegration").disabled = busy;
+  byId("openJetBrainsIntegration").setAttribute("aria-busy", String(busy));
+  byId("confirmJetBrainsIntegration").textContent = busy ? "Saving…" : action;
+  byId("confirmJetBrainsIntegration").disabled = busy || connected === null;
+  byId("openJetBrainsIntegration").className = connected && !busy ? "danger-button" : "primary-button";
+  byId("confirmJetBrainsIntegration").className = connected ? "danger-button" : "primary-button";
+  byId("jetBrainsIntegrationDescription").textContent = connected
+    ? "Remove the Claude Code (FCC) agent, including its custom settings. Finish any configuration edits first."
+    : "Add Claude Code (FCC) using JetBrains' installed Claude Agent. Start that agent once before connecting, and finish any configuration edits.";
+  const files = byId("jetBrainsIntegrationFiles");
+  files.replaceChildren();
+  if (paths) {
+    const targets = [paths.acp_config];
+    targets.forEach((path) => {
+      const item = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = path;
+      item.appendChild(code);
+      files.appendChild(item);
+    });
+  }
+}
+
+async function refreshJetBrainsIntegration(retry = false, { background = false } = {}) {
+  if (!background) integrationMessage("jetBrainsIntegrationMessage", "");
+  if (jetBrainsIntegration.busy) return;
+  jetBrainsIntegration.busy = true;
+  renderJetBrainsIntegration();
+  try {
+    if (retry) await api(`${jetBrainsIntegrationPath}/refresh`, { method: "POST" });
+    const result = await api(jetBrainsIntegrationPath);
+    jetBrainsIntegration.connected = result.connected;
+    jetBrainsIntegration.paths = result.paths;
+    jetBrainsIntegration.update = result.update;
+    if (result.update?.state === "failed") integrationMessage("jetBrainsIntegrationMessage", result.update.message, true);
+    else if (byId("jetBrainsIntegrationMessage").classList.contains("error")) integrationMessage("jetBrainsIntegrationMessage", "");
+  } catch (error) {
+    jetBrainsIntegration.connected = null;
+    jetBrainsIntegration.update = null;
+    integrationMessage("jetBrainsIntegrationMessage", error.message, true);
+  } finally {
+    jetBrainsIntegration.busy = false;
+    renderJetBrainsIntegration();
+    if (jetBrainsIntegration.update?.state === "starting") void refreshStartup();
+  }
+}
+
+byId("openJetBrainsIntegration").addEventListener("click", () => {
+  if (jetBrainsIntegration.connected === null) {
+    refreshJetBrainsIntegration(jetBrainsIntegration.update?.state === "failed");
+    return;
+  }
+  integrationMessage("jetBrainsIntegrationDialogMessage", "");
+  jetBrainsIntegrationDialog.showModal();
+});
+byId("confirmJetBrainsIntegration").addEventListener("click", async () => {
+  if (byId("confirmJetBrainsIntegration").disabled) return;
+  const disconnect = jetBrainsIntegration.connected;
+  jetBrainsIntegration.busy = true;
+  renderJetBrainsIntegration();
+  integrationMessage("jetBrainsIntegrationDialogMessage", "");
+  integrationMessage("jetBrainsIntegrationMessage", "");
+  try {
+    const result = await api(`${jetBrainsIntegrationPath}/${disconnect ? "disconnect" : "connect"}`, { method: "POST" });
+    jetBrainsIntegration.connected = result.connected;
+    jetBrainsIntegration.update = null;
+    jetBrainsIntegrationDialog.close();
+    integrationMessage("jetBrainsIntegrationMessage", disconnect
+      ? "Agent removed. Reopen JetBrains to disconnect."
+      : "Settings saved. Reopen JetBrains, select Claude Code (FCC), and start a new chat.");
+  } catch (error) {
+    integrationMessage("jetBrainsIntegrationDialogMessage", error.message, true);
+    integrationMessage("jetBrainsIntegrationMessage", error.message, true);
+  } finally {
+    jetBrainsIntegration.busy = false;
+    renderJetBrainsIntegration();
+  }
+});
+byId("closeJetBrainsIntegration").addEventListener("click", () => jetBrainsIntegrationDialog.close());
+jetBrainsIntegrationDialog.addEventListener("click", (event) => {
+  if (event.target !== jetBrainsIntegrationDialog) return;
+  const bounds = jetBrainsIntegrationDialog.getBoundingClientRect();
+  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) {
+    jetBrainsIntegrationDialog.close();
+  }
+});
+
+const claudeDesktopIntegrationDialog = byId("claudeDesktopIntegrationDialog");
+const claudeDesktopIntegration = { connected: null, disconnectPending: false, busy: false, paths: null, update: null };
+const claudeDesktopIntegrationPath = "/admin/api/integrations/claude-desktop";
+
+function renderClaudeDesktopIntegration() {
+  const { connected, paths, disconnectPending } = claudeDesktopIntegration;
+  const busy = claudeDesktopIntegration.busy || integrationUpdating(claudeDesktopIntegration, "claude-desktop");
+  const disconnect = disconnectPending || connected;
+  const action = disconnectPending ? "Retry disconnect" : connected ? "Disconnect" : "Connect";
+  byId("openClaudeDesktopIntegration").textContent = busy ? "Loading…" : connected === null && !disconnectPending ? "Retry" : action;
+  byId("openClaudeDesktopIntegration").disabled = busy;
+  byId("openClaudeDesktopIntegration").setAttribute("aria-busy", String(busy));
+  byId("confirmClaudeDesktopIntegration").textContent = busy ? "Saving…" : action;
+  byId("confirmClaudeDesktopIntegration").disabled = busy || (connected === null && !disconnectPending);
+  byId("openClaudeDesktopIntegration").className = disconnect && !busy ? "danger-button" : "primary-button";
+  byId("confirmClaudeDesktopIntegration").className = disconnect ? "danger-button" : "primary-button";
+  byId("claudeDesktopIntegrationDescription").textContent = disconnectPending
+    ? "Finish removing FCC's configuration. Fully quit Claude Desktop before retrying, then reopen it."
+    : connected
+    ? "Remove FCC's configuration and return to normal Claude sign-in. Fully quit Claude Desktop first, then reopen it."
+    : "Set FCC as Claude Desktop's gateway. Fully quit Claude Desktop before connecting, then reopen it.";
+  const files = byId("claudeDesktopIntegrationFiles");
+  files.replaceChildren();
+  if (paths) {
+    const targets = Object.values(paths);
+    targets.forEach((path) => {
+      const item = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = path;
+      item.appendChild(code);
+      files.appendChild(item);
+    });
+  }
+}
+
+async function refreshClaudeDesktopIntegration(retry = false, { background = false } = {}) {
+  if (!background) integrationMessage("claudeDesktopIntegrationMessage", "");
+  if (claudeDesktopIntegration.busy) return;
+  claudeDesktopIntegration.busy = true;
+  renderClaudeDesktopIntegration();
+  try {
+    if (retry) await api(`${claudeDesktopIntegrationPath}/refresh`, { method: "POST" });
+    const result = await api(claudeDesktopIntegrationPath);
+    claudeDesktopIntegration.connected = result.connected;
+    claudeDesktopIntegration.disconnectPending = result.disconnect_pending;
+    claudeDesktopIntegration.paths = result.paths;
+    claudeDesktopIntegration.update = result.update;
+    if (result.update?.state === "failed") integrationMessage("claudeDesktopIntegrationMessage", result.update.message, true);
+    else if (byId("claudeDesktopIntegrationMessage").classList.contains("error")) integrationMessage("claudeDesktopIntegrationMessage", "");
+  } catch (error) {
+    claudeDesktopIntegration.connected = null;
+    claudeDesktopIntegration.disconnectPending = false;
+    claudeDesktopIntegration.update = null;
+    integrationMessage("claudeDesktopIntegrationMessage", error.message, true);
+  } finally {
+    claudeDesktopIntegration.busy = false;
+    renderClaudeDesktopIntegration();
+    if (claudeDesktopIntegration.update?.state === "starting") void refreshStartup();
+  }
+}
+
+byId("openClaudeDesktopIntegration").addEventListener("click", () => {
+  if (claudeDesktopIntegration.connected === null && !claudeDesktopIntegration.disconnectPending) {
+    refreshClaudeDesktopIntegration(claudeDesktopIntegration.update?.state === "failed");
+    return;
+  }
+  integrationMessage("claudeDesktopIntegrationDialogMessage", "");
+  claudeDesktopIntegrationDialog.showModal();
+});
+byId("confirmClaudeDesktopIntegration").addEventListener("click", async () => {
+  if (byId("confirmClaudeDesktopIntegration").disabled) return;
+  const disconnect = claudeDesktopIntegration.disconnectPending || claudeDesktopIntegration.connected;
+  claudeDesktopIntegration.busy = true;
+  renderClaudeDesktopIntegration();
+  integrationMessage("claudeDesktopIntegrationDialogMessage", "");
+  integrationMessage("claudeDesktopIntegrationMessage", "");
+  try {
+    const result = await api(`${claudeDesktopIntegrationPath}/${disconnect ? "disconnect" : "connect"}`, { method: "POST" });
+    claudeDesktopIntegration.connected = result.connected;
+    claudeDesktopIntegration.disconnectPending = result.disconnect_pending;
+    claudeDesktopIntegration.paths = result.paths;
+    claudeDesktopIntegration.update = null;
+    claudeDesktopIntegrationDialog.close();
+    integrationMessage("claudeDesktopIntegrationMessage", disconnect
+      ? "Settings removed. Reopen Claude Desktop to disconnect."
+      : "Settings saved. Reopen Claude Desktop to connect.");
+  } catch (error) {
+    if (disconnect) {
+      try {
+        const result = await api(claudeDesktopIntegrationPath);
+        claudeDesktopIntegration.connected = result.connected;
+        claudeDesktopIntegration.disconnectPending = result.disconnect_pending;
+        claudeDesktopIntegration.paths = result.paths;
+        claudeDesktopIntegration.update = result.update;
+      } catch {
+        // Keep the user's disconnect action available if status is unreadable too.
+      }
+    }
+    integrationMessage("claudeDesktopIntegrationDialogMessage", error.message, true);
+    integrationMessage("claudeDesktopIntegrationMessage", error.message, true);
+  } finally {
+    claudeDesktopIntegration.busy = false;
+    renderClaudeDesktopIntegration();
+  }
+});
+byId("closeClaudeDesktopIntegration").addEventListener("click", () => claudeDesktopIntegrationDialog.close());
+claudeDesktopIntegrationDialog.addEventListener("click", (event) => {
+  if (event.target !== claudeDesktopIntegrationDialog) return;
+  const bounds = claudeDesktopIntegrationDialog.getBoundingClientRect();
+  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) {
+    claudeDesktopIntegrationDialog.close();
+  }
+});
+
+// Keep footer clearance exact when messages wrap or a view hides the bar.
+new ResizeObserver(([entry]) => {
+  document.documentElement.style.setProperty(
+    "--action-bar-height",
+    `${entry.target.getBoundingClientRect().height}px`,
+  );
+}).observe(document.querySelector(".action-bar"), { box: "border-box" });
 
 load().then(showRestartNotice).catch((error) => {
   showMessage(error.message, "error");

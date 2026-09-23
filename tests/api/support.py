@@ -1,13 +1,15 @@
 """Explicit test composition for the API adapter."""
 
+import asyncio
 from collections.abc import Mapping, MutableMapping
 
 from fastapi import FastAPI
 
 from free_claude_code.api.app import create_app
 from free_claude_code.api.ports import ApiServices
-from free_claude_code.application.chat import ChatApplicationPort
+from free_claude_code.application.code_sessions import CodeApplicationPort
 from free_claude_code.application.connected_accounts import ConnectedAccountPort
+from free_claude_code.application.model_metadata import ProviderModelRefreshResult
 from free_claude_code.config.loader import ManagedConfigStore
 from free_claude_code.config.settings import Settings
 from free_claude_code.providers.base import BaseProvider
@@ -15,6 +17,25 @@ from free_claude_code.providers.runtime import ProviderRuntime
 from free_claude_code.runtime.application import ApplicationRuntime, RestartCallback
 from free_claude_code.runtime.configuration import ConfigurationService
 from free_claude_code.runtime.provider_manager import ProviderRuntimeManager
+from tests.web_tools_support import StubWebToolsClient
+
+
+class ApiTestRuntime(ProviderRuntimeManager):
+    """API-only tests supply metadata explicitly; startup/discovery has separate tests."""
+
+    def _catalog_task(self, generation, provider_id, *, refresh=False):
+        if refresh:
+            return super()._catalog_task(generation, provider_id, refresh=True)
+        task = generation.catalog_tasks.get(provider_id)
+        if task is None:
+
+            async def supplied_catalog():
+                generation.initialized.add(provider_id)
+                return ProviderModelRefreshResult()
+
+            task = asyncio.create_task(supplied_catalog())
+            generation.catalog_tasks[provider_id] = task
+        return task
 
 
 def create_test_app(
@@ -23,7 +44,7 @@ def create_test_app(
     providers: MutableMapping[str, BaseProvider] | None = None,
     restart_callback: RestartCallback | None = None,
     connected_accounts: Mapping[str, ConnectedAccountPort] | None = None,
-    chat: ChatApplicationPort | None = None,
+    code: CodeApplicationPort | None = None,
 ) -> FastAPI:
     """Build an API app with explicit in-memory runtime services."""
     store = ManagedConfigStore()
@@ -39,12 +60,12 @@ def create_test_app(
         )
 
     if providers is None:
-        manager = ProviderRuntimeManager(
+        manager = ApiTestRuntime(
             settings,
             connected_provider_ids=connected_provider_ids,
         )
     else:
-        manager = ProviderRuntimeManager(
+        manager = ApiTestRuntime(
             settings,
             runtime_factory=lambda snapshot: ProviderRuntime(
                 snapshot,
@@ -64,7 +85,8 @@ def create_test_app(
             requests=manager,
             admin=runtime,
             tasks=runtime,
-            chat=chat,
+            code=code,
+            web_tools=StubWebToolsClient(),
         )
     )
 

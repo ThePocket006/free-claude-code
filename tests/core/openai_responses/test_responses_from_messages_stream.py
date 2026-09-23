@@ -11,15 +11,15 @@ from free_claude_code.core.anthropic.native import (
 )
 from free_claude_code.core.anthropic.stream_contracts import parse_sse_lines
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
+from free_claude_code.core.history_replay import (
+    ReplayOrigin,
+    decode_replay,
+)
 from free_claude_code.core.json_types import JsonObject, JsonValue
 from free_claude_code.core.openai_responses import (
     AnthropicToResponsesStream,
     OpenAIResponsesRequest,
     build_responses_messages_request,
-)
-from free_claude_code.core.openai_responses.reasoning_replay import (
-    MessagesReplayOrigin,
-    decode_messages_reasoning,
 )
 
 _SCOPE = "github_copilot/anthropic_messages"
@@ -28,13 +28,13 @@ _SCOPE = "github_copilot/anthropic_messages"
 def _stream(*, tools: list[JsonObject] | None = None) -> AnthropicToResponsesStream:
     request = OpenAIResponsesRequest(model="public", input="hi", tools=tools)
     prepared = build_responses_messages_request(
-        request, options=NativeMessagesOptions("upstream", 4096), replay_scope=_SCOPE
+        request, options=NativeMessagesOptions("upstream", 4096)
     )
     return AnthropicToResponsesStream(
         request,
         public_model="public",
         tool_identities=prepared.tool_identities,
-        replay_origin=MessagesReplayOrigin(_SCOPE, "upstream"),
+        replay_origin=ReplayOrigin(_SCOPE, "messages", "", "", "upstream"),
     )
 
 
@@ -155,18 +155,15 @@ def test_text_thinking_and_redacted_blocks_keep_order_replay_and_exact_usage() -
     first = output[0]
     assert isinstance(first, Mapping)
     assert first["content"] == [{"type": "reasoning_text", "text": "think"}]
-    assert decode_messages_reasoning(
-        cast(str, first["encrypted_content"]), replay_scope=_SCOPE
-    ) == {
+    assert decode_replay(cast(str, first["encrypted_content"])).native == {
         "type": "thinking",
         "thinking": "think",
         "signature": "sig-end",
         "extension": {"x": 1},
     }
-    assert decode_messages_reasoning(
-        cast(str, cast(Mapping[str, JsonValue], output[1])["encrypted_content"]),
-        replay_scope=_SCOPE,
-    ) == {"type": "redacted_thinking", "data": "opaque"}
+    assert decode_replay(
+        cast(str, cast(Mapping[str, JsonValue], output[1])["encrypted_content"])
+    ).native == {"type": "redacted_thinking", "data": "opaque"}
     assert cast(Mapping[str, JsonValue], output[2])["content"] == [
         {"type": "output_text", "text": "Hello world", "annotations": []}
     ]
@@ -252,6 +249,19 @@ def test_parallel_tools_preserve_call_ids_namespace_and_emit_arguments_once() ->
     assert output[0]["name"] == "lookup" and output[0]["arguments"] == '{"q":"ok"}'
     assert output[1]["call_id"] == "call-b" and output[1]["input"] == "pwd"
     assert output[0]["id"] != output[0]["call_id"]
+    for index, prefix in ((0, "fc_"), (1, "ctc_")):
+        item_id = output[index]["id"]
+        assert isinstance(item_id, str) and item_id.startswith(prefix)
+        coordinates = [event for event in events if event.get("output_index") == index]
+        assert [
+            cast(JsonObject, event["item"])["id"]
+            for event in coordinates
+            if "item" in event
+        ] == [item_id, item_id]
+        assert [event["item_id"] for event in coordinates if "item_id" in event] == [
+            item_id,
+            item_id,
+        ]
     assert [
         event["delta"]
         for event in events
@@ -284,12 +294,7 @@ def test_signature_only_thinking_has_replay_without_invented_visible_text() -> N
     response = cast(Mapping[str, JsonValue], events[-1]["response"])
     item = cast(list[JsonObject], response["output"])[0]
     assert "content" not in item
-    assert (
-        decode_messages_reasoning(
-            cast(str, item["encrypted_content"]), replay_scope=_SCOPE
-        )["thinking"]
-        == ""
-    )
+    assert decode_replay(cast(str, item["encrypted_content"])).native["thinking"] == ""
     assert "output_tokens_details" not in cast(
         Mapping[str, JsonValue], response["usage"]
     )

@@ -11,6 +11,7 @@ from urllib.request import Request
 import pytest
 
 from free_claude_code.cli import local_http
+from free_claude_code.config.loader import ManagedConfigStore
 from free_claude_code.core.json_types import JsonObject
 
 
@@ -26,6 +27,7 @@ class LaunchCapture:
     environments: list[dict[str, str]] = field(default_factory=list)
     catalog: JsonObject = field(
         default_factory=lambda: {
+            "default_model_id": "nvidia_nim/catalog-model:variant",
             "data": [
                 {
                     "id": "nvidia_nim/catalog-model:variant",
@@ -44,8 +46,8 @@ class LaunchCapture:
     exit_code: int = 23
     versions: dict[str, str] = field(
         default_factory=lambda: {
-            "pi": "Pi Coding Agent --extension --models",
-            "opencode": "1.18.18",
+            "pi": "0.80.4",
+            "opencode": "opencode v2.0.10",
             "cline": "3.0.55",
             "hermes": "Hermes Agent 0.20.4",
             "dsh": "0.1.0-rc.8",
@@ -102,7 +104,11 @@ def launch_capture(monkeypatch: pytest.MonkeyPatch) -> LaunchCapture:
     from free_claude_code.cli.launchers import common
 
     capture = LaunchCapture()
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "launcher-test-token")
+    store = ManagedConfigStore()
+    store.initialize({})
+    store.commit(
+        dict(store.read({}).managed) | {"ANTHROPIC_AUTH_TOKEN": "launcher-test-token"}
+    )
     monkeypatch.setenv("HOST", "127.0.0.1")
     monkeypatch.setenv("PORT", "8182")
     monkeypatch.setenv("MODEL", "nvidia_nim/catalog-model:variant")

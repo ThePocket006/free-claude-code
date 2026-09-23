@@ -32,6 +32,33 @@ def _local_client(app):
     )
 
 
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/admin/chat",
+        "/admin/chat/old-session",
+        "/admin/api/chat/sessions",
+        "/admin/api/chat/events",
+        "/admin/api/chat/settings",
+        f"/admin/assets/{package_version()}/chat_sessions.js",
+        f"/admin/assets/{package_version()}/chat_sessions.css",
+    ),
+)
+def test_retired_chat_urls_are_not_served(path):
+    client = _local_client(create_test_app())
+    assert client.get(path).status_code == 404
+
+
+def test_admin_retains_code_without_chat_markup():
+    client = _local_client(create_test_app())
+    response = client.get("/admin")
+    assert response.status_code == 200
+    assert 'id="view-code"' in response.text
+    assert 'id="view-chat"' not in response.text
+    assert "chat_sessions" not in response.text
+    assert client.get("/admin/code").status_code == 200
+
+
 def test_admin_retirement_preview_apply_and_runtime_agree(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)
     _clear_process_config(monkeypatch)
@@ -135,13 +162,16 @@ def _catalog_proxy_env_keys() -> tuple[str, ...]:
     return tuple(keys)
 
 
-def test_admin_page_is_loopback_only(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "path", ["/admin", "/admin/model_config", "/admin/messaging", "/admin/integrations"]
+)
+def test_admin_page_is_loopback_only(monkeypatch, tmp_path, path):
     _set_home(monkeypatch, tmp_path)
     app = create_test_app()
 
-    assert _local_client(app).get("/admin").status_code == 200
+    assert _local_client(app).get(path).status_code == 200
     remote_client = TestClient(app, client=("203.0.113.10", 50000))
-    assert remote_client.get("/admin").status_code == 403
+    assert remote_client.get(path).status_code == 403
 
 
 def test_admin_page_uses_installed_version(monkeypatch, tmp_path):
@@ -161,13 +191,14 @@ def test_admin_page_uses_installed_version(monkeypatch, tmp_path):
     assert 'aria-label="Open Free Claude Code on GitHub"' in response.text
     assert 'src="/admin/assets/9.8.7/app-icon.svg"' in response.text
     assert 'href="/admin/assets/9.8.7/admin.css"' in response.text
-    assert 'href="/admin/assets/9.8.7/chat_sessions.css"' in response.text
+    assert 'href="/admin/assets/9.8.7/code_sessions.css"' in response.text
     assert 'src="/admin/assets/9.8.7/model_combobox.js"' in response.text
-    assert 'src="/admin/assets/9.8.7/chat_sessions.js"' in response.text
+    assert 'src="/admin/assets/9.8.7/form_controls.js"' in response.text
+    assert 'src="/admin/assets/9.8.7/code_sessions.js"' in response.text
     assert 'src="/admin/assets/9.8.7/admin.js"' in response.text
     assert 'href="/admin/assets/admin.css"' not in response.text
-    assert 'href="/admin/assets/chat_sessions.css"' not in response.text
-    assert 'src="/admin/assets/chat_sessions.js"' not in response.text
+    assert 'href="/admin/assets/code_sessions.css"' not in response.text
+    assert 'src="/admin/assets/code_sessions.js"' not in response.text
     assert 'src="/admin/assets/admin.js"' not in response.text
 
 
@@ -176,8 +207,10 @@ def test_admin_page_uses_installed_version(monkeypatch, tmp_path):
     (
         ("admin.css", "text/css"),
         ("admin.js", "text/javascript"),
-        ("chat_sessions.css", "text/css"),
-        ("chat_sessions.js", "text/javascript"),
+        ("form_controls.js", "text/javascript"),
+        ("code_sessions.css", "text/css"),
+        ("code_sessions.js", "text/javascript"),
+        ("session_ui.js", "text/javascript"),
         ("model_combobox.js", "text/javascript"),
     ),
 )
@@ -230,8 +263,8 @@ def test_admin_versioned_logo_reuses_packaged_app_icon(monkeypatch, tmp_path):
         f"/admin/assets/{package_version()}/app-icon.svg",
         f"/admin/assets/{package_version()}/admin.css",
         f"/admin/assets/{package_version()}/admin.js",
-        f"/admin/assets/{package_version()}/chat_sessions.css",
-        f"/admin/assets/{package_version()}/chat_sessions.js",
+        f"/admin/assets/{package_version()}/code_sessions.css",
+        f"/admin/assets/{package_version()}/code_sessions.js",
         f"/admin/assets/{package_version()}/model_combobox.js",
         "/admin/api/config",
     ),
@@ -1927,9 +1960,7 @@ def test_reverting_pending_restart_restores_hot_apply(monkeypatch, tmp_path):
     app = create_test_app(settings, restart_callback=callback)
     client = _local_client(app)
     client.post("/admin/api/config/apply", json={"values": {"PORT": "9090"}})
-    with patch.object(
-        provider_manager_for_app(app), "_refresh_generation_in_background", AsyncMock()
-    ):
+    with patch.object(provider_manager_for_app(app), "_start_pass", MagicMock()):
         result = client.post(
             "/admin/api/config/apply",
             json={"values": {"PORT": str(settings.port), "MODEL": "nvidia_nim/new"}},

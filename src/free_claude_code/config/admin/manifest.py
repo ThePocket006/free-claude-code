@@ -88,7 +88,7 @@ _NON_PROVIDER_FIELDS: tuple[ConfigFieldSpec, ...] = (
     ConfigFieldSpec(
         "PROVIDER_API_KEYS",
         "Provider API Key Pool",
-        "providers",
+        "runtime",
         "textarea",
         settings_attr="provider_api_keys",
         secret=True,
@@ -102,7 +102,7 @@ _NON_PROVIDER_FIELDS: tuple[ConfigFieldSpec, ...] = (
     ConfigFieldSpec(
         "PROVIDER_KEY_COOLDOWN_SECONDS",
         "Key Cooldown (s)",
-        "providers",
+        "runtime",
         "number",
         settings_attr="provider_key_cooldown_seconds",
         description=(
@@ -113,7 +113,7 @@ _NON_PROVIDER_FIELDS: tuple[ConfigFieldSpec, ...] = (
     ConfigFieldSpec(
         "CIRCUIT_BREAKER_THRESHOLD",
         "Circuit Breaker Threshold",
-        "providers",
+        "runtime",
         "number",
         settings_attr="circuit_breaker_threshold",
         description=(
@@ -124,7 +124,7 @@ _NON_PROVIDER_FIELDS: tuple[ConfigFieldSpec, ...] = (
     ConfigFieldSpec(
         "CIRCUIT_BREAKER_COOLDOWN",
         "Circuit Breaker Cooldown (s)",
-        "providers",
+        "runtime",
         "number",
         settings_attr="circuit_breaker_cooldown",
         description=(
