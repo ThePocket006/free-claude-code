@@ -43,6 +43,7 @@ _ADMIN_ASSET_FILENAMES = frozenset(
         "admin.css",
         "admin.js",
         "app-icon.svg",
+        "app-icon.png",
         "chat_sessions.css",
         "chat_sessions.js",
         "model_combobox.js",
@@ -71,7 +72,7 @@ class ConnectedAccountLoginPayload(BaseModel):
 
 
 def _asset_path(filename: str) -> Path:
-    asset_dir = PACKAGE_ASSETS_DIR if filename == "app-icon.svg" else STATIC_DIR
+    asset_dir = PACKAGE_ASSETS_DIR if filename in ("app-icon.svg", "app-icon.png") else STATIC_DIR
     path = asset_dir / filename
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Admin asset not found")
