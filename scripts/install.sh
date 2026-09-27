@@ -1,8 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO_ARCHIVE_URL="https://github.com/Alishahryar1/free-claude-code/archive/refs/heads/main.zip"
-PYTHON_VERSION="3.14.0"
+PYTHON_VERSION="3.14.7"
 MIN_UV_VERSION="0.12.13"
 CLAUDE_INSTALL_URL="https://claude.ai/install.sh"
 CODEX_INSTALL_URL="https://chatgpt.com/codex/install.sh"
@@ -19,12 +18,10 @@ UV_INSTALL_URL="https://astral.sh/uv/install.sh"
 FCC_MACOS_BUNDLE_ID="io.github.alishahryar1.free-claude-code"
 FCC_MACOS_OWNER_FILE=".free-claude-code-owner"
 # Include retired entry points so updates reject older FCC processes before replacement.
-FCC_COMMANDS="fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi fcc-opencode fcc-cline fcc-hermes fcc-dsh fcc-grok fcc-muse fcc-aider fcc-update fcc-init free-claude-code"
+FCC_COMMANDS="fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi fcc-opencode fcc-cline fcc-hermes fcc-dsh fcc-grok fcc-muse fcc-aider fcc-doctor fcc-update fcc-init free-claude-code"
 
 dry_run=0
-voice_nim=0
 voice_local=0
-voice_all=0
 install_claude=1
 install_codex=1
 install_pi=1
@@ -50,9 +47,7 @@ Usage: install.sh [options]
 Installs or updates Free Claude Code and lets you choose which coding agents to install or verify.
 
 Options:
-  --voice-nim              Install NVIDIA NIM voice transcription support.
   --voice-local            Install local Whisper voice transcription support.
-  --voice-all              Install all voice transcription backends.
   --torch-backend VALUE    Use a uv PyTorch backend, such as cu130. Requires local voice.
   --rtk                    Install and configure RTK for the selected coding agents.
   --dry-run                Print commands without running them.
@@ -1261,14 +1256,8 @@ ensure_uv() {
 parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --voice-nim)
-                voice_nim=1
-                ;;
             --voice-local)
                 voice_local=1
-                ;;
-            --voice-all)
-                voice_all=1
                 ;;
             --torch-backend)
                 shift
@@ -1300,33 +1289,16 @@ parse_args() {
 }
 
 validate_args() {
-    include_local=$voice_local
-    if [ "$voice_all" -eq 1 ]; then
-        include_local=1
-    fi
-
-    if [ -n "$torch_backend" ] && [ "$include_local" -ne 1 ]; then
-        fail "--torch-backend requires --voice-local or --voice-all."
+    if [ -n "$torch_backend" ] && [ "$voice_local" -ne 1 ]; then
+        fail "--torch-backend requires --voice-local."
     fi
 }
 
 package_spec() {
-    include_nim=$voice_nim
-    include_local=$voice_local
-
-    if [ "$voice_all" -eq 1 ]; then
-        include_nim=1
-        include_local=1
-    fi
-
-    if [ "$include_nim" -eq 1 ] && [ "$include_local" -eq 1 ]; then
-        printf 'free-claude-code[voice,voice_local] @ %s' "$REPO_ARCHIVE_URL"
-    elif [ "$include_nim" -eq 1 ]; then
-        printf 'free-claude-code[voice] @ %s' "$REPO_ARCHIVE_URL"
-    elif [ "$include_local" -eq 1 ]; then
-        printf 'free-claude-code[voice_local] @ %s' "$REPO_ARCHIVE_URL"
+    if [ "$voice_local" -eq 1 ]; then
+        printf '%s' 'free-claude-code[voice_local]'
     else
-        printf 'free-claude-code @ %s' "$REPO_ARCHIVE_URL"
+        printf '%s' 'free-claude-code'
     fi
 }
 
@@ -1353,7 +1325,7 @@ configure_and_verify_free_claude_code() {
 
     add_uv_tool_bin_directory
 
-    for command_name in fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi fcc-opencode fcc-cline fcc-hermes fcc-dsh fcc-grok fcc-muse fcc-aider fcc-update; do
+    for command_name in fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi fcc-opencode fcc-cline fcc-hermes fcc-dsh fcc-grok fcc-muse fcc-aider fcc-doctor fcc-update; do
         [ -x "$tool_bin/$command_name" ] || fail "Free Claude Code installation did not create $tool_bin/$command_name."
     done
 

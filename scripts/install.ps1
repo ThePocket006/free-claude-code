@@ -1,7 +1,5 @@
 param(
-    [switch] $VoiceNim,
     [switch] $VoiceLocal,
-    [switch] $VoiceAll,
     [string] $TorchBackend = "",
     [switch] $Rtk,
     [switch] $DryRun,
@@ -14,9 +12,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$RepoArchiveUrl = "https://github.com/Alishahryar1/free-claude-code/archive/refs/heads/main.zip"
 # Windows on ARM emulates x64, whose Python package ecosystem has broader wheel support.
-$PythonRequest = "cpython-3.14.0-windows-x86_64-none"
+$PythonRequest = "cpython-3.14.7-windows-x86_64-none"
 $MinUvVersion = "0.12.13"
 $ClaudeInstallUrl = "https://claude.ai/install.ps1"
 $CodexInstallUrl = "https://chatgpt.com/codex/install.ps1"
@@ -59,6 +56,7 @@ $FccCommands = @(
     "fcc-grok",
     "fcc-muse",
     "fcc-aider",
+    "fcc-doctor",
     "fcc-update",
     "fcc-init",
     "free-claude-code"
@@ -71,9 +69,7 @@ Usage: install.ps1 [options]
 Installs or updates Free Claude Code and lets you choose which coding agents to install or verify.
 
 Options:
-  -VoiceNim              Install NVIDIA NIM voice transcription support.
   -VoiceLocal            Install local Whisper voice transcription support.
-  -VoiceAll              Install all voice transcription backends.
   -TorchBackend VALUE    Use a uv PyTorch backend, such as cu130. Requires local voice.
   -Rtk                   Install and configure RTK for the selected coding agents.
   -DryRun                Print commands without running them.
@@ -1398,24 +1394,10 @@ function Ensure-Uv {
 }
 
 function Get-PackageSpec {
-    $includeNim = $VoiceNim
-    $includeLocal = $VoiceLocal
-
-    if ($VoiceAll) {
-        $includeNim = $true
-        $includeLocal = $true
+    if ($VoiceLocal) {
+        return "free-claude-code[voice_local]"
     }
-
-    if ($includeNim -and $includeLocal) {
-        return "free-claude-code[voice,voice_local] @ $RepoArchiveUrl"
-    }
-    if ($includeNim) {
-        return "free-claude-code[voice] @ $RepoArchiveUrl"
-    }
-    if ($includeLocal) {
-        return "free-claude-code[voice_local] @ $RepoArchiveUrl"
-    }
-    return "free-claude-code @ $RepoArchiveUrl"
+    return "free-claude-code"
 }
 
 function Install-FreeClaudeCode {
@@ -1507,7 +1489,7 @@ function Configure-AndConfirmFreeClaudeCode {
         [IO.Path]::AltDirectorySeparatorChar
     )
     $installedCommands = @{}
-    foreach ($commandName in @("fcc-desktop", "fcc-server", "fcc-claude", "fcc-codex", "fcc-pi", "fcc-opencode", "fcc-cline", "fcc-hermes", "fcc-dsh", "fcc-grok", "fcc-muse", "fcc-aider", "fcc-update.cmd")) {
+    foreach ($commandName in @("fcc-desktop", "fcc-server", "fcc-claude", "fcc-codex", "fcc-pi", "fcc-opencode", "fcc-cline", "fcc-hermes", "fcc-dsh", "fcc-grok", "fcc-muse", "fcc-aider", "fcc-doctor", "fcc-update.cmd")) {
         $command = Get-ApplicationCommand $commandName
         if (-not $command) {
             throw "Free Claude Code installation did not create '$commandName'."
@@ -1605,8 +1587,8 @@ if ($RemainingArgs.Count -gt 0) {
     throw "Unknown option: $($RemainingArgs -join ' ')"
 }
 
-if ((-not [string]::IsNullOrWhiteSpace($TorchBackend)) -and (-not ($VoiceLocal -or $VoiceAll))) {
-    throw "-TorchBackend requires -VoiceLocal or -VoiceAll."
+if ((-not [string]::IsNullOrWhiteSpace($TorchBackend)) -and (-not $VoiceLocal)) {
+    throw "-TorchBackend requires -VoiceLocal."
 }
 
 # Preserve the user's winning command before adding installer search paths.

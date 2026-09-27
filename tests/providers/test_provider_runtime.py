@@ -14,6 +14,7 @@ from free_claude_code.config.nim import NimSettings
 from free_claude_code.config.provider_catalog import (
     AGNES_DEFAULT_BASE,
     BEDROCK_DEFAULT_BASE,
+    CHEAPERINFERENCE_DEFAULT_BASE,
     CHUTES_DEFAULT_BASE,
     CLINE_DEFAULT_BASE,
     COHERE_DEFAULT_BASE,
@@ -22,12 +23,11 @@ from free_claude_code.config.provider_catalog import (
     FEATHERLESS_DEFAULT_BASE,
     HUGGINGFACE_DEFAULT_BASE,
     KIMI_CODE_DEFAULT_BASE,
-    LIGHTNING_DEFAULT_BASE,
     LLM7_DEFAULT_BASE,
     MINIMAX_DEFAULT_BASE,
-    NARAROUTE_DEFAULT_BASE,
     NEBIUS_DEFAULT_BASE,
     OLLAMA_CLOUD_DEFAULT_BASE,
+    ORCAROUTER_DEFAULT_BASE,
     POOLSIDE_DEFAULT_BASE,
     PROVIDER_CATALOG,
     QWENCLOUD_CODING_DEFAULT_BASE,
@@ -36,7 +36,6 @@ from free_claude_code.config.provider_catalog import (
     SILICONFLOW_DEFAULT_BASE,
     SUPPORTED_PROVIDER_IDS,
     TOGETHER_DEFAULT_BASE,
-    TOKENROUTER_DEFAULT_BASE,
     VERCEL_AI_GATEWAY_DEFAULT_BASE,
     WANDB_INFERENCE_DEFAULT_BASE,
     XAI_DEFAULT_BASE,
@@ -55,6 +54,7 @@ from free_claude_code.providers.lmstudio import LMStudioProvider
 from free_claude_code.providers.mistral import MistralProvider
 from free_claude_code.providers.nvidia_nim import NvidiaNimProvider
 from free_claude_code.providers.open_router import OpenRouterProvider
+from free_claude_code.providers.openai_api import OpenAIAPIProvider
 from free_claude_code.providers.openai_chat import (
     OPENAI_CHAT_PROFILES,
     OpenAIChatProvider,
@@ -76,6 +76,7 @@ def _make_settings(**overrides):
     mock.model_opus = None
     mock.model_sonnet = None
     mock.model_haiku = None
+    mock.openai_api_key = "test_openai_api_key"
     mock.azure_openai_api_key = "test_azure_openai_key"
     mock.azure_openai_base_url = "https://test-resource.openai.azure.com/openai/v1/"
     mock.nvidia_nim_api_key = "test_key"
@@ -103,9 +104,7 @@ def _make_settings(**overrides):
     mock.cohere_api_key = "test_cohere_key"
     mock.zai_api_key = "test_zai_key"
     mock.tokenrouter_api_key = "test_tokenrouter_key"
-    mock.tokenrouter_base_url = TOKENROUTER_DEFAULT_BASE
     mock.nararoute_api_key = "test_nararoute_key"
-    mock.nararoute_base_url = NARAROUTE_DEFAULT_BASE
     mock.agnes_api_key = "test_agnes_key"
     mock.zenmux_api_key = "test_zenmux_key"
     mock.wandb_api_key = "test_wandb_key"
@@ -116,9 +115,9 @@ def _make_settings(**overrides):
     mock.poolside_api_key = "test_poolside_key"
     mock.llm7_api_key = "test_llm7_key"
     mock.lightning_api_key = "test_lightning_key"
-    mock.lightning_base_url = LIGHTNING_DEFAULT_BASE
     mock.experiential_api_key = "test_experiential_key"
-    mock.experiential_base_url = EXPERIENTIAL_DEFAULT_BASE
+    mock.cheaperinference_api_key = "test_cheaperinference_key"
+    mock.orcarouter_api_key = "test_orcarouter_key"
     mock.nvidia_nim_proxy = None
     mock.open_router_proxy = None
     mock.lmstudio_proxy = None
@@ -167,9 +166,12 @@ def _make_settings(**overrides):
     mock.llm7_proxy = None
     mock.lightning_proxy = None
     mock.experiential_proxy = None
+    mock.cheaperinference_proxy = None
+    mock.orcarouter_proxy = None
     mock.kilo_api_key = "test_kilo_key"
     mock.kilo_proxy = None
     mock.openai_proxy = None
+    mock.openai_api_proxy = None
     mock.xai_proxy = None
     mock.qwencloud_proxy = None
     mock.qwencloud_coding_proxy = None
@@ -314,7 +316,6 @@ async def test_experiential_provider_config_uses_key_base_and_proxy() -> None:
     descriptor = PROVIDER_CATALOG["experiential"]
     settings = _make_settings(
         experiential_api_key="experiential-token",
-        experiential_base_url="https://custom.experientiallabs.example/v1",
         experiential_proxy="http://proxy.test:8080",
     )
 
@@ -330,10 +331,61 @@ async def test_experiential_provider_config_uses_key_base_and_proxy() -> None:
         == "https://platform.experientiallabs.ai/settings/api-keys"
     )
     assert descriptor.default_base_url == EXPERIENTIAL_DEFAULT_BASE
-    assert descriptor.base_url_attr == "experiential_base_url"
+    assert descriptor.base_url_attr is None
     assert descriptor.proxy_attr == "experiential_proxy"
     assert config.api_key == "experiential-token"
-    assert config.base_url == "https://custom.experientiallabs.example/v1"
+    assert config.base_url == EXPERIENTIAL_DEFAULT_BASE
+    assert config.proxy == "http://proxy.test:8080"
+    assert isinstance(provider, OpenAIChatProvider)
+
+
+@pytest.mark.asyncio
+async def test_cheaperinference_provider_config_uses_key_base_and_proxy() -> None:
+    descriptor = PROVIDER_CATALOG["cheaperinference"]
+    settings = _make_settings(
+        cheaperinference_api_key="ci_live_token",
+        cheaperinference_proxy="http://proxy.test:8080",
+    )
+
+    config = build_provider_config(descriptor, settings)
+    with patch("free_claude_code.providers.openai_chat.client.AsyncOpenAI"):
+        provider = await create_provider("cheaperinference", settings)
+
+    assert descriptor.display_name == "Cheaper Inference"
+    assert descriptor.credential_env == "CHEAPER_INFERENCE_API_KEY"
+    assert descriptor.credential_attr == "cheaperinference_api_key"
+    assert descriptor.credential_url == "https://cheaperinference.com/signup"
+    assert descriptor.default_base_url == CHEAPERINFERENCE_DEFAULT_BASE
+    assert descriptor.base_url_attr is None
+    assert descriptor.proxy_attr == "cheaperinference_proxy"
+    assert config.api_key == "ci_live_token"
+    assert config.base_url == "https://api.cheaperinference.com/v1"
+    assert config.proxy == "http://proxy.test:8080"
+    assert isinstance(provider, OpenAIChatProvider)
+
+
+@pytest.mark.asyncio
+async def test_orcarouter_provider_config_uses_key_base_and_proxy() -> None:
+    descriptor = PROVIDER_CATALOG["orcarouter"]
+    settings = _make_settings(
+        orcarouter_api_key="orcarouter-token",
+        orcarouter_base_url="https://unused.example/v1",
+        orcarouter_proxy="http://proxy.test:8080",
+    )
+
+    config = build_provider_config(descriptor, settings)
+    with patch("free_claude_code.providers.openai_chat.client.AsyncOpenAI"):
+        provider = await create_provider("orcarouter", settings)
+
+    assert descriptor.display_name == "OrcaRouter"
+    assert descriptor.credential_env == "ORCAROUTER_API_KEY"
+    assert descriptor.credential_attr == "orcarouter_api_key"
+    assert descriptor.credential_url == "https://www.orcarouter.ai/console"
+    assert descriptor.default_base_url == ORCAROUTER_DEFAULT_BASE
+    assert descriptor.base_url_attr is None
+    assert descriptor.proxy_attr == "orcarouter_proxy"
+    assert config.api_key == "orcarouter-token"
+    assert config.base_url == ORCAROUTER_DEFAULT_BASE
     assert config.proxy == "http://proxy.test:8080"
     assert isinstance(provider, OpenAIChatProvider)
 
@@ -979,6 +1031,7 @@ async def test_create_provider_instantiates_each_builtin():
     cases = {
         "nvidia_nim": NvidiaNimProvider,
         "openai": OpenAICodexProvider,
+        "openai_api": OpenAIAPIProvider,
         "github_copilot": GitHubCopilotProvider,
         "cline_pass": OpenAIChatProvider,
         "xai": OpenAIChatProvider,
@@ -1012,6 +1065,8 @@ async def test_create_provider_instantiates_each_builtin():
         "llm7": OpenAIChatProvider,
         "lightning": OpenAIChatProvider,
         "experiential": OpenAIChatProvider,
+        "cheaperinference": OpenAIChatProvider,
+        "orcarouter": OpenAIChatProvider,
         "opencode_go": OpenCodeProvider,
         "vercel": OpenAIChatProvider,
         "bedrock": OpenAIChatProvider,
@@ -1050,6 +1105,7 @@ async def test_create_provider_instantiates_each_builtin():
         patch("free_claude_code.providers.openai_chat.client.AsyncOpenAI"),
         patch("free_claude_code.providers.github_copilot.provider.AsyncOpenAI"),
         patch("free_claude_code.providers.openai_codex.provider.AsyncOpenAI"),
+        patch("free_claude_code.providers.openai_api.provider.AsyncOpenAI"),
         patch("httpx.AsyncClient"),
         patch(
             "free_claude_code.providers.runtime.factory.ProviderAdmissionController",

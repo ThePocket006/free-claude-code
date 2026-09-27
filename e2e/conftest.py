@@ -13,6 +13,7 @@ import uvicorn
 from playwright.sync_api import Page
 
 from e2e.code_support import CodeControl
+from e2e.server_shutdown import join_server
 from free_claude_code.api.app import create_app
 from free_claude_code.api.ports import ApiServices
 from free_claude_code.application.model_metadata import ProviderModelInfo
@@ -23,6 +24,7 @@ from free_claude_code.config.loader import (
     clear_settings_cache,
     get_settings,
 )
+from free_claude_code.config.settings import Settings
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
@@ -31,6 +33,7 @@ from free_claude_code.harnesses import (
     claude_integration,
     codex_integration,
     jetbrains_acp_integration,
+    vscode_chat_integration,
 )
 from free_claude_code.providers.base import BaseProvider, ProviderConfig
 from free_claude_code.providers.runtime import ProviderRuntime
@@ -115,6 +118,7 @@ class _ModelListingProvider(BaseProvider):
         response_model: str | None = None,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
         request_headers: Mapping[str, str] | None = None,
+        model_info: ProviderModelInfo | None = None,
     ) -> AsyncIterator[str]:
         if False:
             yield ""
@@ -131,12 +135,28 @@ def admin_client_files():
 
 
 @pytest.fixture
+def provider_load_guard(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    attempted: list[str] = []
+
+    def forbidden(provider_id: str, *_args):
+        attempted.append(provider_id)
+        raise AssertionError(f"Browser fixture loaded real provider: {provider_id}")
+
+    monkeypatch.setattr(
+        "free_claude_code.providers.runtime.runtime._load_constructor", forbidden
+    )
+    yield
+    assert attempted == [], f"Browser fixture loaded real providers: {attempted}"
+
+
+@pytest.fixture
 def admin_base_url(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     code_control: CodeControl,
     admin_client_files,
+    provider_load_guard,
 ) -> Iterator[str]:
     """Serve one fully isolated Admin application on an OS-assigned port."""
 
@@ -165,6 +185,11 @@ def admin_base_url(
     )
     monkeypatch.setattr(
         codex_integration, "config_path", lambda: tmp_path / ".codex" / "config.toml"
+    )
+    monkeypatch.setattr(
+        vscode_chat_integration,
+        "config_path",
+        lambda: tmp_path / "vscode/chatLanguageModels.json",
     )
     monkeypatch.setattr(
         claude_integration, "claude_state_path", lambda: tmp_path / ".claude.json"
@@ -202,6 +227,7 @@ def admin_base_url(
 
     provider_secret = "CREDENTIAL[unrecognized-format-987654321]"
     providers: dict[str, BaseProvider] = {
+        "nvidia_nim": _ModelListingProvider(),
         "open_router": _ModelListingProvider(
             frozenset(
                 {
@@ -225,15 +251,24 @@ def admin_base_url(
             error=RuntimeError(f"Provider rejected credential {provider_secret}")
         ),
     }
+
+    async def fixture_provider(provider_id: str, _settings: Settings) -> BaseProvider:
+        if provider_id not in providers:
+            raise AssertionError(f"Missing browser fixture provider: {provider_id}")
+        return providers[provider_id]
+
     manager = ProviderRuntimeManager(
         get_settings(),
-        runtime_factory=lambda snapshot: ProviderRuntime(snapshot, dict(providers)),
+        runtime_factory=lambda snapshot: ProviderRuntime(
+            snapshot, dict(providers), provider_constructor=fixture_provider
+        ),
     )
     runtime = ApplicationRuntime(
         manager,
         configuration=ConfigurationService(ManagedConfigStore()),
         transcriber=None,
         code_service=code_control.service,
+        database=code_control.database,
     )
     monkeypatch.setattr(
         NativeFolderPicker,
@@ -318,11 +353,9 @@ def admin_base_url(
         yield f"http://127.0.0.1:{port}"
     finally:
         server.should_exit = True
-        thread.join(timeout=5.0)
+        join_server(thread, code_control, request)
         listener.close()
         clear_settings_cache()
-        if thread.is_alive():
-            pytest.fail("Admin browser-test server did not stop")
 
 
 @pytest.fixture(autouse=True)

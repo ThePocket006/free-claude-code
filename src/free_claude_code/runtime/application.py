@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from loguru import logger
@@ -25,8 +26,10 @@ from free_claude_code.application.errors import (
     ApplicationUnavailableError,
     InvalidRequestError,
 )
+from free_claude_code.application.model_catalog import ModelCatalog, read_model_catalog
 from free_claude_code.application.model_metadata import ProviderModelRefreshResult
 from free_claude_code.application.ports import StopResult
+from free_claude_code.config.admin.custom_providers import CustomProviderMutation
 from free_claude_code.config.admin.persistence import (
     PreparedAdminUpdate,
 )
@@ -47,6 +50,7 @@ from free_claude_code.harnesses import (
     claude_integration,
     codex_integration,
     jetbrains_acp_integration,
+    vscode_chat_integration,
 )
 from free_claude_code.messaging.platforms import factory as messaging_platform_factory
 from free_claude_code.messaging.platforms.factory import MessagingPlatformOptions
@@ -64,6 +68,8 @@ if TYPE_CHECKING:
     import free_claude_code.cli.managed as cli_managed
     import free_claude_code.messaging.workflow as messaging_workflow_module
 
+    from .messaging_sqlite import SQLiteMessagingStore
+
 from free_claude_code.application.readiness import InitializationWait
 from free_claude_code.core.async_tasks import run_sync_owned
 
@@ -71,6 +77,7 @@ from .configuration import ConfigurationService
 from .folder_picker import NativeFolderPicker
 from .provider_manager import ProviderRuntimeManager
 from .retired_chat import remove_retired_chat_history
+from .sqlite_database import SQLiteDatabase
 
 RestartCallback = Callable[[], None]
 IntegrationAction = Literal["status", "connect", "disconnect", "refresh"]
@@ -181,6 +188,7 @@ class ApplicationRuntime:
         configuration: ConfigurationService,
         transcriber: Transcriber | None,
         code_service: CodeService | None = None,
+        database: SQLiteDatabase | None = None,
         transcriber_factory: Callable[[Settings], Awaitable[Transcriber | None]]
         | None = None,
         restart_callback: RestartCallback | None = None,
@@ -189,6 +197,11 @@ class ApplicationRuntime:
         self.provider_manager = provider_manager
         self._configuration = configuration
         self._code_service = code_service
+        self._database = database
+        self._messaging_store: SQLiteMessagingStore | None = None
+        self._messaging_import_task: asyncio.Task[None] | None = None
+        self._messaging_warning: str | None = None
+        self._messaging_storage_error: Exception | None = None
         self._folder_picker = NativeFolderPicker()
         self._transcriber = transcriber
         self._transcriber_factory = transcriber_factory
@@ -217,6 +230,8 @@ class ApplicationRuntime:
         self._desktop_update = _IntegrationUpdate()
         self._codex_update = _IntegrationUpdate()
         self._jetbrains_update = _IntegrationUpdate()
+        self._vscode_update = _IntegrationUpdate()
+        self._vscode_dirty = False
         self._http_ready = asyncio.Event()
         self._messaging_state = (
             "disabled" if self.settings.messaging_platform == "none" else "starting"
@@ -250,6 +265,10 @@ class ApplicationRuntime:
                         "Application runtime is shutting down."
                     )
                 self.provider_manager.start_model_list_refresh()
+                self.provider_manager.set_catalog_changed_callback(
+                    self._queue_vscode_refresh
+                )
+                self._queue_vscode_refresh()
                 await self.refresh_claude_vscode()
                 await self.refresh_codex_integration()
                 await self.refresh_claude_desktop()
@@ -260,6 +279,13 @@ class ApplicationRuntime:
                         name="fcc-retired-chat-cleanup",
                     )
                 )
+                if self._database is not None:
+                    self._messaging_state = "starting"
+                    self._messaging_import_task = asyncio.create_task(
+                        self._initialize_messaging_storage(),
+                        name="fcc-messaging-import",
+                    )
+                    self._startup_tasks.append(self._messaging_import_task)
                 if self._code_service is not None:
                     self._startup_tasks.append(
                         asyncio.create_task(
@@ -295,6 +321,7 @@ class ApplicationRuntime:
     def begin_shutdown(self) -> None:
         """Finish indefinite observer responses before the server drains HTTP."""
         self._draining = True
+        self.provider_manager.set_catalog_changed_callback(None)
         self.provider_manager.begin_shutdown()
         self._folder_picker.begin_shutdown()
         if self._code_service is not None:
@@ -334,6 +361,7 @@ class ApplicationRuntime:
     async def apply_admin_config(
         self,
         updates: Mapping[str, ConfigInputValue],
+        custom_provider: CustomProviderMutation | None = None,
     ) -> JsonObject:
         """Apply one validated config update without splitting runtime ownership."""
         caller = asyncio.current_task()
@@ -344,7 +372,9 @@ class ApplicationRuntime:
                 raise ApplicationUnavailableError(
                     "Configuration runtime is shutting down."
                 )
-            prepared = await self._configuration.prepare(updates, self.settings)
+            prepared = await self._configuration.prepare(
+                updates, self.settings, custom_provider
+            )
             if not prepared.valid:
                 return prepared.applied_response() | {"credential_checks": []}
             assert prepared.settings is not None
@@ -425,6 +455,119 @@ class ApplicationRuntime:
 
     async def admin_values(self) -> ValueState:
         return await self._configuration.admin_values()
+
+    async def vscode_chat_status(self) -> JsonObject:
+        return await self._vscode_chat("status")
+
+    async def connect_vscode_chat(self) -> JsonObject:
+        return await self._vscode_chat("connect")
+
+    async def disconnect_vscode_chat(self) -> JsonObject:
+        return await self._vscode_chat("disconnect")
+
+    async def refresh_vscode_chat(self) -> JsonObject:
+        self._check_integration_available()
+        self._queue_vscode_refresh()
+        return {"update": self._vscode_update.snapshot()}
+
+    def _queue_vscode_refresh(self) -> None:
+        if self._draining:
+            return
+        self._vscode_dirty = True
+        update = self._vscode_update
+        if update.task is not None and not update.task.done():
+            return
+        update.state, update.changed, update.message = "starting", False, None
+
+        async def drain() -> None:
+            while self._vscode_dirty:
+                self._vscode_dirty = False
+                try:
+                    result = await self._vscode_chat("refresh")
+                    update.complete(update.changed or result.get("changed") is True)
+                except ApplicationError as exc:
+                    update.state, update.message = "failed", exc.message
+                except Exception as exc:
+                    update.state = "failed"
+                    update.message = "Could not update VS Code models. Retry shortly."
+                    logger.warning(
+                        "VS Code integration update failed: exc_type={}",
+                        type(exc).__name__,
+                    )
+                if self._vscode_dirty:
+                    update.state = "starting"
+
+        update.task = asyncio.create_task(drain(), name="fcc-vscode-models")
+        self._startup_tasks.append(update.task)
+        update.task.add_done_callback(self._startup_tasks.remove)
+
+    async def _vscode_chat(self, action: IntegrationAction) -> JsonObject:
+        try:
+            if action == "refresh":
+                async with self._config_lock:
+                    self._check_integration_available()
+                    status = await run_sync_owned(
+                        lambda: vscode_chat_integration.status(
+                            vscode_chat_integration.config_path()
+                        )
+                    )
+                    if not status["connected"]:
+                        return {"changed": False}
+            while True:
+                snapshot = (
+                    await self.provider_manager.wait_for_catalog()
+                    if action in {"connect", "refresh"}
+                    else None
+                )
+                revision = self.provider_manager.catalog_status()["catalog_revision"]
+                async with self._config_lock:
+                    self._check_integration_available()
+                    if snapshot is not None and (
+                        snapshot.current_settings() is not self.settings
+                        or revision
+                        != self.provider_manager.catalog_status()["catalog_revision"]
+                        or self.provider_manager.catalog_status()["catalog"] != "ready"
+                    ):
+                        continue
+                    catalog = (
+                        read_model_catalog(snapshot) if snapshot is not None else None
+                    )
+                    settings = self.settings
+
+                    def operate(
+                        catalog: ModelCatalog | None = catalog,
+                        settings: Settings = settings,
+                    ) -> JsonObject:
+                        path = vscode_chat_integration.config_path()
+                        changed = False
+                        if action == "disconnect":
+                            vscode_chat_integration.disconnect(path)
+                        elif catalog is not None:
+                            changed = vscode_chat_integration.configure(
+                                path,
+                                local_proxy_root_url(settings),
+                                settings.proxy_auth_token,
+                                catalog.models,
+                                only_existing=action == "refresh",
+                            )
+                        if action == "refresh":
+                            return {"changed": changed}
+                        return vscode_chat_integration.status(path)
+
+                    result = await run_sync_owned(operate)
+                    if action in {"connect", "disconnect"}:
+                        self._vscode_update.complete()
+                    if action == "status":
+                        result["update"] = self._vscode_update.snapshot()
+                    return result
+        except ValueError, UnicodeError:
+            raise InvalidRequestError(
+                "Could not configure VS Code Chat. Check chatLanguageModels.json for invalid JSON or conflicting FCC groups."
+            ) from None
+        except OSError:
+            raise ApplicationUnavailableError(
+                "Could not access chatLanguageModels.json. Finish configuration edits, check file permissions, and retry."
+            ) from None
 
     async def claude_vscode_status(self) -> JsonObject:
         return await self._claude_vscode("status")
@@ -738,8 +881,10 @@ class ApplicationRuntime:
                 "messaging": {
                     "state": self._messaging_state,
                     "message": self._messaging_error,
+                    "warning": self._messaging_warning,
                 },
                 "integrations": {
+                    "vscode-chat": self._vscode_update.snapshot(),
                     "claude-vscode": self._claude_update.snapshot(),
                     "claude-desktop": self._desktop_update.snapshot(),
                     "codex": self._codex_update.snapshot(),
@@ -879,12 +1024,15 @@ class ApplicationRuntime:
         return result
 
     async def _start_messaging_if_configured(self) -> None:
+        if self._messaging_import_task is not None:
+            await asyncio.shield(self._messaging_import_task)
         if self.settings.messaging_platform == "none":
+            self._messaging_state = "disabled"
             return
         try:
 
             def load_modules() -> None:
-                for name in ("cli.managed", "messaging.session", "messaging.workflow"):
+                for name in ("cli.managed", "messaging.workflow"):
                     importlib.import_module(f"free_claude_code.{name}")
                 importlib.import_module(
                     f"free_claude_code.messaging.platforms.{self.settings.messaging_platform}"
@@ -950,12 +1098,36 @@ class ApplicationRuntime:
             log_api_error_tracebacks=settings.log_api_error_tracebacks,
         )
 
+    async def _initialize_messaging_storage(self) -> None:
+        if self._database is None:
+            return
+        try:
+            await self._database.start()
+            from .messaging_import import import_legacy
+            from .messaging_sqlite import SQLiteMessagingStore
+
+            self._messaging_store = SQLiteMessagingStore(
+                self._database,
+                managed_message_cap=self.settings.max_message_log_entries_per_chat,
+            )
+            self._messaging_warning = await import_legacy(
+                self._database, Path(messaging_state_dir_path()) / "sessions.json"
+            )
+            await self._messaging_store.trim()
+        except Exception as exc:
+            self._messaging_storage_error = exc
+            logger.error(
+                "Messaging storage initialization failed: {}", type(exc).__name__
+            )
+            return
+        if self._messaging_warning:
+            logger.warning("{}", self._messaging_warning)
+
     async def _start_messaging_workflow(
         self,
         components: MessagingPlatformComponents,
     ) -> None:
         import free_claude_code.cli.managed as cli_managed
-        import free_claude_code.messaging.session as messaging_session
         import free_claude_code.messaging.workflow as messaging_workflow_module
 
         settings = self.settings
@@ -966,8 +1138,6 @@ class ApplicationRuntime:
             else os.getcwd()
         )
         await run_sync_owned(partial(os.makedirs, workspace, exist_ok=True))
-        data_path = os.path.abspath(messaging_state_dir_path())
-        await run_sync_owned(partial(os.makedirs, data_path, exist_ok=True))
         allowed_dirs = [workspace] if settings.allowed_dir else []
 
         self._cli_manager = cli_managed.ManagedClaudeSessionManager(
@@ -978,13 +1148,15 @@ class ApplicationRuntime:
             log_raw_cli_diagnostics=settings.log_raw_cli_diagnostics,
             log_messaging_error_details=settings.log_messaging_error_details,
         )
-        session_store = await run_sync_owned(
-            partial(
-                messaging_session.SessionStore,
-                storage_path=os.path.join(data_path, "sessions.json"),
-                managed_message_cap=settings.max_message_log_entries_per_chat,
-            )
-        )
+        if self._messaging_import_task is not None:
+            await asyncio.shield(self._messaging_import_task)
+        if self._messaging_storage_error is not None:
+            raise ApplicationUnavailableError(
+                "Messaging storage is unavailable."
+            ) from self._messaging_storage_error
+        if self._messaging_store is None:
+            raise ApplicationUnavailableError("Messaging storage is unavailable.")
+        session_store = self._messaging_store
         workflow = messaging_workflow_module.MessagingWorkflow(
             platform_name=components.name,
             outbound=components.outbound,
@@ -997,7 +1169,7 @@ class ApplicationRuntime:
             log_messaging_error_details=settings.log_messaging_error_details,
         )
         self._messaging_workflow = workflow
-        workflow.restore()
+        await workflow.restore()
         components.runtime.on_message(workflow.handle_message)
         await self._http_ready.wait()
         if self._draining:
@@ -1018,6 +1190,10 @@ class ApplicationRuntime:
             "code_service.close",
             self._code_service.close(),
             log_verbose_errors=verbose,
+        ):
+            return False
+        if self._database is not None and not await best_effort(
+            "database.close", self._database.close()
         ):
             return False
         if not await self._cleanup_transcriber():
