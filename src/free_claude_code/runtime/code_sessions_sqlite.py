@@ -4,10 +4,12 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import Callable, Sequence
-from contextlib import closing
 
 from free_claude_code.application.code_sessions.models import (
+    ACTIVE_RUN_STATUSES,
     CodeConflictError,
+    CodeExecutionSeed,
+    CodeHistory,
     CodeItem,
     CodeItemPage,
     CodeNotFoundError,
@@ -98,6 +100,80 @@ def _session(connection: sqlite3.Connection, session_id: str) -> CodeSession:
     if row is None:
         raise CodeNotFoundError("Code session not found.")
     return _record(CodeSession, row)
+
+
+def _by_ids[T: Record](
+    connection: sqlite3.Connection,
+    model: type[T],
+    session_id: str,
+    ids: Sequence[str],
+) -> tuple[T, ...]:
+    tables: dict[type[Record], str] = {
+        CodeItem: "code_items",
+        CodeRun: "code_runs",
+        CodePrompt: "code_prompts",
+    }
+    table = tables[model]
+    records: list[T] = []
+    unique = tuple(dict.fromkeys(ids))
+    for start in range(0, len(unique), 500):
+        batch = unique[start : start + 500]
+        records.extend(
+            _record(model, row)
+            for row in connection.execute(
+                f"SELECT * FROM {table} WHERE session_id = ? AND id IN ({','.join('?' for _ in batch)})",
+                (session_id, *batch),
+            )
+        )
+    return tuple(records)
+
+
+def _latest_run(connection: sqlite3.Connection, session_id: str) -> CodeRun | None:
+    row = connection.execute(
+        "SELECT * FROM code_runs WHERE session_id = ? ORDER BY ordinal DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    return _record(CodeRun, row) if row else None
+
+
+def _active_prompts(
+    connection: sqlite3.Connection, session_id: str
+) -> tuple[CodePrompt, ...]:
+    return tuple(
+        _record(CodePrompt, row)
+        for row in connection.execute(
+            "SELECT * FROM code_prompts WHERE session_id = ? AND status IN ('pending', 'answering') ORDER BY id",
+            (session_id,),
+        )
+    )
+
+
+def _item_page(
+    connection: sqlite3.Connection,
+    session_id: str,
+    before: tuple[int, int] | None,
+    limit: int | None,
+) -> CodeItemPage:
+    parameters: list[object] = [session_id]
+    query = "SELECT i.*, r.ordinal AS run_ordinal FROM code_items i JOIN code_runs r ON (r.session_id, r.id) = (i.session_id, i.run_id) WHERE i.session_id = ?"
+    if before:
+        query += " AND (r.ordinal, i.sequence) < (?, ?)"
+        parameters.extend(before)
+    query += " ORDER BY r.ordinal DESC, i.sequence DESC"
+    if limit is not None:
+        query += " LIMIT ?"
+        parameters.append(limit + 1)
+    rows = connection.execute(query, parameters).fetchall()
+    selected = rows if limit is None else rows[:limit]
+    runs = _by_ids(connection, CodeRun, session_id, [row["run_id"] for row in selected])
+    last = (
+        selected[-1] if selected and limit is not None and len(rows) > limit else None
+    )
+    return CodeItemPage(
+        tuple(_record(CodeItem, row) for row in reversed(selected)),
+        tuple(sorted(runs, key=lambda run: run.ordinal)),
+        (last["run_ordinal"], last["sequence"]) if last else None,
+    )
 
 
 def _idle(connection: sqlite3.Connection, session_id: str) -> None:
@@ -299,7 +375,6 @@ def _write_prompt(connection: sqlite3.Connection, prompt: CodePrompt) -> None:
 class SQLiteCodeStore:
     def __init__(self, database: SQLiteDatabase) -> None:
         self.database = database
-        self._path = database.path
         self._started = False
         self._lifecycle = asyncio.Lock()
 
@@ -309,7 +384,7 @@ class SQLiteCodeStore:
                 return
             try:
                 await self.database.start()
-                await self.database.work(lambda: self._execute(self._recover))
+                await self._execute(self._recover, write=True)
             except sqlite3.IntegrityError as exc:
                 raise CodeConflictError(
                     "Saved Code history conflicts with its schema."
@@ -324,13 +399,11 @@ class SQLiteCodeStore:
         async with self._lifecycle:
             self._started = False
 
-    def _execute[T](self, operation: Callable[[sqlite3.Connection], T]) -> T:
+    async def _execute[T](
+        self, operation: Callable[[sqlite3.Connection], T], *, write: bool
+    ) -> T:
         try:
-            with closing(sqlite3.connect(self._path, timeout=10)) as connection:
-                connection.row_factory = sqlite3.Row
-                connection.execute("PRAGMA foreign_keys = ON")
-                with connection:
-                    return operation(connection)
+            return await self.database.run(operation, write=write)
         except sqlite3.IntegrityError as exc:
             raise CodeConflictError(
                 "This Code operation conflicts with existing session state."
@@ -338,10 +411,12 @@ class SQLiteCodeStore:
         except sqlite3.Error as exc:
             raise CodeUnavailableError("Code session storage is unavailable.") from exc
 
-    async def _run[T](self, operation: Callable[[sqlite3.Connection], T]) -> T:
+    async def _run[T](
+        self, operation: Callable[[sqlite3.Connection], T], *, write: bool
+    ) -> T:
         if not self._started:
             raise CodeUnavailableError("Code session storage is closed.")
-        return await self.database.work(lambda: self._execute(operation))
+        return await self._execute(operation, write=write)
 
     def _recover(self, connection: sqlite3.Connection) -> None:
         connection.execute(
@@ -358,7 +433,6 @@ class SQLiteCodeStore:
 
     async def create(self, session: CodeSession) -> CodeSession:
         def operation(connection: sqlite3.Connection) -> CodeSession:
-            connection.execute("BEGIN IMMEDIATE")
             if connection.execute(
                 "SELECT 1 FROM code_deleted WHERE id = ?", (session.id,)
             ).fetchone():
@@ -378,10 +452,12 @@ class SQLiteCodeStore:
             _insert(connection, "code_sessions", session)
             return session
 
-        return await self._run(operation)
+        return await self._run(operation, write=True)
 
     async def get_session(self, session_id: str) -> CodeSession:
-        return await self._run(lambda connection: _session(connection, session_id))
+        return await self._run(
+            lambda connection: _session(connection, session_id), write=False
+        )
 
     async def list_sessions(
         self, cursor: tuple[int, str] | None, limit: int, query: str = ""
@@ -407,7 +483,7 @@ class SQLiteCodeStore:
             last = sessions[-1] if sessions and len(rows) > limit else None
             return CodePage(sessions, (last.updated_at, last.id) if last else None)
 
-        return await self._run(operation)
+        return await self._run(operation, write=False)
 
     async def pending_deletions(self) -> tuple[CodeSession, ...]:
         return await self._run(
@@ -416,7 +492,8 @@ class SQLiteCodeStore:
                 for row in connection.execute(
                     "SELECT * FROM code_sessions WHERE status != 'ready'"
                 )
-            )
+            ),
+            write=False,
         )
 
     async def is_deleted(self, session_id: str) -> bool:
@@ -426,7 +503,8 @@ class SQLiteCodeStore:
                     "SELECT 1 FROM code_deleted WHERE id = ?", (session_id,)
                 ).fetchone()
                 is not None
-            )
+            ),
+            write=False,
         )
 
     async def get_run(self, session_id: str, run_id: str) -> CodeRun | None:
@@ -437,7 +515,7 @@ class SQLiteCodeStore:
             ).fetchone()
             return _record(CodeRun, row) if row else None
 
-        return await self._run(operation)
+        return await self._run(operation, write=False)
 
     async def runs(self, session_id: str) -> tuple[CodeRun, ...]:
         return await self._run(
@@ -447,7 +525,8 @@ class SQLiteCodeStore:
                     "SELECT * FROM code_runs WHERE session_id = ? ORDER BY ordinal",
                     (session_id,),
                 )
-            )
+            ),
+            write=False,
         )
 
     async def latest_run(self, session_id: str) -> CodeRun | None:
@@ -458,7 +537,7 @@ class SQLiteCodeStore:
             ).fetchone()
             return _record(CodeRun, row) if row else None
 
-        return await self._run(operation)
+        return await self._run(operation, write=False)
 
     async def items(
         self, session_id: str, before: tuple[int, int] | None, limit: int | None
@@ -469,39 +548,152 @@ class SQLiteCodeStore:
         self, session_id: str, before: tuple[int, int] | None, limit: int | None
     ) -> CodeItemPage:
         def operation(connection: sqlite3.Connection) -> CodeItemPage:
-            connection.execute("BEGIN")
-            parameters: list[object] = [session_id]
-            query = "SELECT i.*, r.ordinal AS run_ordinal FROM code_items i JOIN code_runs r ON (r.session_id, r.id) = (i.session_id, i.run_id) WHERE i.session_id = ?"
-            if before:
-                query += " AND (r.ordinal, i.sequence) < (?, ?)"
-                parameters.extend(before)
-            query += " ORDER BY r.ordinal DESC, i.sequence DESC"
-            if limit is not None:
-                query += " LIMIT ?"
-                parameters.append(limit + 1)
-            rows = connection.execute(query, parameters).fetchall()
-            selected = rows if limit is None else rows[:limit]
-            run_ids = {row["run_id"] for row in selected}
-            runs = tuple(
-                _record(CodeRun, row)
+            return _item_page(connection, session_id, before, limit)
+
+        return await self._run(operation, write=False)
+
+    async def read_history(
+        self,
+        session_id: str,
+        before: tuple[int, int] | None,
+        include_item_ids: Sequence[str],
+    ) -> CodeHistory:
+        def operation(connection: sqlite3.Connection) -> CodeHistory:
+            session = _session(connection, session_id)
+            run = _latest_run(connection, session_id)
+            active = run is not None and run.status in ACTIVE_RUN_STATUSES
+            boundary = before
+            if active and run is not None:
+                start = (run.ordinal, 0)
+                boundary = min(before, start) if before else start
+            page = _item_page(connection, session_id, boundary, 50)
+            active_prompts = _active_prompts(connection, session_id)
+            extras = _by_ids(
+                connection,
+                CodeItem,
+                session_id,
+                (*include_item_ids, *(prompt.id for prompt in active_prompts)),
+            )
+            items = {item.id: item for item in (*page.items, *extras)}
+            if active and run is not None:
                 for row in connection.execute(
-                    "SELECT * FROM code_runs WHERE session_id = ? ORDER BY ordinal",
-                    (session_id,),
+                    "SELECT * FROM code_items WHERE session_id = ? AND run_id = ?",
+                    (session_id, run.id),
+                ):
+                    item = _record(CodeItem, row)
+                    items[item.id] = item
+            run_ids = {item.run_id for item in items.values()}
+            if run is not None:
+                run_ids.add(run.id)
+            runs = _by_ids(connection, CodeRun, session_id, tuple(run_ids))
+            ordinals = {run.id: run.ordinal for run in runs}
+            selected = tuple(
+                sorted(
+                    items.values(),
+                    key=lambda item: (ordinals[item.run_id], item.sequence),
                 )
-                if row["id"] in run_ids
             )
-            last = (
-                selected[-1]
-                if selected and limit is not None and len(rows) > limit
-                else None
+            prompts = _by_ids(
+                connection,
+                CodePrompt,
+                session_id,
+                [item.id for item in selected if item.kind == "prompt"],
             )
-            return CodeItemPage(
-                tuple(_record(CodeItem, row) for row in reversed(selected)),
-                runs,
-                (last["run_ordinal"], last["sequence"]) if last else None,
+            return CodeHistory(
+                session,
+                run,
+                selected,
+                prompts,
+                tuple(sorted(runs, key=lambda run: run.ordinal)),
+                tuple(prompt.id for prompt in active_prompts),
+                page.next_before,
             )
 
-        return await self._run(operation)
+        return await self._run(operation, write=False)
+
+    async def execution_seed(self, session_id: str) -> CodeExecutionSeed:
+        def operation(connection: sqlite3.Connection) -> CodeExecutionSeed:
+            session = _session(connection, session_id)
+            run = _latest_run(connection, session_id)
+            sequence = connection.execute(
+                "SELECT coalesce(max(sequence), 0) FROM code_items WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            prompts = _active_prompts(connection, session_id)
+            items = _by_ids(
+                connection, CodeItem, session_id, [prompt.id for prompt in prompts]
+            )
+            ids = {item.run_id for item in items}
+            if run is not None:
+                ids.add(run.id)
+            return CodeExecutionSeed(
+                session,
+                run,
+                sequence,
+                items,
+                prompts,
+                _by_ids(connection, CodeRun, session_id, tuple(ids)),
+            )
+
+        return await self._run(operation, write=False)
+
+    async def get_native_item(
+        self, session_id: str, turn_id: str, item_id: str
+    ) -> CodeItem | None:
+        def operation(connection: sqlite3.Connection) -> CodeItem | None:
+            row = connection.execute(
+                "SELECT * FROM code_items WHERE session_id = ? AND native_turn_id = ? AND native_item_id = ?",
+                (session_id, turn_id, item_id),
+            ).fetchone()
+            return _record(CodeItem, row) if row else None
+
+        return await self._run(operation, write=False)
+
+    async def run_items(self, session_id: str, run_id: str) -> tuple[CodeItem, ...]:
+        return await self._run(
+            lambda connection: tuple(
+                _record(CodeItem, row)
+                for row in connection.execute(
+                    "SELECT * FROM code_items WHERE session_id = ? AND run_id = ? ORDER BY sequence",
+                    (session_id, run_id),
+                )
+            ),
+            write=False,
+        )
+
+    async def get_prompt(self, session_id: str, prompt_id: str) -> CodePrompt | None:
+        return await self._run(
+            lambda connection: next(
+                iter(_by_ids(connection, CodePrompt, session_id, (prompt_id,))), None
+            ),
+            write=False,
+        )
+
+    async def has_prompt_request(
+        self, session_id: str, generation: str, request_id: str | int
+    ) -> bool:
+        return await self._run(
+            lambda connection: (
+                connection.execute(
+                    "SELECT 1 FROM code_prompts WHERE session_id = ? AND generation = ? AND request_id = ?",
+                    (session_id, generation, json.dumps(request_id)),
+                ).fetchone()
+                is not None
+            ),
+            write=False,
+        )
+
+    async def has_native_turn(self, session_id: str, turn_id: str) -> bool:
+        return await self._run(
+            lambda connection: (
+                connection.execute(
+                    "SELECT 1 FROM code_runs WHERE session_id = ? AND native_turn_id = ?",
+                    (session_id, turn_id),
+                ).fetchone()
+                is not None
+            ),
+            write=False,
+        )
 
     async def prompts(self, session_id: str) -> tuple[CodePrompt, ...]:
         return await self._run(
@@ -511,14 +703,14 @@ class SQLiteCodeStore:
                     "SELECT * FROM code_prompts WHERE session_id = ? ORDER BY id",
                     (session_id,),
                 )
-            )
+            ),
+            write=False,
         )
 
     async def update_settings(
         self, session: CodeSession, expected_revision: int
     ) -> CodeSession:
         def operation(connection: sqlite3.Connection) -> CodeSession:
-            connection.execute("BEGIN IMMEDIATE")
             previous = _session(connection, session.id)
             if previous.status != "ready":
                 raise CodeConflictError("This session is being deleted.")
@@ -531,13 +723,12 @@ class SQLiteCodeStore:
             _write_session(connection, session, expected_revision, settings=True)
             return _session(connection, session.id)
 
-        return await self._run(operation)
+        return await self._run(operation, write=True)
 
     async def admit_run(
         self, session: CodeSession, run: CodeRun, item: CodeItem, expected_revision: int
     ) -> tuple[CodeSession, CodeRun]:
         def operation(connection: sqlite3.Connection) -> tuple[CodeSession, CodeRun]:
-            connection.execute("BEGIN IMMEDIATE")
             previous = _session(connection, session.id)
             row = connection.execute(
                 "SELECT * FROM code_runs WHERE session_id = ? AND id = ?",
@@ -579,13 +770,12 @@ class SQLiteCodeStore:
             _insert(connection, "code_items", item)
             return _session(connection, session.id), admitted
 
-        return await self._run(operation)
+        return await self._run(operation, write=True)
 
     async def claim_prompt(
         self, session_id: str, prompt_id: str, response_id: str, generation: str
     ) -> CodePrompt:
         def operation(connection: sqlite3.Connection) -> CodePrompt:
-            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT * FROM code_prompts WHERE session_id = ? AND id = ?",
                 (session_id, prompt_id),
@@ -605,7 +795,7 @@ class SQLiteCodeStore:
             _write_prompt(connection, claimed)
             return claimed
 
-        return await self._run(operation)
+        return await self._run(operation, write=True)
 
     async def save_progress(
         self,
@@ -617,7 +807,6 @@ class SQLiteCodeStore:
         prompts: Sequence[CodePrompt] = (),
     ) -> None:
         def operation(connection: sqlite3.Connection) -> None:
-            connection.execute("BEGIN IMMEDIATE")
             _write_session(connection, session, expected_revision, settings=False)
             if run is not None:
                 if run.session_id != session.id:
@@ -632,14 +821,13 @@ class SQLiteCodeStore:
                     raise CodeConflictError("This prompt belongs to another session.")
                 _write_prompt(connection, prompt)
 
-        await self._run(operation)
+        await self._run(operation, write=True)
 
     async def delete(self, session_id: str) -> None:
         def operation(connection: sqlite3.Connection) -> None:
-            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 "INSERT OR IGNORE INTO code_deleted(id) VALUES (?)", (session_id,)
             )
             connection.execute("DELETE FROM code_sessions WHERE id = ?", (session_id,))
 
-        await self._run(operation)
+        await self._run(operation, write=True)
