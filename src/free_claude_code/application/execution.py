@@ -24,6 +24,7 @@ from free_claude_code.core.openai_responses import (
     estimate_responses_input_tokens,
 )
 from free_claude_code.core.reasoning import ReasoningPolicy
+from free_claude_code.core.request_outcomes import record_request_route
 from free_claude_code.core.trace import (
     close_stream_input,
     trace_event,
@@ -391,6 +392,7 @@ class ProviderExecutor:
                         )
                         continue
 
+                record_request_route(target.provider_id, target.provider_model)
                 provider_stream: AsyncIterator[str] | None = None
                 candidate_committed = False
                 candidate_failure: ExecutionFailure | None = None

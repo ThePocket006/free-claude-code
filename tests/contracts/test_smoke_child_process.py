@@ -20,7 +20,26 @@ from smoke.lib.config import ProviderModel, SmokeConfig
 from smoke.lib.e2e import ConversationDriver
 from smoke.lib.http import collect_message_stream
 from smoke.lib.server import RunningServer
+from smoke.product import test_client_product_live as client_smoke
 from smoke.product import test_provider_product_live as provider_smoke
+
+
+def test_smoke_reads_native_trace_events_from_mixed_subprocess_output():
+    output = (
+        'INFO: server started\n{"type":"result"}\n'
+        '{"text":"ordinary log record\\n","record":{"extra":{}}}\n'
+        '{"text":"trace event\\n","record":{"extra":{"trace_payload":'
+        '{"stage":"execution","event":"test.completed","source":"test","status":200}}}}\n'
+    )
+    assert client_smoke._trace_log_events(output) == [
+        {
+            "stage": "execution",
+            "event": "test.completed",
+            "source": "test",
+            "status": 200,
+        }
+    ]
+    assert {"type": "result"} in client_smoke._json_object_lines(output)
 
 
 def test_fcc_server_command_uses_cli_entrypoint() -> None:

@@ -156,14 +156,21 @@ def test_remote_provider_with_default_endpoint_stays_remote() -> None:
 
 
 def test_provider_pointed_at_custom_endpoint_is_custom() -> None:
-    descriptor = PROVIDER_CATALOG["tokenrouter"]
-    state = {"TOKENROUTER_API_KEY": _value("key")}
+    # Bedrock is one of the providers still allowed a configurable base URL.
+    # TokenRouter and NaraRoute are not: their cloud endpoints were retired in
+    # upstream 2baadb86, and tests/config/test_fixed_cloud_endpoints.py asserts
+    # TOKENROUTER_BASE_URL / NARAROUTE_BASE_URL stay out of the Admin manifest.
+    descriptor = PROVIDER_CATALOG["bedrock"]
+    state = {"AWS_BEARER_TOKEN_BEDROCK": _value("key")}
 
     assert provider_kind_for(descriptor, state) == "remote"
     assert (
         provider_kind_for(
             descriptor,
-            {"TOKENROUTER_API_KEY": _value("key"), "TOKENROUTER_BASE_URL": _value("http://localhost:20128/v1")},
+            {
+                "AWS_BEARER_TOKEN_BEDROCK": _value("key"),
+                "BEDROCK_BASE_URL": _value("https://bedrock.example/v1"),
+            },
         )
         == "custom"
     )
@@ -171,8 +178,8 @@ def test_provider_pointed_at_custom_endpoint_is_custom() -> None:
         provider_kind_for(
             descriptor,
             {
-                "TOKENROUTER_API_KEY": _value("key"),
-                "TOKENROUTER_BASE_URL": _value(descriptor.default_base_url),
+                "AWS_BEARER_TOKEN_BEDROCK": _value("key"),
+                "BEDROCK_BASE_URL": _value(descriptor.default_base_url),
             },
         )
         == "remote"
@@ -181,15 +188,15 @@ def test_provider_pointed_at_custom_endpoint_is_custom() -> None:
 
 def test_custom_status_exposes_base_url() -> None:
     status = _provider_status(
-        "tokenrouter",
+        "bedrock",
         {
-            "TOKENROUTER_API_KEY": _value("key"),
-            "TOKENROUTER_BASE_URL": _value("http://localhost:20128/v1"),
+            "AWS_BEARER_TOKEN_BEDROCK": _value("key"),
+            "BEDROCK_BASE_URL": _value("https://bedrock.example/v1"),
         },
     )
 
     assert status["kind"] == "custom"
-    assert status["base_url"] == "http://localhost:20128/v1"
+    assert status["base_url"] == "https://bedrock.example/v1"
     assert status["status"] == "configured"
 
 
