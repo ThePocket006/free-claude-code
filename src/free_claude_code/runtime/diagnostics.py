@@ -38,6 +38,9 @@ RUNTIME_FIELDS = (
     "provider_rate_limit",
     "provider_rate_window",
     "provider_max_concurrency",
+    "provider_key_cooldown_seconds",
+    "circuit_breaker_threshold",
+    "circuit_breaker_cooldown",
     "provider_progress_timeout",
     "http_read_timeout",
     "http_write_timeout",
@@ -71,6 +74,10 @@ ROUTING_FIELDS = (
     "model_sonnet",
     "model_haiku",
     "model_fallbacks",
+    "model_fallbacks_fable",
+    "model_fallbacks_opus",
+    "model_fallbacks_sonnet",
+    "model_fallbacks_haiku",
 )
 REASONING_FIELDS = (
     "reasoning_policy",
@@ -108,6 +115,11 @@ EXCLUDED_FIELDS = {
     "cloudflare_account_id",
     "vertex_project_id",
 } | {d.credential_attr for d in PROVIDER_CATALOG.values() if d.credential_attr}
+# Structured secrets that must never reach the report. Kept apart from
+# EXCLUDED_FIELDS because they are not scalar canaries: provider_api_keys maps
+# a provider id to a comma-separated list of raw API keys, so the canary test
+# cannot represent it as a plain string.
+UNREPORTED_FIELDS = {"provider_api_keys"}
 URL_FIELDS = {
     attr
     for d in PROVIDER_CATALOG.values()
@@ -135,6 +147,7 @@ def classified_settings() -> set[str]:
     return (
         set(RUNTIME_FIELDS + ROUTING_FIELDS + REASONING_FIELDS + WEB_FIELDS)
         | EXCLUDED_FIELDS
+        | UNREPORTED_FIELDS
         | URL_FIELDS
         | {"nim", "vertex_location", "custom_providers"}
     )

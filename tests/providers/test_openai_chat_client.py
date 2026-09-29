@@ -10,9 +10,6 @@ def _config() -> ProviderConfig:
     return ProviderConfig(
         api_key="test-key",
         base_url="http://localhost:20128/v1",
-        rate_limit=120,
-        rate_window=60,
-        max_concurrency=8,
         http_read_timeout=120.0,
         http_write_timeout=10.0,
         http_connect_timeout=10.0,
