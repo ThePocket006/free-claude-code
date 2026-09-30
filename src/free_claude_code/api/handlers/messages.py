@@ -124,7 +124,7 @@ circuit_breakers: CircuitBreakerRegistry | None = None,
                 result = _MessagesStreamResult(
                     self._provider_executor.stream_messages(
                         routed,
-                        raw_log_payload=routed.request.model_dump(),
+                        raw_log_payload=routed.request.model_dump,
                         request_id=request_id,
                     )
                 )

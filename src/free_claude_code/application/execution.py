@@ -187,7 +187,7 @@ class ProviderExecutor:
         self,
         routed: RoutedMessagesRequest,
         *,
-        raw_log_payload: object,
+        raw_log_payload: Callable[[], object],
         request_id: str,
     ) -> AsyncIterator[str]:
         """Execute one Anthropic Messages request."""
@@ -230,7 +230,7 @@ class ProviderExecutor:
             wire_api="messages",
             raw_log_label="FULL_PAYLOAD",
             raw_log_payload=raw_log_payload,
-            request_snapshot=anthropic_request_snapshot(routed.request),
+            request_snapshot=lambda: anthropic_request_snapshot(routed.request),
             ingress_count_name="message_count",
             ingress_count=len(routed.request.messages),
             request_id=request_id,
@@ -241,7 +241,7 @@ class ProviderExecutor:
         self,
         routed: RoutedResponsesRequest,
         *,
-        raw_log_payload: object,
+        raw_log_payload: Callable[[], object],
         request_id: str,
     ) -> AsyncIterator[str]:
         """Execute one native OpenAI Responses request."""
@@ -286,7 +286,7 @@ class ProviderExecutor:
             wire_api="responses",
             raw_log_label="FULL_RESPONSES_PAYLOAD",
             raw_log_payload=raw_log_payload,
-            request_snapshot={
+            request_snapshot=lambda: {
                 "model": routed.request.model,
                 "input_item_count": input_item_count,
                 "tool_count": len(routed.request.tools or ()),
@@ -304,8 +304,8 @@ class ProviderExecutor:
         reasoning: ReasoningPolicy,
         wire_api: WireApi,
         raw_log_label: str,
-        raw_log_payload: object,
-        request_snapshot: dict[str, object],
+        raw_log_payload: Callable[[], object],
+        request_snapshot: Callable[[], dict[str, object]],
         ingress_count_name: str,
         ingress_count: int,
         request_id: str,
@@ -338,7 +338,6 @@ class ProviderExecutor:
             route_trace["generation_id"] = self._generation_id
         trace_event(**route_trace)
 
-        request_snapshot["model"] = gateway_model
         ingress_trace: dict[str, object] = {
             "stage": "ingress",
             "event": (
@@ -347,16 +346,18 @@ class ProviderExecutor:
                 else "free_claude_code.api.request.received"
             ),
             "source": "api",
-            "snapshot": request_snapshot,
             "request_id": request_id,
             ingress_count_name: ingress_count,
         }
         trace_event(
+            lambda: {"snapshot": {**request_snapshot(), "model": gateway_model}},
             **ingress_trace,
         )
 
         if self._log_raw_payloads:
-            logger.debug(f"{raw_log_label} [{{}}]: {{}}", request_id, raw_log_payload)
+            logger.opt(lazy=True).debug(
+                f"{raw_log_label} [{{}}]: {{}}", lambda: request_id, raw_log_payload
+            )
 
         async def provider_body() -> AsyncIterator[str]:
             loop = asyncio.get_running_loop()

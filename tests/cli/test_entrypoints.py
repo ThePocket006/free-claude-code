@@ -116,8 +116,9 @@ def test_explicit_open_admin_waits_for_owned_http_ready():
         open_admin.assert_not_called()
         settings = _launcher_settings()
         supervisor._ready_settings = settings
+        supervisor._ready_instance_id = "ready-instance"
         supervisor.request_open_admin()
-        open_admin.assert_called_once_with(settings, 0)
+        open_admin.assert_called_once_with(settings, 0, "ready-instance")
 
 
 @pytest.mark.parametrize("open_admin_browser", (False, True))
@@ -296,6 +297,7 @@ def test_serve_supervisor_restarts_when_app_requests_restart() -> None:
         restart_callbacks.append(restart_callback)
         app = SimpleNamespace(
             runtime=SimpleNamespace(
+                instance_id=f"instance-{len(apps)}",
                 is_closed=False,
                 begin_shutdown=lambda: None,
                 http_started=lambda: None,
@@ -340,7 +342,7 @@ def test_serve_supervisor_restarts_when_app_requests_restart() -> None:
         commands.serve()
 
     assert len(servers) == 2
-    open_admin.assert_called_once_with(settings, 0)
+    open_admin.assert_called_once_with(settings, 0, "instance-0")
     clear_settings_cache.assert_called_once()
     kill_all.assert_called_once()
 
@@ -357,6 +359,7 @@ def test_serve_supervisor_refuses_restart_after_incomplete_shutdown() -> None:
         restart_callbacks.append(restart_callback)
         return SimpleNamespace(
             runtime=SimpleNamespace(
+                instance_id="incomplete-instance",
                 is_closed=False,
                 begin_shutdown=lambda: None,
                 http_started=lambda: None,
