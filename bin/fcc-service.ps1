@@ -126,16 +126,27 @@ function Test-Health {
 
 function Set-LocalEnv {
     # Load every KEY=VALUE from .fcc-local.env into the process environment.
-    # Process env vars take precedence over the managed config (~/.fcc/.env),
-    # so this cleanly isolates the local server from the global one.
+    # FCC_ENV_FILE is what redirects the server away from the managed config
+    # (~/.fcc/.env), so this cleanly isolates the local server from the global one.
     $env:FCC_ENV_FILE = $LocalEnv
     if (-not (Test-Path $LocalEnv)) { return }
     foreach ($line in Get-Content $LocalEnv) {
         if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') {
             $key = $Matches[1]
             $value = $Matches[2].Trim().Trim('"', "'")
+            # A blank KEY= line means "not configured here", not "force it empty".
+            # Without this guard the placeholder entries that keep .fcc-local.env
+            # readable wipe the credentials exported by fcc-test.bat, and the
+            # server comes up with no usable provider at all.
+            if ($value -eq '' -and [Environment]::GetEnvironmentVariable($key, 'Process')) { continue }
             Set-Item -Path "env:$key" -Value $value
         }
+    }
+    # Google's own SDKs accept either GOOGLE_API_KEY or GEMINI_API_KEY for the
+    # same credential, but free-claude-code only reads GEMINI_API_KEY. Bridge the
+    # two so a launcher that exports the Google spelling keeps working.
+    if (-not $env:GEMINI_API_KEY -and $env:GOOGLE_API_KEY) {
+        $env:GEMINI_API_KEY = $env:GOOGLE_API_KEY
     }
 }
 
