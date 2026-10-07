@@ -135,7 +135,9 @@ def _events_for(protocol):
 
 
 @asynccontextmanager
-async def _harness(protocol, responder=None, *, key="a", chat_provider_factory=None):
+async def _harness(
+    protocol, responder=None, *, key="a", chat_provider_factory=None, max_attempts=5
+):
     bodies: list[dict[str, Any]] = []
 
     def reply(request):
@@ -146,6 +148,10 @@ async def _harness(protocol, responder=None, *, key="a", chat_provider_factory=N
         module = httpx if protocol == "messages" else httpx2
         if status != 200:
             return module.Response(status, json={"error": payload})
+        if isinstance(payload, module.AsyncByteStream):
+            return module.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=payload
+            )
         raw = "".join(
             (f"event: {event['type']}\n" if protocol == "messages" else "")
             + f"data: {json.dumps(event)}\n\n"
@@ -157,14 +163,16 @@ async def _harness(protocol, responder=None, *, key="a", chat_provider_factory=N
 
     if protocol == "messages":
         client = httpx.AsyncClient(transport=httpx.MockTransport(reply))
-        provider = messages_transport(client, immediate_admission(max_attempts=5))
+        provider = messages_transport(
+            client, immediate_admission(max_attempts=max_attempts)
+        )
         endpoint = Endpoint()
         endpoint.token = key
         extras = {"endpoint_context": endpoint}
     else:
         client = _client(reply, api_key=key)
         if protocol == "responses":
-            provider = responses_transport(client)
+            provider = responses_transport(client, max_attempts=max_attempts)
         else:
             with patch(
                 "free_claude_code.providers.openai_chat.client.AsyncOpenAI",
@@ -177,12 +185,12 @@ async def _harness(protocol, responder=None, *, key="a", chat_provider_factory=N
                         make_provider_config(
                             api_key=key, base_url="https://provider.invalid/v1"
                         ),
-                        admission=immediate_admission(max_attempts=5),
+                        admission=immediate_admission(max_attempts=max_attempts),
                     )
                 )
         extras = {}
 
-    def stream(wire, history, *, tools=None):
+    def stream(wire, history, *, tools=None, model="requested", continuation=None):
         options: dict[str, Any] = dict(
             input_tokens=0,
             request_id="history-test",
@@ -193,16 +201,18 @@ async def _harness(protocol, responder=None, *, key="a", chat_provider_factory=N
         if protocol == "messages":
             options.pop("input_tokens")
             options["reasoning"] = ReasoningPolicy.provider_default()
+        if continuation is not None:
+            options["continuation"] = continuation
         if wire == "responses":
             return provider.stream_responses(
                 OpenAIResponsesRequest.model_validate(
-                    {"model": "requested", "input": history, "tools": tools}
+                    {"model": model, "input": history, "tools": tools}
                 ),
                 **options,
             )
         return provider.stream_messages(
             MessagesRequest.model_validate(
-                {"model": "requested", "messages": history, "tools": tools}
+                {"model": model, "messages": history, "tools": tools}
             ),
             **options,
         )

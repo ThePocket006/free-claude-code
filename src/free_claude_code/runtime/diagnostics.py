@@ -113,6 +113,7 @@ EXCLUDED_FIELDS = {
     "allowed_discord_channels",
     "allowed_dir",
     "cloudflare_account_id",
+    "anthropic_workspace_id",
     "vertex_project_id",
 } | {d.credential_attr for d in PROVIDER_CATALOG.values() if d.credential_attr}
 # Structured secrets that must never reach the report. Kept apart from

@@ -255,7 +255,11 @@ class ChatStreamOutput(ABC):
         return events
 
     def close_unclosed_blocks(self) -> list[str]:
-        return self.close_all_blocks()
+        events = self.finish_reasoning_group()
+        for state in self.tool_states.values():
+            state.open = False
+        events.extend(self.finish_replay_carriers())
+        return events
 
     def has_emitted_tool_block(self) -> bool:
         return any(state.started for state in self.tool_states.values())
@@ -322,6 +326,9 @@ class ChatStreamOutput(ABC):
         events.extend(self._finish_failure(failure))
         self._terminal = True
         return events
+
+    def failure_payload(self, failure: ExecutionFailure) -> JsonObject | None:
+        return None
 
     @abstractmethod
     def _start_events(self) -> list[str]: ...
@@ -750,6 +757,15 @@ class ResponsesChatStreamOutput(ChatStreamOutput):
             error=openai_error_from_failure(failure),
         )
         return [self._events.response_failed(response)]
+
+    def failure_payload(self, failure: ExecutionFailure) -> JsonObject:
+        self._completer.retain_incomplete_blocks()
+        self._terminal = True
+        return self._events.response_failed_payload(
+            self._response_payload(
+                status="failed", error=openai_error_from_failure(failure)
+            )
+        )
 
 
 def _responses_usage(usage: ChatStreamUsage) -> dict[str, object]:

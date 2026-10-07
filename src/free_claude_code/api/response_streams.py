@@ -33,7 +33,10 @@ from free_claude_code.core.request_outcomes import (
     record_request_exception,
     record_request_failure,
 )
+from free_claude_code.core.stream_delivery import StreamDeliveryState
 from free_claude_code.core.trace import close_stream_input, trace_event
+
+from .stream_delivery import DeliveryObservedStream, PublicResponseStream
 
 TERMINAL_EXECUTION_ERROR_HEADERS = {"x-should-retry": "false"}
 
@@ -229,11 +232,15 @@ def trace_terminal_execution_error(
 async def _first_chunk_streaming_response(
     body: AsyncIterator[str],
     *,
+    wire_api: WireApi,
     headers: Mapping[str, str],
     pre_start_error_response: PreStartErrorResponse,
     terminal_frame: TerminalFrameEmitter | None,
     terminal_failure_observer: TerminalFailureObserver | None,
+    hide_reasoning: bool = False,
 ) -> Response:
+    state = StreamDeliveryState()
+    body = DeliveryObservedStream(body, state)
     try:
         first_chunk = await anext(body)
     except StopAsyncIteration:
@@ -254,11 +261,14 @@ async def _first_chunk_streaming_response(
         return pre_start_error_response(exc)
 
     return ManagedStreamingResponse(
-        _PrefetchedStream(
-            first_chunk,
-            body,
+        PublicResponseStream(
+            _PrefetchedStream(first_chunk, body),
+            state,
+            wire_api=wire_api,
+            first_chunk=first_chunk,
             terminal_frame=terminal_frame,
             terminal_failure_observer=terminal_failure_observer,
+            hide_reasoning=hide_reasoning,
         ),
         media_type="text/event-stream",
         headers=dict(headers),
@@ -283,64 +293,31 @@ async def _close_pre_start_body(
 
 
 class _PrefetchedStream(AsyncIterator[str]):
-    """Replay one prefetched frame while retaining ownership of the tail."""
+    """Replay the raw prefetched chunk and retain ownership of the tail."""
 
-    def __init__(
-        self,
-        first_chunk: str,
-        body: AsyncIterator[str],
-        *,
-        terminal_frame: TerminalFrameEmitter | None,
-        terminal_failure_observer: TerminalFailureObserver | None,
-    ) -> None:
+    def __init__(self, first_chunk: str, body: AsyncIterator[str]) -> None:
         self._first_chunk: str | None = first_chunk
-        self._initial_chunk = first_chunk
-        self._latest_chunk = first_chunk
         self._body = body
-        self._terminal_frame = terminal_frame
-        self._terminal_failure_observer = terminal_failure_observer
-        self._done = False
         self._closed = False
 
     def __aiter__(self) -> _PrefetchedStream:
         return self
 
     async def __anext__(self) -> str:
-        if self._closed or self._done:
+        if self._closed:
             raise StopAsyncIteration
         if self._first_chunk is not None:
-            first_chunk = self._first_chunk
-            self._first_chunk = None
+            first_chunk, self._first_chunk = self._first_chunk, None
             return first_chunk
-        try:
-            chunk = await anext(self._body)
-            self._latest_chunk = chunk
-            return chunk
-        except StopAsyncIteration:
-            self._done = True
-            raise
-        except BaseExceptionGroup as exc:
-            return self._terminal_chunk(find_execution_failure(exc) or exc)
-        except Exception as exc:
-            return self._terminal_chunk(exc)
+        return await anext(self._body)
 
     async def aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
-        self._done = True
         close_error = await try_close_async_iterator(self._body)
         if close_error is not None:
             raise close_error
-
-    def _terminal_chunk(self, exc: BaseException) -> str:
-        terminal_frame = self._terminal_frame
-        if terminal_frame is None:
-            raise exc
-        self._done = True
-        if self._terminal_failure_observer is not None:
-            self._terminal_failure_observer(exc)
-        return terminal_frame(self._initial_chunk, self._latest_chunk, exc)
 
 
 async def anthropic_sse_streaming_response(
@@ -348,11 +325,14 @@ async def anthropic_sse_streaming_response(
     *,
     pre_start_error_response: PreStartErrorResponse,
     request_id: str,
+    hide_reasoning: bool = False,
 ) -> Response:
     """Return a streaming response for Anthropic-style SSE streams."""
     return await _first_chunk_streaming_response(
         body,
+        wire_api="messages",
         headers=ANTHROPIC_SSE_RESPONSE_HEADERS,
+        hide_reasoning=hide_reasoning,
         pre_start_error_response=pre_start_error_response,
         terminal_frame=_anthropic_terminal_frame,
         terminal_failure_observer=lambda exc: _trace_anthropic_terminal_failure(
@@ -402,6 +382,7 @@ async def openai_responses_sse_streaming_response(
     """Return a streaming response for OpenAI Responses-style SSE."""
     return await _first_chunk_streaming_response(
         body,
+        wire_api="responses",
         headers=headers,
         pre_start_error_response=pre_start_error_response,
         terminal_frame=committed_response_failure_frame,

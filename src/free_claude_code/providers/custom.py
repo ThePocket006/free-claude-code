@@ -9,7 +9,6 @@ from free_claude_code.application.errors import InvalidRequestError
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.config.custom_providers import CustomProviderDefinition
 from free_claude_code.core.anthropic import MessagesRequest, ReasoningReplayMode
-from free_claude_code.core.model_capabilities import ModelInputModality
 from free_claude_code.core.openai_responses import (
     OpenAIResponsesRequest,
     responses_reasoning_policy,
@@ -19,9 +18,14 @@ from free_claude_code.core.reasoning import (
     ReasoningEffort,
     ReasoningPolicy,
 )
+from free_claude_code.core.stream_recovery import ContinuationSeed
 from free_claude_code.providers.admission import (
     ProviderAdmissionController,
     ProviderOperationKind,
+)
+from free_claude_code.providers.anthropic_messages.discovery import (
+    list_messages_models,
+    messages_model_info,
 )
 from free_claude_code.providers.anthropic_messages.request_policy import (
     MessagesModelCapabilities,
@@ -32,7 +36,6 @@ from free_claude_code.providers.anthropic_messages.transport import (
 from free_claude_code.providers.base import BaseProvider, ProviderConfig
 from free_claude_code.providers.endpoint_types import HttpEndpoint
 from free_claude_code.providers.model_listing import (
-    ModelListResponseError,
     extract_openai_model_infos,
     model_infos_from_ids,
 )
@@ -217,6 +220,7 @@ class CustomProvider(BaseProvider):
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         reasoning = self._reasoning(reasoning)
         if (
@@ -243,6 +247,7 @@ class CustomProvider(BaseProvider):
                 model_info=model_info,
                 preserve_native_controls=self._definition.reasoning_format
                 == "provider_default",
+                continuation=continuation,
             )
         transport = self._chat if self._chat is not None else self._responses
         assert transport is not None
@@ -254,6 +259,7 @@ class CustomProvider(BaseProvider):
             response_model=response_model or request.model,
             reasoning=reasoning,
             model_info=model_info,
+            continuation=continuation,
         )
 
     def stream_responses(
@@ -266,6 +272,7 @@ class CustomProvider(BaseProvider):
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         reasoning = (
             responses_reasoning_policy(request.reasoning)
@@ -294,6 +301,7 @@ class CustomProvider(BaseProvider):
                 response_model=response_model,
                 reasoning=reasoning,
                 model_info=model_info,
+                continuation=continuation,
             )
         transport = self._chat if self._chat is not None else self._responses
         assert transport is not None
@@ -304,6 +312,7 @@ class CustomProvider(BaseProvider):
             request_id=request_id,
             response_model=response_model or request.model,
             reasoning=reasoning,
+            continuation=continuation,
         )
 
     async def list_model_infos(self) -> frozenset[ProviderModelInfo]:
@@ -326,55 +335,9 @@ class CustomProvider(BaseProvider):
         headers = {"anthropic-version": "2023-06-01"}
         if self._config.api_key:
             headers["x-api-key"] = self._config.api_key
-        params = {"limit": "1000"}
-        seen: set[str] = set()
-        infos: dict[str, ProviderModelInfo] = {}
-        for _ in range(100):
-            response = await self._admission.start_execution().run_call(
-                lambda params=params: self._fetch_models(headers, params),
-                operation_kind=ProviderOperationKind.MODEL_DISCOVERY,
-            )
-            if not isinstance(response, dict) or not isinstance(
-                response.get("has_more"), bool
-            ):
-                raise ModelListResponseError("Invalid Messages model-list page")
-            page = extract_openai_model_infos(
-                response,
-                provider_name=self._definition.provider_id,
-                thinking_boolean_path=("capabilities", "thinking", "supported"),
-                fixed_input_modalities=frozenset({ModelInputModality.TEXT}),
-                input_modality_boolean_paths=(
-                    (
-                        ModelInputModality.IMAGE,
-                        ("capabilities", "image_input", "supported"),
-                    ),
-                ),
-                context_window_tokens_path=("max_input_tokens",),
-                max_output_tokens_path=("max_tokens",),
-            )
-            infos.update((info.model_id, info) for info in page)
-            if not response["has_more"]:
-                return frozenset(infos.values())
-            cursor = response.get("last_id")
-            if (
-                not isinstance(cursor, str)
-                or not cursor
-                or cursor in seen
-                or cursor not in {info.model_id for info in page}
-            ):
-                raise ModelListResponseError(
-                    "Messages model-list cursor did not advance"
-                )
-            seen.add(cursor)
-            params = {"limit": "1000", "after_id": cursor}
-        raise ModelListResponseError("Messages model-list exceeded 100 pages")
-
-    async def _fetch_models(
-        self, headers: dict[str, str], params: dict[str, str]
-    ) -> object:
-        assert self._http is not None
-        response = await self._http.get(
-            self._config.base_url + "/models", headers=headers, params=params
+        records = await list_messages_models(
+            self._http, self._admission, base_url=self._config.base_url, headers=headers
         )
-        response.raise_for_status()
-        return response.json()
+        return frozenset(
+            messages_model_info(item, self._definition.provider_id) for item in records
+        )

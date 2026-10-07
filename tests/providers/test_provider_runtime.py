@@ -27,6 +27,7 @@ from free_claude_code.config.provider_catalog import (
     MINIMAX_DEFAULT_BASE,
     NEBIUS_DEFAULT_BASE,
     OLLAMA_CLOUD_DEFAULT_BASE,
+    OPPER_DEFAULT_BASE,
     ORCAROUTER_DEFAULT_BASE,
     POOLSIDE_DEFAULT_BASE,
     PROVIDER_CATALOG,
@@ -39,6 +40,7 @@ from free_claude_code.config.provider_catalog import (
     VERCEL_AI_GATEWAY_DEFAULT_BASE,
     WANDB_INFERENCE_DEFAULT_BASE,
     XAI_DEFAULT_BASE,
+    XKIRO_DEFAULT_BASE,
     ZAI_API_DEFAULT_BASE,
     ZAI_CODING_DEFAULT_BASE,
     ZENMUX_DEFAULT_BASE,
@@ -47,6 +49,7 @@ from free_claude_code.providers.admission import ProviderAdmissionController
 from free_claude_code.providers.admission_policy import ProviderAdmissionLimits
 from free_claude_code.providers.admission_registry import ProviderAdmissionRegistry
 from free_claude_code.providers.alibaba_cloud import AlibabaCloudProvider
+from free_claude_code.providers.anthropic import AnthropicProvider
 from free_claude_code.providers.cloudflare import CloudflareProvider
 from free_claude_code.providers.deepseek import DeepSeekProvider
 from free_claude_code.providers.gemini import GeminiProvider
@@ -85,6 +88,9 @@ def _make_settings(**overrides):
     mock.nvidia_nim_api_key = "test_key"
     mock.open_router_api_key = "test_openrouter_key"
     mock.xai_api_key = "test_xai_key"
+    mock.anthropic_api_key = "test_anthropic_key"
+    mock.anthropic_workspace_id = "workspace"
+    mock.anthropic_proxy = None
     mock.alibaba_cloud_api_key = "test_alibaba_key"
     mock.alibaba_cloud_base_url = None
     mock.alibaba_cloud_proxy = None
@@ -95,6 +101,7 @@ def _make_settings(**overrides):
     mock.siliconflow_api_key = "test_siliconflow_key"
     mock.nebius_api_key = "test_nebius_key"
     mock.scw_secret_key = "test_scw_key"
+    mock.opper_api_key = "test_opper_key"
     mock.chutes_api_key = "test_chutes_key"
     mock.featherless_api_key = "test_featherless_key"
     mock.mistral_api_key = "test_mistral_key"
@@ -124,6 +131,7 @@ def _make_settings(**overrides):
     mock.experiential_api_key = "test_experiential_key"
     mock.cheaperinference_api_key = "test_cheaperinference_key"
     mock.orcarouter_api_key = "test_orcarouter_key"
+    mock.xkiro_api_key = "test_xkiro_key"
     mock.nvidia_nim_proxy = None
     mock.open_router_proxy = None
     mock.lmstudio_proxy = None
@@ -174,6 +182,7 @@ def _make_settings(**overrides):
     mock.experiential_proxy = None
     mock.cheaperinference_proxy = None
     mock.orcarouter_proxy = None
+    mock.xkiro_proxy = None
     mock.kilo_api_key = "test_kilo_key"
     mock.kilo_proxy = None
     mock.openai_proxy = None
@@ -186,6 +195,7 @@ def _make_settings(**overrides):
     mock.siliconflow_proxy = None
     mock.nebius_proxy = None
     mock.scw_proxy = None
+    mock.opper_proxy = None
     mock.chutes_proxy = None
     mock.featherless_proxy = None
     mock.azure_openai_proxy = None
@@ -639,6 +649,32 @@ async def test_scaleway_provider_config_uses_key_base_and_proxy() -> None:
     assert descriptor.base_url_attr is None
     assert config.api_key == "scw-token"
     assert config.base_url == SCALEWAY_DEFAULT_BASE
+    assert config.proxy == "http://proxy.test:8080"
+    assert isinstance(provider, OpenAIChatProvider)
+
+
+@pytest.mark.asyncio
+async def test_opper_provider_config_uses_key_base_and_proxy() -> None:
+    descriptor = PROVIDER_CATALOG["opper"]
+    settings = _make_settings(
+        opper_api_key="opper-token",
+        opper_proxy="http://proxy.test:8080",
+    )
+
+    config = build_provider_config(descriptor, settings)
+    with patch("free_claude_code.providers.openai_chat.client.AsyncOpenAI"):
+        provider = await create_provider(
+            "opper",
+            settings,
+            ProviderAdmissionRegistry(ProviderAdmissionLimits.from_settings(settings)),
+        )
+
+    assert descriptor.display_name == "Opper"
+    assert descriptor.credential_env == "OPPER_API_KEY"
+    assert descriptor.credential_url == "https://platform.opper.ai/"
+    assert descriptor.base_url_attr is None
+    assert config.api_key == "opper-token"
+    assert config.base_url == OPPER_DEFAULT_BASE
     assert config.proxy == "http://proxy.test:8080"
     assert isinstance(provider, OpenAIChatProvider)
 
@@ -1147,6 +1183,7 @@ async def test_create_provider_instantiates_each_builtin():
         "github_copilot": GitHubCopilotProvider,
         "cline_pass": OpenAIChatProvider,
         "xai": OpenAIChatProvider,
+        "anthropic": AnthropicProvider,
         "alibaba_cloud": AlibabaCloudProvider,
         "qwencloud": OpenAIChatProvider,
         "qwencloud_coding": OpenAIChatProvider,
@@ -1155,6 +1192,7 @@ async def test_create_provider_instantiates_each_builtin():
         "siliconflow": OpenAIChatProvider,
         "nebius": OpenAIChatProvider,
         "scaleway": OpenAIChatProvider,
+        "opper": OpenAIChatProvider,
         "chutes": OpenAIChatProvider,
         "featherless": OpenAIChatProvider,
         "azure_openai": OpenAIChatProvider,
@@ -1180,6 +1218,7 @@ async def test_create_provider_instantiates_each_builtin():
         "experiential": OpenAIChatProvider,
         "cheaperinference": OpenAIChatProvider,
         "orcarouter": OpenAIChatProvider,
+        "xkiro": OpenAIChatProvider,
         "opencode_go": OpenCodeProvider,
         "vercel": OpenAIChatProvider,
         "bedrock": OpenAIChatProvider,
@@ -1672,3 +1711,40 @@ async def test_provider_runtime_cleanup_exceptiongroup_on_multiple_failures() ->
 
     assert not runtime.is_cached("x")
     assert not runtime.is_cached("y")
+
+
+@pytest.mark.asyncio
+async def test_xkiro_provider_config_uses_key_base_and_proxy() -> None:
+    descriptor = PROVIDER_CATALOG["xkiro"]
+    settings = _make_settings(
+        xkiro_api_key="xkiro-token",
+        xkiro_base_url="https://unused.example/v1",
+        xkiro_proxy="http://proxy.test:8080",
+    )
+
+    config = build_provider_config(descriptor, settings)
+    with patch("free_claude_code.providers.openai_chat.client.AsyncOpenAI"):
+        provider = await create_provider(
+            "xkiro",
+            settings,
+            ProviderAdmissionRegistry(ProviderAdmissionLimits.from_settings(settings)),
+        )
+
+    assert descriptor.display_name == "xKiro"
+    assert descriptor.credential_env == "XKIRO_API_KEY"
+    assert descriptor.credential_attr == "xkiro_api_key"
+    assert descriptor.credential_url == "https://xkiro.com/dashboard/api/keys"
+    assert descriptor.default_base_url == XKIRO_DEFAULT_BASE
+    assert descriptor.base_url_attr is None
+    assert descriptor.proxy_attr == "xkiro_proxy"
+    assert config.api_key == "xkiro-token"
+    assert config.base_url == XKIRO_DEFAULT_BASE
+    assert config.proxy == "http://proxy.test:8080"
+    assert isinstance(provider, OpenAIChatProvider)
+
+
+def test_xkiro_requires_key_despite_public_catalog():
+    with pytest.raises(ApplicationUnavailableError, match="XKIRO_API_KEY is not set"):
+        build_provider_config(
+            PROVIDER_CATALOG["xkiro"], _make_settings(xkiro_api_key=None)
+        )

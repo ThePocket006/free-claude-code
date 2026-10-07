@@ -17,16 +17,29 @@ from free_claude_code.application.routing import (
 )
 from free_claude_code.config.reasoning import ReasoningPreference
 from free_claude_code.core.anthropic.models import Message, MessagesRequest
+from free_claude_code.core.anthropic.passthrough import NativeMessagesRequest
 from free_claude_code.core.async_iterators import AsyncCloseable
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import ReasoningCapability, ReasoningPolicy
+from free_claude_code.core.stream_recovery import ContinuationSeed
 
 
 class FakeProvider:
     def __init__(self) -> None:
         self.stream_calls: list[dict[str, object]] = []
         self.stream_close_calls = 0
+
+    def stream_native_messages(
+        self,
+        request: NativeMessagesRequest,
+        *,
+        request_id: str,
+        response_model: str,
+        request_headers: Mapping[str, str] | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[str]:
+        raise AssertionError("Compatibility test provider received a native request")
 
     async def stream_messages(
         self,
@@ -38,6 +51,7 @@ class FakeProvider:
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         self._record_stream_call(
             request,
@@ -61,6 +75,7 @@ class FakeProvider:
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         raise AssertionError("Messages test provider received a Responses request")
         yield ""
@@ -100,6 +115,7 @@ class ResponsesFakeProvider:
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         raise AssertionError("Responses test provider received a Messages request")
         yield ""
@@ -114,6 +130,7 @@ class ResponsesFakeProvider:
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         self.stream_calls.append(
             {
@@ -166,6 +183,7 @@ class ControlledProvider(FakeProvider):
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         self._record_stream_call(
             request,
@@ -233,6 +251,7 @@ class FailingStreamConstructionProvider(FakeProvider):
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         raise RuntimeError("stream construction failed")
 
@@ -275,6 +294,7 @@ class ExecutionFailureStreamConstructionProvider(FakeProvider):
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         del request, input_tokens, request_id, response_model, reasoning
         raise self._failure
@@ -304,6 +324,7 @@ class CloseControlledProvider(FakeProvider):
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         self._record_stream_call(
             request,
@@ -627,6 +648,8 @@ async def test_retryable_preframe_failure_selects_fallback_after_closing_primary
         "failure_kind": "overloaded",
         "status_code": 529,
         "provider_retryable": True,
+        "recovery_action": "restart",
+        "recovery_reason": "no_candidate_output",
         "generation_id": 7,
     }
     selected = next(
@@ -918,6 +941,7 @@ async def test_candidate_requests_are_isolated_from_provider_mutation() -> None:
             reasoning: ReasoningPolicy,
             request_headers: Mapping[str, str] | None = None,
             model_info: ProviderModelInfo | None = None,
+            continuation: ContinuationSeed | None = None,
         ) -> AsyncIterator[str]:
             request.messages[0].content = "mutated"
             async for chunk in super().stream_messages(

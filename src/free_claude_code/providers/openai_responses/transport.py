@@ -36,11 +36,18 @@ from free_claude_code.core.openai_responses import (
 )
 from free_claude_code.core.openai_tool_names import OpenAIToolNameCodec
 from free_claude_code.core.reasoning import ReasoningControl, ReasoningPolicy
+from free_claude_code.core.stream_recovery import ContinuationSeed
 from free_claude_code.core.trace import trace_event
 from free_claude_code.providers.admission import (
     ProviderAdmissionController,
     ProviderExecution,
     ProviderOperationKind,
+)
+from free_claude_code.providers.continuation import (
+    ContinuationRequest,
+    SourceRecoveryState,
+    public_recovery,
+    public_stream_failure,
 )
 from free_claude_code.providers.endpoint import RequestEndpoint
 from free_claude_code.providers.endpoint_types import EndpointContext
@@ -70,6 +77,7 @@ from free_claude_code.providers.request_recovery import (
     RequestRecovery,
 )
 from free_claude_code.providers.stream_recovery import (
+    HoldbackSignal,
     RecoveryController,
     RecoveryFailureAction,
 )
@@ -131,6 +139,7 @@ class OpenAIResponsesTransport:
         extra_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
         can_disable_reasoning: bool = True,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         prepared, wire_reasoning = prepare_messages_reasoning(
             request,
@@ -155,15 +164,17 @@ class OpenAIResponsesTransport:
             extra_headers=dict(extra_headers or {}),
             request_id=request_id,
             response_model=response_model,
-            presenter_factory=lambda: MessagesResponsesPresenter(
+            presenter_factory=lambda pad_empty: MessagesResponsesPresenter(
                 ResponsesProviderStream(
                     message_id=message_id,
                     model=response_model,
                     input_tokens=input_tokens,
                     tool_names=tool_names,
                     log_raw_events=self._log_raw_sse_events,
+                    pad_empty=pad_empty,
                 )
             ),
+            continuation=continuation,
         )
 
     def stream_responses(
@@ -176,6 +187,7 @@ class OpenAIResponsesTransport:
         reasoning: ReasoningPolicy,
         endpoint_context: EndpointContext | None = None,
         extra_headers: Mapping[str, str] | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         del input_tokens
         body, tools = self._build_native_body(request, reasoning=reasoning)
@@ -185,9 +197,10 @@ class OpenAIResponsesTransport:
             extra_headers=dict(extra_headers or {}),
             request_id=request_id,
             response_model=response_model,
-            presenter_factory=lambda: NativeResponsesPresenter(
+            presenter_factory=lambda _pad_empty: NativeResponsesPresenter(
                 public_model=response_model, tool_events=tools.event_adapter()
             ),
+            continuation=continuation,
         )
 
     def _build_messages_body(
@@ -258,6 +271,7 @@ class OpenAIResponsesTransport:
         endpoint_context: EndpointContext | None = None,
         extra_headers: Mapping[str, str] | None = None,
         reasoning_correction: ReasoningCorrection | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         execution = self._admission.start_execution(request_id=request_id)
         outcome = ResponsesExecutionOutcome()
@@ -276,6 +290,7 @@ class OpenAIResponsesTransport:
             endpoint=endpoint,
             request_client=request_client,
             extra_headers=extra_headers,
+            continuation=continuation,
         )
         try:
             async for event in provider_stream:
@@ -312,12 +327,20 @@ class OpenAIResponsesTransport:
         request_client: OpenAIRequestClient,
         extra_headers: Mapping[str, str] | None = None,
         reasoning_correction: ReasoningCorrection | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
-        recovery = RecoveryController()
+        recovery = RecoveryController(execution.delivery)
         request_recovery = RequestRecovery(
             execution, endpoint=endpoint, stream=recovery
         )
         corrections = RequestCorrections("responses", reasoning_correction)
+        continuation_request = ContinuationRequest("responses")
+        operation_kind = ProviderOperationKind.GENERATION
+        if continuation is not None:
+            body = continuation_request.build(
+                body, continuation.text, continuation.thinking
+            )
+            operation_kind = ProviderOperationKind.CONTINUATION
         trace_event(
             stage="provider",
             event="provider.request.sent",
@@ -330,8 +353,13 @@ class OpenAIResponsesTransport:
             transport="responses",
         )
 
+        source: SourceRecoveryState | None = None
         while execution.can_attempt:
-            presenter = presenter_factory()
+            normal_stop_seen = False
+            source = SourceRecoveryState(execution, previous=source)
+            presenter = presenter_factory(
+                operation_kind is ProviderOperationKind.GENERATION
+            )
             start_events = tuple(presenter.start())
             presenter_started = False
             adapt_event = (
@@ -356,7 +384,7 @@ class OpenAIResponsesTransport:
                     endpoint=endpoint.snapshot if endpoint is not None else None,
                 )
                 sent_body = prepare_history(body, origin)
-                attempt = await execution.open_attempt(ProviderOperationKind.GENERATION)
+                attempt = await execution.open_attempt(operation_kind)
                 scope = ProviderAttemptScope(
                     attempt,
                     provider_name=self._provider_name,
@@ -371,58 +399,77 @@ class OpenAIResponsesTransport:
                 stream = scope.retain(OpenAIStreamAdapter(sdk_stream))
                 stream_opened = True
 
-                async for upstream_event in stream:
-                    if not scope.attempt.accepted:
-                        await scope.attempt.accept()
-                    if not presenter_started:
-                        presenter_started = True
-                        for event in start_events:
+                async with recovery.read_stream(stream) as events:
+                    async for upstream_event in events:
+                        if upstream_event is HoldbackSignal.EXPIRED:
+                            for held in recovery.flush():
+                                yield held
+                            continue
+                        normal_stop_seen |= upstream_event.type in {
+                            "response.completed",
+                            "response.incomplete",
+                        }
+                        if not scope.attempt.accepted:
+                            await scope.attempt.accept()
+                        if not presenter_started:
+                            presenter_started = True
+                            for event in start_events:
+                                for held in recovery.push(event):
+                                    yield held
+                        payload = cast(
+                            JsonObject,
+                            upstream_event.to_dict(mode="json"),
+                        )
+                        failed = upstream_event.type in {
+                            "response.failed",
+                            "error",
+                            "response.error",
+                        }
+                        context_exceeded = reports_context_window_incomplete(
+                            upstream_event.type, payload
+                        )
+                        # Failed snapshots constrain recovery without replacing the
+                        # provider's own error with an output-eligibility failure.
+                        source.observe(
+                            "responses",
+                            payload,
+                            continuing=operation_kind
+                            is ProviderOperationKind.CONTINUATION
+                            and not (failed or context_exceeded),
+                        )
+                        if failed:
+                            stream_failure = responses_stream_failure_from_event(
+                                upstream_event.type,
+                                payload,
+                            )
+                            if adapt_event is not None:
+                                try:
+                                    stream_failure.payload = adapt_event(
+                                        upstream_event.type, payload
+                                    )
+                                except RetryableProviderProtocolError:
+                                    # Preserve the upstream failure classification.
+                                    # Synthesize the terminal event if partial output
+                                    # cannot retain a consistent public identity.
+                                    stream_failure.payload = None
+                            raise stream_failure
+                        if context_exceeded:
+                            raise context_window_exceeded_provider_failure()
+                        if adapt_event is not None:
+                            payload = adapt_event(upstream_event.type, payload)
+                        response = payload.get("response")
+                        if (
+                            isinstance(response, dict)
+                            and isinstance(response.get("model"), str)
+                            and response["model"]
+                        ):
+                            origin = replace(origin, model=response["model"])
+                        payload = preserve_responses_reasoning(payload, origin)
+                        for event in presenter.feed(upstream_event.type, payload):
                             for held in recovery.push(event):
                                 yield held
-                    payload = cast(
-                        JsonObject,
-                        upstream_event.to_dict(mode="json"),
-                    )
-                    if upstream_event.type in {
-                        "response.failed",
-                        "error",
-                        "response.error",
-                    }:
-                        stream_failure = responses_stream_failure_from_event(
-                            upstream_event.type,
-                            payload,
-                        )
-                        if adapt_event is not None:
-                            try:
-                                stream_failure.payload = adapt_event(
-                                    upstream_event.type, payload
-                                )
-                            except RetryableProviderProtocolError:
-                                # Preserve the upstream failure classification.
-                                # Synthesize the terminal event if partial output
-                                # cannot retain a consistent public identity.
-                                stream_failure.payload = None
-                        raise stream_failure
-                    if reports_context_window_incomplete(
-                        upstream_event.type,
-                        payload,
-                    ):
-                        raise context_window_exceeded_provider_failure()
-                    if adapt_event is not None:
-                        payload = adapt_event(upstream_event.type, payload)
-                    response = payload.get("response")
-                    if (
-                        isinstance(response, dict)
-                        and isinstance(response.get("model"), str)
-                        and response["model"]
-                    ):
-                        origin = replace(origin, model=response["model"])
-                    payload = preserve_responses_reasoning(payload, origin)
-                    for event in presenter.feed(upstream_event.type, payload):
-                        for held in recovery.push(event):
-                            yield held
-                    if presenter.completed:
-                        break
+                        if presenter.completed:
+                            break
                 if not presenter.completed:
                     raise _TruncatedResponsesStream(
                         "Provider Responses stream ended without a terminal event."
@@ -448,7 +495,8 @@ class OpenAIResponsesTransport:
                         provider_authentication_status(error),
                         scope.attempt,
                         body,
-                        operation_kind=ProviderOperationKind.GENERATION,
+                        operation_kind=operation_kind,
+                        normal_stop_seen=normal_stop_seen,
                         propose_correction=partial(
                             corrections.next_body,
                             raw_error,
@@ -487,6 +535,7 @@ class OpenAIResponsesTransport:
                     generated_output=recovery.committed,
                     complete_tool_salvageable=False,
                     attempts_remaining=execution.attempts_remaining,
+                    normal_stop_seen=normal_stop_seen,
                 )
                 if decision.action is RecoveryFailureAction.EARLY_RETRY:
                     recovery.discard()
@@ -495,6 +544,25 @@ class OpenAIResponsesTransport:
                         request_id=request_id,
                         execution=execution,
                     )
+                    continue
+
+                if scope is not None:
+                    await scope.aclose(active_error=error)
+                recovered = public_recovery(
+                    execution,
+                    body=body,
+                    request=continuation_request,
+                    retryable=decision.retryable,
+                    normal_stop_seen=normal_stop_seen,
+                    source=source,
+                )
+                if recovered is not None:
+                    recovery.discard()
+                    if recovered.body is None:
+                        return
+                    body = recovered.body
+                    operation_kind = ProviderOperationKind.CONTINUATION
+                    corrections = RequestCorrections("responses", reasoning_correction)
                     continue
 
                 failure = classify_provider_failure(
@@ -515,6 +583,18 @@ class OpenAIResponsesTransport:
                     status_code=failure.status_code,
                     provider_retryable=failure.retryable,
                 )
+                if execution.delivery is not None:
+                    recovery.discard()
+                    raise public_stream_failure(
+                        failure,
+                        source=source,
+                        body=body,
+                        protocol="responses",
+                        normal_stop_seen=normal_stop_seen,
+                        responses_failure_payload=presenter.failure_payload(
+                            raw_error, failure
+                        ),
+                    ) from raw_error
                 if not decision.committed:
                     recovery.discard()
                     raise failure from raw_error

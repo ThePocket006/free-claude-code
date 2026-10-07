@@ -102,6 +102,7 @@ class _ModelListingProvider(BaseProvider):
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation=None,
     ) -> AsyncIterator[str]:
         if False:
             yield ""
@@ -116,6 +117,7 @@ class _ModelListingProvider(BaseProvider):
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
+        continuation=None,
     ) -> AsyncIterator[str]:
         if False:
             yield ""
@@ -158,6 +160,8 @@ def admin_base_url(
     """Serve one fully isolated Admin application on an OS-assigned port."""
 
     config_dir = tmp_path / ".fcc"
+    monkeypatch.setenv("DSH_HOME", str(tmp_path / ".dsh"))
+    monkeypatch.delenv("FCC_DSH_DESKTOP_API_KEY", raising=False)
     monkeypatch.setattr(
         jetbrains_acp_integration,
         "config_path",

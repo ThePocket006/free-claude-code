@@ -54,11 +54,18 @@ from free_claude_code.core.reasoning import (
     ReasoningControl,
     ReasoningPolicy,
 )
+from free_claude_code.core.stream_recovery import ContinuationSeed
 from free_claude_code.core.trace import provider_chat_body_snapshot, trace_event
 from free_claude_code.providers.admission import (
     ProviderAdmissionController,
     ProviderAttempt,
     ProviderOperationKind,
+)
+from free_claude_code.providers.continuation import (
+    ContinuationRequest,
+    SourceRecoveryState,
+    public_recovery,
+    public_stream_failure,
 )
 from free_claude_code.providers.endpoint import RequestEndpoint
 from free_claude_code.providers.endpoint_types import EndpointContext
@@ -91,7 +98,9 @@ from free_claude_code.providers.request_recovery import (
     RequestRecovery,
 )
 from free_claude_code.providers.stream_recovery import (
+    HoldbackSignal,
     RecoveryController,
+    RecoveryDecision,
     RecoveryFailureAction,
     TruncatedProviderStreamError,
 )
@@ -109,6 +118,7 @@ from .stream_output import (
     ChatStreamUsage,
     ResponsesChatStreamOutput,
 )
+from .tool_call_identity import AmbiguousToolCallIdentityError
 from .tool_calls import (
     CompletedOpenAIToolCall,
     OpenAIToolCallAssembler,
@@ -208,6 +218,7 @@ class _OpenAIChatStreamAssembler:
         if self._structured_reasoning is not None:
             self._output.reasoning_replay = self._structured_reasoning
         self._finish_reason: Any = None
+        self._raw_stop_seen = False
         self._usage_info: Any = None
         self._native_reasoning_seen = False
         self._tool_argument_aliases: dict[str, dict[str, str]] = {}
@@ -249,11 +260,23 @@ class _OpenAIChatStreamAssembler:
     def tool_argument_alias_buffers(self) -> Mapping[int, str]:
         return self._tool_argument_alias_buffers
 
+    @property
+    def normal_stop_seen(self) -> bool:
+        return self._raw_stop_seen or self._finish_reason is not None
+
+    def observe_upstream_chunk(self, chunk: Any) -> None:
+        if chunk.choices and chunk.choices[0].finish_reason is not None:
+            self._raw_stop_seen = True
+
     def recovered_tool_call_events(
-        self, tool_call: CompletedOpenAIToolCall
+        self, tool_calls: tuple[CompletedOpenAIToolCall, ...]
     ) -> Iterator[str]:
-        """Emit one buffered recovery call through this attempt's ID scope."""
-        yield from self._tool_calls.process_tool_call(tool_call, self._output)
+        """Import a complete recovery batch without inheriting abandoned tools."""
+        if self._output.has_emitted_tool_block():
+            raise RuntimeError("cannot replace started tool calls with recovery output")
+        self._tool_name_buffers.clear()
+        self._tool_argument_alias_buffers.clear()
+        yield from self._tool_calls.process_completed_calls(tool_calls, self._output)
 
     def start_events(self) -> Iterator[str]:
         if self._started:
@@ -288,7 +311,7 @@ class _OpenAIChatStreamAssembler:
             )
         choice = chunk.choices[0]
         delta = choice.delta
-        if choice.finish_reason:
+        if choice.finish_reason is not None:
             self._finish_reason = choice.finish_reason
         if delta is None:
             return
@@ -384,7 +407,7 @@ class _OpenAIChatStreamAssembler:
         yield from self._output.flush_reasoning_replay()
         self._upstream_finished = True
 
-    def prepare_completion(self) -> Iterator[str]:
+    def prepare_completion(self, *, pad_empty: bool) -> Iterator[str]:
         if not self._upstream_finished or self._completion is not None:
             raise RuntimeError("stream completion cannot be prepared")
 
@@ -398,10 +421,13 @@ class _OpenAIChatStreamAssembler:
 
         has_emitted_tool = self._output.has_emitted_tool_block()
         has_content_blocks = self._output.has_content_block()
-        if not has_content_blocks or (
-            not has_emitted_tool
-            and not self._output.accumulated_text.strip()
-            and self._output.accumulated_reasoning.strip()
+        if pad_empty and (
+            not has_content_blocks
+            or (
+                not has_emitted_tool
+                and not self._output.accumulated_text.strip()
+                and self._output.accumulated_reasoning.strip()
+            )
         ):
             yield from self._output.ensure_text_block()
             yield self._output.emit_text_delta(" ")
@@ -579,6 +605,7 @@ class OpenAIChatTransport:
         endpoint: RequestEndpoint | None = None,
         request_client: OpenAIRequestClient | None = None,
         extra_headers: Mapping[str, str] | None = None,
+        on_event: Callable[[Any], None] | None = None,
     ) -> tuple[Any, dict, ProviderAttempt, dict]:
         """Create a streaming chat completion with bounded request fallbacks."""
         execution = request_recovery.execution
@@ -631,7 +658,8 @@ class OpenAIChatTransport:
                     await client.chat.completions.create(
                         **create_body,
                         stream=True,
-                    )
+                    ),
+                    on_event=on_event,
                 )
                 stream = self._behavior.normalize_stream(stream, body)
                 retain_attempt = True
@@ -765,6 +793,7 @@ class OpenAIChatTransport:
         model_info: ProviderModelInfo | None = None,
         endpoint_context: EndpointContext | None = None,
         extra_headers: Mapping[str, str] | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         """Stream response in Anthropic SSE format."""
         prepared_request, wire_reasoning = self._prepare_messages_reasoning(
@@ -807,6 +836,7 @@ class OpenAIChatTransport:
             endpoint_context=endpoint_context,
             extra_headers=extra_headers or {},
             reasoning_correction=correction,
+            continuation=continuation,
         )
         return runner.run()
 
@@ -820,6 +850,7 @@ class OpenAIChatTransport:
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
         endpoint_context: EndpointContext | None = None,
         extra_headers: Mapping[str, str] | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> AsyncIterator[str]:
         """Stream a Chat upstream directly as OpenAI Responses SSE."""
         translated = self._build_responses_request_body(request, reasoning=reasoning)
@@ -845,6 +876,7 @@ class OpenAIChatTransport:
             reasoning=reasoning,
             endpoint_context=endpoint_context,
             extra_headers=extra_headers or {},
+            continuation=continuation,
         )
         return runner.run()
 
@@ -868,9 +900,11 @@ class _OpenAIChatStreamRunner:
         endpoint_context: EndpointContext | None = None,
         extra_headers: Mapping[str, str] | None = None,
         reasoning_correction: ReasoningCorrection | None = None,
+        continuation: ContinuationSeed | None = None,
     ) -> None:
         self._transport = transport
         self._body = body
+        self._continuation = continuation
         self._tool_argument_aliases = transport._behavior.tool_argument_aliases(body)
         self._tool_names = tool_names
         self._tool_schemas = tool_schemas
@@ -893,7 +927,7 @@ class _OpenAIChatStreamRunner:
         execution = self._transport._admission.start_execution(
             request_id=self._request_id
         )
-        recovery = RecoveryController()
+        recovery = RecoveryController(execution.delivery)
         request_recovery = RequestRecovery(
             execution, endpoint=self._endpoint, stream=recovery
         )
@@ -934,6 +968,13 @@ class _OpenAIChatStreamRunner:
             yield from recovery.push(event)
 
         body = self._body
+        continuation_request = ContinuationRequest("chat")
+        operation_kind = ProviderOperationKind.GENERATION
+        if self._continuation is not None:
+            body = continuation_request.build(
+                body, self._continuation.text, self._continuation.thinking
+            )
+            operation_kind = ProviderOperationKind.CONTINUATION
         request_stream_usage(body)
         output_reasoning = self._reasoning.output_enabled
         corrections = RequestCorrections("chat", self._reasoning_correction)
@@ -951,18 +992,61 @@ class _OpenAIChatStreamRunner:
             tool_count=len(body.get("tools", [])),
         )
 
+        source: SourceRecoveryState | None = None
         while True:
             assembler = self._new_stream_assembler(output_reasoning=output_reasoning)
+            source = SourceRecoveryState(execution, previous=source)
+
+            def observe_chunk(
+                chunk: Any,
+                assembler: _OpenAIChatStreamAssembler = assembler,
+                source: SourceRecoveryState = source,
+                operation_kind: ProviderOperationKind = operation_kind,
+            ) -> None:
+                assembler.observe_upstream_chunk(chunk)
+                source.observe(
+                    "chat",
+                    {
+                        "usage": {
+                            key: value
+                            for key in (
+                                "prompt_tokens",
+                                "completion_tokens",
+                                "total_tokens",
+                            )
+                            if (value := usage_int(getattr(chunk, "usage", None), key))
+                            is not None
+                        },
+                        "choices": [
+                            {
+                                "delta": {
+                                    "reasoning_details": getattr(
+                                        getattr(choice, "delta", None),
+                                        "reasoning_details",
+                                        None,
+                                    ),
+                                    "audio": getattr(
+                                        getattr(choice, "delta", None), "audio", None
+                                    ),
+                                }
+                            }
+                            for choice in (getattr(chunk, "choices", None) or ())
+                        ],
+                    },
+                    continuing=operation_kind is ProviderOperationKind.CONTINUATION,
+                )
+
             scope: ProviderAttemptScope | None = None
             try:
                 stream, body, attempt, sent_body = await self._transport._create_stream(
                     body,
                     request_recovery,
-                    ProviderOperationKind.GENERATION,
+                    operation_kind,
                     corrections=corrections,
                     endpoint=self._endpoint,
                     request_client=self._request_client,
                     extra_headers=self._extra_headers,
+                    on_event=observe_chunk,
                 )
                 scope = ProviderAttemptScope(
                     attempt,
@@ -980,15 +1064,20 @@ class _OpenAIChatStreamRunner:
                     else None,
                 )
                 assembler.bind_tool_argument_aliases(self._tool_argument_aliases)
-                async for chunk in stream:
-                    if not scope.attempt.accepted:
-                        await scope.attempt.accept()
-                    for event in assembler.start_events():
-                        for out_event in hold_event(event):
-                            yield out_event
-                    for event in assembler.feed(chunk):
-                        for out_event in hold_event(event):
-                            yield out_event
+                async with recovery.read_stream(stream) as chunks:
+                    async for chunk in chunks:
+                        if chunk is HoldbackSignal.EXPIRED:
+                            for event in recovery.flush():
+                                yield event
+                            continue
+                        if not scope.attempt.accepted:
+                            await scope.attempt.accept()
+                        for event in assembler.start_events():
+                            for out_event in hold_event(event):
+                                yield out_event
+                        for event in assembler.feed(chunk):
+                            for out_event in hold_event(event):
+                                yield out_event
 
                 for event in assembler.finish_upstream():
                     for out_event in hold_event(event):
@@ -1007,7 +1096,8 @@ class _OpenAIChatStreamRunner:
                         provider_authentication_status(error),
                         scope.attempt,
                         body,
-                        operation_kind=ProviderOperationKind.GENERATION,
+                        operation_kind=operation_kind,
+                        normal_stop_seen=assembler.normal_stop_seen,
                         propose_correction=partial(
                             corrections.next_body,
                             error,
@@ -1021,10 +1111,35 @@ class _OpenAIChatStreamRunner:
                         body = corrected_body
                         recovery.discard()
                         continue
+                if (
+                    execution.delivery is not None
+                    and execution.delivery.content_released
+                ):
+                    if scope is not None:
+                        await scope.aclose(active_error=error)
+                    recovered = public_recovery(
+                        execution,
+                        body=body,
+                        request=continuation_request,
+                        retryable=is_retryable_stream_error(error),
+                        normal_stop_seen=assembler.normal_stop_seen,
+                        source=source,
+                    )
+                    if recovered is not None:
+                        recovery.discard()
+                        if recovered.body is None:
+                            return
+                        body = recovered.body
+                        operation_kind = ProviderOperationKind.CONTINUATION
+                        corrections = RequestCorrections(
+                            "chat", self._reasoning_correction
+                        )
+                        continue
                 resolution = await self._resolve_attempt_failure(
                     error=error,
                     scope=scope,
                     assembler=assembler,
+                    source=source,
                     body=body,
                     request_recovery=request_recovery,
                     recovery=recovery,
@@ -1046,7 +1161,9 @@ class _OpenAIChatStreamRunner:
                 if scope is not None:
                     await scope.aclose(active_error=sys.exception())
 
-        for event in assembler.prepare_completion():
+        for event in assembler.prepare_completion(
+            pad_empty=operation_kind is ProviderOperationKind.GENERATION
+        ):
             for out_event in hold_event(event):
                 yield out_event
         completion = assembler.completion
@@ -1106,6 +1223,7 @@ class _OpenAIChatStreamRunner:
         error: Exception,
         scope: ProviderAttemptScope | None,
         assembler: _OpenAIChatStreamAssembler,
+        source: SourceRecoveryState,
         body: dict[str, Any],
         request_recovery: RequestRecovery,
         recovery: RecoveryController,
@@ -1115,10 +1233,19 @@ class _OpenAIChatStreamRunner:
         execution = request_recovery.execution
         attempt_failure = None
         if scope is not None and not scope.attempt.accepted:
-            attempt_failure = await scope.attempt.fail(
-                error,
-                provider_failure_override=self._transport._behavior.failure_override,
-            )
+            if (
+                assembler.normal_stop_seen
+                and execution.delivery is not None
+                and not execution.delivery.content_released
+            ):
+                # The raw stop proves acceptance even if normalization rejected it.
+                # Do not reserve a retry probe for this terminal execution.
+                await scope.attempt.accept()
+            else:
+                attempt_failure = await scope.attempt.fail(
+                    error,
+                    provider_failure_override=self._transport._behavior.failure_override,
+                )
 
         retryable = (
             attempt_failure.retryable
@@ -1126,14 +1253,37 @@ class _OpenAIChatStreamRunner:
             else is_retryable_stream_error(error)
         )
         generated_output = assembler.generated_output
-        complete_tool_salvageable = assembler.complete_tool_salvageable
-        decision = recovery.advance_failure(
-            retryable=retryable,
-            stream_opened=scope is not None,
-            generated_output=generated_output,
-            complete_tool_salvageable=complete_tool_salvageable,
-            attempts_remaining=execution.attempts_remaining,
+        identity_failure = isinstance(error, AmbiguousToolCallIdentityError)
+        complete_tool_salvageable = (
+            not identity_failure and assembler.complete_tool_salvageable
         )
+        if identity_failure and execution.delivery is None:
+            # Schema-valid arguments cannot prove which call owned a fragment.
+            # Only private output still held here can be discarded and replayed.
+            action = RecoveryFailureAction.FINAL_ERROR
+            if (
+                retryable
+                and not recovery.committed
+                and not assembler.normal_stop_seen
+                and execution.can_attempt
+            ):
+                recovery.discard()
+                action = RecoveryFailureAction.EARLY_RETRY
+            decision = RecoveryDecision(
+                action=action,
+                retryable=retryable,
+                committed=recovery.committed,
+                has_buffered=recovery.has_buffered,
+            )
+        else:
+            decision = recovery.advance_failure(
+                retryable=retryable,
+                stream_opened=scope is not None,
+                generated_output=generated_output,
+                complete_tool_salvageable=complete_tool_salvageable,
+                attempts_remaining=execution.attempts_remaining,
+                normal_stop_seen=assembler.normal_stop_seen,
+            )
         tag = self._transport._provider_name
         if decision.action == RecoveryFailureAction.EARLY_RETRY:
             trace_event(
@@ -1148,7 +1298,10 @@ class _OpenAIChatStreamRunner:
             )
             return _OpenAIChatFailureResolution(outcome=_OpenAIChatFailureOutcome.RETRY)
 
-        if decision.action == RecoveryFailureAction.MIDSTREAM_RECOVERY:
+        if (
+            decision.action == RecoveryFailureAction.MIDSTREAM_RECOVERY
+            and execution.delivery is None
+        ):
             if scope is not None:
                 await scope.aclose(active_error=error)
             try:
@@ -1219,6 +1372,20 @@ class _OpenAIChatStreamRunner:
             error_trace["error_message"] = failure.message
         trace_event(**error_trace)
 
+        if execution.delivery is not None:
+            recovery.discard()
+            return _OpenAIChatFailureResolution(
+                outcome=_OpenAIChatFailureOutcome.RAISE,
+                failure=public_stream_failure(
+                    failure,
+                    source=source,
+                    body=body,
+                    protocol="chat",
+                    normal_stop_seen=assembler.normal_stop_seen,
+                    responses_failure_payload=assembler.output.failure_payload(failure),
+                ),
+            )
+
         failure_events: list[str] = []
         if (
             not decision.committed
@@ -1263,6 +1430,7 @@ class _OpenAIChatStreamRunner:
         last_error: Exception | None = None
         while execution.can_attempt:
             scope: ProviderAttemptScope | None = None
+            terminal_seen = False
             try:
                 (
                     stream,
@@ -1286,7 +1454,6 @@ class _OpenAIChatStreamRunner:
                 text_parts: list[str] = []
                 thinking_parts: list[str] = []
                 tool_calls = OpenAIToolCallCollector()
-                terminal_seen = False
                 async for chunk in stream:
                     if not scope.attempt.accepted:
                         await scope.attempt.accept()
@@ -1343,7 +1510,14 @@ class _OpenAIChatStreamRunner:
                         ),
                     )
                     retryable = failure.retryable
-                if not retryable or not execution.can_attempt:
+                if (
+                    not retryable
+                    or not execution.can_attempt
+                    or (
+                        isinstance(error, AmbiguousToolCallIdentityError)
+                        and terminal_seen
+                    )
+                ):
                     raise
                 trace_event(
                     stage="provider",
@@ -1446,8 +1620,7 @@ class _OpenAIChatStreamRunner:
             events.append(output.emit_text_delta(text_suffix))
         if recovered.tool_calls:
             events.extend(output.close_content_blocks())
-            for tool_call in recovered.tool_calls:
-                events.extend(assembler.recovered_tool_call_events(tool_call))
+            events.extend(assembler.recovered_tool_call_events(recovered.tool_calls))
         if not events:
             return None
         events.extend(
