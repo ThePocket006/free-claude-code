@@ -11,6 +11,11 @@ from openai import AsyncOpenAI
 
 from free_claude_code.config.settings import Settings
 from free_claude_code.providers.opencode import create_opencode_provider
+from free_claude_code.providers.opencode.provider import (
+    OPENCODE_GATE_USER_AGENT,
+    _upstream_session,
+    _upstream_user_agent,
+)
 from tests.api.support import create_test_app, provider_manager_for_app
 from tests.providers.support import immediate_admission, make_provider_config
 from tests.providers.test_opencode import (
@@ -122,8 +127,12 @@ def payload(ingress, provider_id, selector):
 async def test_upstream_receives_one_original_client_user_agent(
     provider_id, selector, ingress, header_name, user_agent
 ):
+    # The gate only accepts a versioned "opencode/<version>" User-Agent, so a
+    # foreign caller UA travels behind that prefix instead of alone.
+    expected_user_agent = _upstream_user_agent(user_agent)
+
     async def upstream(request):
-        if request.headers.get_list("user-agent") != [user_agent]:
+        if request.headers.get_list("user-agent") != [expected_user_agent]:
             return httpx2.Response(
                 403,
                 json={
@@ -145,10 +154,14 @@ async def test_upstream_receives_one_original_client_user_agent(
             headers={header_name: user_agent, "X-Session-Id": "native-session"},
         )
         assert response.status_code == 200, response.text
-        assert requests[-1].headers.get_list("user-agent") == [user_agent]
-        assert requests[-1].headers["x-opencode-session"] == "native-session"
+        assert requests[-1].headers.get_list("user-agent") == [expected_user_agent]
+        assert requests[-1].headers["x-opencode-session"] == _upstream_session(
+            "native-session"
+        )
         assert requests[-1].headers["authorization"] == "Bearer test_opencode_key"
-        assert provider._client.default_headers["User-Agent"] == "opencode"
+        assert provider._client.default_headers["User-Agent"] == (
+            OPENCODE_GATE_USER_AGENT
+        )
         assert all(
             request.headers.get_list("user-agent") == ["opencode"]
             for request in catalogs
@@ -182,9 +195,15 @@ async def test_unusable_user_agent_keeps_fallback_after_another_client_request(
             )
         )
         assert response.status_code == 200, response.text
-        assert requests[-1].headers.get_list("user-agent") == ["opencode"]
-        assert requests[-1].headers["x-opencode-session"] == "current"
-        assert provider._client.default_headers["User-Agent"] == "opencode"
+        assert requests[-1].headers.get_list("user-agent") == [
+            OPENCODE_GATE_USER_AGENT
+        ]
+        assert requests[-1].headers["x-opencode-session"] == _upstream_session(
+            "current"
+        )
+        assert provider._client.default_headers["User-Agent"] == (
+            OPENCODE_GATE_USER_AGENT
+        )
 
 
 @pytest.mark.parametrize("provider_id", ["opencode_zen", "opencode_go"])
@@ -222,7 +241,9 @@ async def test_existing_session_id_reaches_opencode_without_forwarding_other_hea
                 )
                 assert response.status_code == 200, response.text
                 upstream = requests[-1]
-                assert upstream.headers["x-opencode-session"] == conversation
+                assert upstream.headers["x-opencode-session"] == _upstream_session(
+                    conversation
+                )
                 assert upstream.headers["authorization"] == "Bearer test_opencode_key"
                 assert "cookie" not in upstream.headers
                 assert "x-private" not in upstream.headers
@@ -256,7 +277,9 @@ async def test_session_header_precedence_and_absence_do_not_invent_or_reuse_iden
             },
         )
         assert response.status_code == 200, response.text
-        assert requests[-1].headers["x-opencode-session"] == "explicit-session"
+        assert requests[-1].headers["x-opencode-session"] == _upstream_session(
+            "explicit-session"
+        )
         response = await client.post(
             "/v1/responses",
             json={**request, "prompt_cache_key": "not-a-conversation"},
@@ -286,7 +309,7 @@ async def test_launch_fallback_is_stable_until_a_native_conversation_id_is_avail
                 headers={"x-fcc-launch-id": launch_id, "session-id": native_id},
             )
             assert response.status_code == 200, response.text
-            assert requests[-1].headers["x-opencode-session"] == (
+            assert requests[-1].headers["x-opencode-session"] == _upstream_session(
                 native_id or launch_id
             )
             assert "x-fcc-launch-id" not in requests[-1].headers
@@ -317,11 +340,11 @@ async def test_concurrent_conversations_keep_their_session_ids_during_retry(
         session = request.headers.get("x-opencode-session")
         attempts.append(session)
         user_agents.append(request.headers.get_list("user-agent"))
-        if session == "conversation-a" and attempts.count(session) == 1:
+        if session == _upstream_session("conversation-a") and attempts.count(session) == 1:
             first_arrived.set()
             await second_arrived.wait()
             return httpx2.Response(503, json={"error": {"message": "Try again"}})
-        if session == "conversation-b":
+        if session == _upstream_session("conversation-b"):
             second_arrived.set()
         return successful_response(request)
 
@@ -359,11 +382,15 @@ async def test_concurrent_conversations_keep_their_session_ids_during_retry(
             finally:
                 first.cancel()
                 await asyncio.gather(first, return_exceptions=True)
-        assert attempts == ["conversation-a", "conversation-b", "conversation-a"]
+        assert attempts == [
+            _upstream_session("conversation-a"),
+            _upstream_session("conversation-b"),
+            _upstream_session("conversation-a"),
+        ]
         assert len(requests) == 3
         assert user_agents == [
             [OPENCODE_USER_AGENT],
-            ["codex-cli/1.0"],
+            [f"{OPENCODE_GATE_USER_AGENT} codex-cli/1.0"],
             [OPENCODE_USER_AGENT],
         ]
         response = await client.post(
@@ -372,5 +399,9 @@ async def test_concurrent_conversations_keep_their_session_ids_during_retry(
             headers={session_header: "conversation-c", "User-Agent": ""},
         )
         assert response.status_code == 200, response.text
-        assert requests[-1].headers.get_list("user-agent") == ["opencode"]
-        assert provider._client.default_headers["User-Agent"] == "opencode"
+        assert requests[-1].headers.get_list("user-agent") == [
+            OPENCODE_GATE_USER_AGENT
+        ]
+        assert provider._client.default_headers["User-Agent"] == (
+            OPENCODE_GATE_USER_AGENT
+        )

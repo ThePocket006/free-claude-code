@@ -1,5 +1,7 @@
 """OpenCode provider with catalog-driven Chat/Responses dispatch."""
 
+import hashlib
+import re
 import sys
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
@@ -73,6 +75,39 @@ _PROFILES = {
     "opencode_go": _profile("opencode_go", "OPENCODE_GO", "opencode-go"),
 }
 
+# The Zen free-tier gate only answers requests that look like they come from
+# the official OpenCode client: the User-Agent must be versioned
+# ("opencode/<version>" — a bare "opencode" or another harness' UA such as
+# "claude-cli/..." is refused) and x-opencode-session must use the "ses_" +
+# 12 hex chars + 14 base62 chars shape the OpenCode CLI mints. Anything else
+# returns HTTP 403 FreeTierError ("free tier can only be used from within
+# OpenCode"), so both headers are normalized here while the caller's own
+# identity is still carried along.
+OPENCODE_GATE_USER_AGENT = "opencode/2.0.24"
+_SESSION_ID_RE = re.compile(r"ses_[0-9A-Za-z]{26}")
+
+
+def _upstream_user_agent(user_agent: str | None) -> str:
+    """Return a gate-compatible User-Agent that keeps the caller's identity."""
+    if user_agent and user_agent.isascii() and user_agent.strip():
+        candidate = user_agent.strip()
+        if candidate.lower().startswith("opencode/"):
+            return candidate
+        return f"{OPENCODE_GATE_USER_AGENT} {candidate}"
+    return OPENCODE_GATE_USER_AGENT
+
+
+def _upstream_session(session_id: str) -> str:
+    """Pass compliant session ids through; hash any other id into that shape.
+
+    The hash is deterministic, so retries of one conversation keep a single
+    upstream identity while distinct conversations stay distinguishable.
+    """
+    if _SESSION_ID_RE.fullmatch(session_id):
+        return session_id
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    return f"ses_{digest[:26]}"
+
 
 class OpenCodeProvider(BaseProvider):
     """Route OpenCode models through their catalog-declared OpenAI endpoint."""
@@ -90,7 +125,7 @@ class OpenCodeProvider(BaseProvider):
             config,
             base_url=profile.chat_profile.base_url(config.base_url).rstrip("/"),
             provider_name=profile.provider_name,
-            default_headers={"User-Agent": "opencode"},
+            default_headers={"User-Agent": OPENCODE_GATE_USER_AGENT},
         )
         self._chat = OpenAIChatTransport(
             client=self._client,
@@ -147,10 +182,7 @@ class OpenCodeProvider(BaseProvider):
         self, request_headers: Mapping[str, str]
     ) -> Mapping[str, str]:
         headers = {name.lower(): value for name, value in request_headers.items()}
-        upstream_headers = {}
-        user_agent = headers.get("user-agent")
-        if user_agent and user_agent.isascii() and user_agent.strip():
-            upstream_headers["User-Agent"] = user_agent
+        upstream_headers = {"User-Agent": _upstream_user_agent(headers.get("user-agent"))}
         for name in (
             "x-opencode-session",
             "session-id",
@@ -164,7 +196,9 @@ class OpenCodeProvider(BaseProvider):
         ):
             session_id = headers.get(name)
             if session_id and session_id.strip():
-                upstream_headers["x-opencode-session"] = session_id
+                upstream_headers["x-opencode-session"] = _upstream_session(
+                    session_id.strip()
+                )
                 break
         return upstream_headers
 

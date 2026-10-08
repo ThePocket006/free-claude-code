@@ -46,6 +46,7 @@ from free_claude_code.providers.opencode.catalog import (
     OpenCodeUpstreamTransport,
     parse_open_code_catalog,
 )
+from free_claude_code.providers.opencode.provider import OPENCODE_GATE_USER_AGENT
 from free_claude_code.providers.stream_recovery import RecoveryHoldbackBuffer
 from tests.api.test_response_streams import _serve
 from tests.api.test_tool_call_buffer import _response
@@ -324,7 +325,9 @@ def test_client_identifies_as_first_party_opencode_user_agent(
             immediate_admission(provider_name=provider_id),
         )
 
-    assert mock_openai.call_args.kwargs["default_headers"] == {"User-Agent": "opencode"}
+    assert mock_openai.call_args.kwargs["default_headers"] == {
+        "User-Agent": OPENCODE_GATE_USER_AGENT
+    }
 
 
 def test_catalog_resolves_package_precedence_status_alias_and_reasoning() -> None:
