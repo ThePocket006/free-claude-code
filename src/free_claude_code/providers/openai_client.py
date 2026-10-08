@@ -1,10 +1,38 @@
 """Bind resolved endpoints to isolated OpenAI SDK request clients."""
 
+import re
+
 import httpx
 import httpx2
 from openai import AsyncOpenAI, Omit
 
 from free_claude_code.providers.endpoint_types import HttpEndpoint
+
+_LOCALHOST_HOST_RE = re.compile(
+    r"^(?P<scheme>https?)://(?P<host>localhost|\.localhost)(?P<port>:\d+)?(?P<path>/|$)"
+)
+
+
+def _normalize_localhost_base_url(base_url: str) -> str:
+    """Route localhost base URLs over IPv4 loopback.
+
+    ``localhost`` resolves to ``::1`` first on hosts with IPv6 enabled; when the
+    IPv6 loopback NAT is broken (e.g. missing Hyper-V HNS/vmcompute services) the
+    connection is reset before any HTTP payload is exchanged and model discovery
+    retries with exponential backoff before reporting a generic failure. A local
+    endpoint nearly always listens on 127.0.0.1, so normalize to IPv4 explicitly.
+
+    The configured URL is left untouched: this only rewrites the request-time
+    base URL so a ``localhost`` endpoint from the config still reaches a local
+    listener that bound IPv4 loopback.
+    """
+    match = _LOCALHOST_HOST_RE.match(base_url)
+    if match is None:
+        return base_url
+    prefix = (
+        f"{match.group('scheme')}://127.0.0.1{match.group('port') or ''}{match.group('path')}"
+    )
+    return prefix + base_url[match.end() :]
 
 
 class _BorrowedTransport(httpx2.AsyncBaseTransport):
@@ -58,7 +86,7 @@ class OpenAIRequestClient:
 
         view = client.with_options(
             api_key=credential,
-            base_url=endpoint.base_url,
+            base_url=_normalize_localhost_base_url(endpoint.base_url),
             set_default_headers=headers,
             set_default_query={},
             http_client=self._http,

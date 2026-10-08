@@ -52,7 +52,10 @@ from free_claude_code.providers.openai_chat import (
     ThinkingObjectReasoning,
     create_chat_client,
 )
-from free_claude_code.providers.openai_client import OpenAIRequestClient
+from free_claude_code.providers.openai_client import (
+    OpenAIRequestClient,
+    _normalize_localhost_base_url,
+)
 from free_claude_code.providers.openai_responses import OpenAIResponsesTransport
 
 
@@ -336,7 +339,10 @@ class CustomProvider(BaseProvider):
         if self._config.api_key:
             headers["x-api-key"] = self._config.api_key
         records = await list_messages_models(
-            self._http, self._admission, base_url=self._config.base_url, headers=headers
+            self._http,
+            self._admission,
+            base_url=_normalize_localhost_base_url(self._config.base_url),
+            headers=headers,
         )
         return frozenset(
             messages_model_info(item, self._definition.provider_id) for item in records

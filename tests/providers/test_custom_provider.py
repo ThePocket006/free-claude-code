@@ -576,6 +576,40 @@ async def test_reasoning_presets_encode_controls_on_the_wire(
 @pytest.mark.parametrize(
     "api_format", ["openai_chat", "openai_responses", "anthropic_messages"]
 )
+async def test_discovery_routes_localhost_config_over_ipv4(api_format):
+    """The config URL is honored but loopback traffic goes over IPv4."""
+    requests = []
+
+    def reply(request):
+        requests.append(request)
+        cls = httpx.Response if api_format == "anthropic_messages" else httpx2.Response
+        return cls(200, json={"data": [{"id": "org/model"}], "has_more": False})
+
+    instance = provider(
+        definition(
+            api_format=api_format,
+            base_url="http://localhost:9999/v1",
+        ),
+        openai_handler=reply if api_format != "anthropic_messages" else None,
+        messages_handler=reply if api_format == "anthropic_messages" else None,
+    )
+    try:
+        assert {info.model_id for info in await instance.list_model_infos()} == {
+            "org/model"
+        }
+        expected_url = (
+            "http://127.0.0.1:9999/v1/models?limit=1000"
+            if api_format == "anthropic_messages"
+            else "http://127.0.0.1:9999/v1/models"
+        )
+        assert str(requests[0].url) == expected_url
+    finally:
+        await instance.cleanup()
+
+
+@pytest.mark.parametrize(
+    "api_format", ["openai_chat", "openai_responses", "anthropic_messages"]
+)
 @pytest.mark.parametrize("ingress", ["messages", "responses"])
 async def test_tool_continuation_keeps_tool_results_and_images(api_format, ingress):
     bodies = []

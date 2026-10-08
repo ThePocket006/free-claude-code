@@ -58,6 +58,7 @@ from free_claude_code.providers.history_replay import (
     validate_history,
 )
 from free_claude_code.providers.http import ProviderAttemptScope, maybe_await_aclose
+from free_claude_code.providers.openai_client import _normalize_localhost_base_url
 from free_claude_code.providers.reasoning_compatibility import (
     ReasoningCorrection,
     prepare_messages_reasoning,
@@ -336,7 +337,7 @@ class AnthropicMessagesTransport:
                     headers["anthropic-beta"] = ",".join(
                         dict.fromkeys([*filter(None, existing.split(",")), *betas])
                     )
-                base_url = endpoint.base_url.rstrip("/")
+                base_url = _normalize_localhost_base_url(endpoint.base_url).rstrip("/")
                 path = "/messages"
                 response = scope.retain(
                     await self._client.send(
